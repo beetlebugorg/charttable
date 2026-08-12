@@ -96,6 +96,7 @@ pub const Expr = union(enum) {
     heatmap_density,
     line_progress,
     properties, // the feature's full property object
+    within: *const Expr, // GeoJSON area the feature must fall inside
     let_bind: Let,
     op: OpCall,
     match_op: Match,
@@ -336,6 +337,24 @@ const Parser = struct {
         if (std.mem.eql(u8, head, "properties")) {
             if (args.len != 0) return error.InvalidExpression;
             return .{ .e = try p.node(.properties), .deps = .{ .feature = true } };
+        }
+        if (std.mem.eql(u8, head, "within")) {
+            if (args.len != 1) return error.InvalidExpression;
+            // The argument is normally a bare GeoJSON OBJECT (a literal, not
+            // an expression); an expression argument is also allowed.
+            const r: Parser.Res = if (args[0] == .object)
+                .{ .e = try p.node(.{ .literal = try p.jsonToValue(args[0]) }), .deps = .{} }
+            else
+                try p.parseJson(args[0]);
+            // A literal GeoJSON argument validates at parse.
+            if (r.e.* == .literal) {
+                const geojson = @import("geojson.zig");
+                var polys: std.ArrayList(geojson.Polygon) = .empty;
+                geojson.valueToPolygons(p.arena, r.e.literal, &polys) catch return error.InvalidExpression;
+                if (polys.items.len == 0) return error.InvalidExpression;
+            }
+            const deps = r.deps.merge(.{ .feature = true });
+            return .{ .e = try p.node(.{ .within = r.e }), .deps = deps };
         }
         if (std.mem.eql(u8, head, "geometry-type")) {
             if (args.len != 0) return error.InvalidExpression;

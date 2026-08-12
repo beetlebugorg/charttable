@@ -29,7 +29,6 @@ const skip_ops = [_][]const u8{
     "number-format",
     "object",
     "resolved-locale",
-    "within",
     "projection",
 };
 
@@ -38,7 +37,8 @@ const skip_ops = [_][]const u8{
 /// History: 229 (first contact, 2026-08-12) → 291 (assertions, split/join,
 /// semiliteral, objects, collator-eq, strict booleans, coalesce errors) →
 /// 352 (legacy property functions, Lab/HCL interpolation) -> 377 (global-
-/// state, feature-state, elevation, heatmap-density, properties).
+/// state, feature-state, elevation, heatmap-density, properties) -> 400
+/// (within, tessellation-era libm rounding).
 ///
 /// Known-fail (2): interpolate-{hcl,lab}/linear-color — the reference
 /// applies a gamut-mapping step to out-of-gamut interpolation results that
@@ -46,7 +46,7 @@ const skip_ops = [_][]const u8{
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
 /// from the fixtures alone). Revisit with more fixture data points; the
 /// pixel difference is below visibility.
-const PASS_FLOOR: usize = 377;
+const PASS_FLOOR: usize = 400;
 
 const Score = struct {
     total: usize = 0,
@@ -109,6 +109,53 @@ const FixtureFeature = struct {
         return false;
     }
 };
+
+const geojson = @import("geojson.zig");
+
+fn coordsToPoints(a: std.mem.Allocator, j: std.json.Value) ![]geojson.Point {
+    if (j != .array) return error.Malformed;
+    const pts = try a.alloc(geojson.Point, j.array.items.len);
+    for (j.array.items, 0..) |it, i| {
+        if (it != .array or it.array.items.len < 2) return error.Malformed;
+        pts[i] = .{ try numOf(it.array.items[0]), try numOf(it.array.items[1]) };
+    }
+    return pts;
+}
+
+fn numOf(j: std.json.Value) !f64 {
+    return switch (j) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => error.Malformed,
+    };
+}
+
+fn geomFromGeoJson(a: std.mem.Allocator, type_name: []const u8, coords_j: ?std.json.Value) !geojson.Geometry {
+    const coords = coords_j orelse return error.Malformed;
+    if (std.mem.eql(u8, type_name, "Point")) {
+        if (coords != .array or coords.array.items.len < 2) return error.Malformed;
+        const pts = try a.alloc(geojson.Point, 1);
+        pts[0] = .{ try numOf(coords.array.items[0]), try numOf(coords.array.items[1]) };
+        const parts = try a.alloc([]const geojson.Point, 1);
+        parts[0] = pts;
+        return .{ .kind = .point, .parts = parts };
+    }
+    if (std.mem.eql(u8, type_name, "MultiPoint") or std.mem.eql(u8, type_name, "LineString")) {
+        const parts = try a.alloc([]const geojson.Point, 1);
+        parts[0] = try coordsToPoints(a, coords);
+        return .{ .kind = if (type_name[0] == 'M') .point else .line, .parts = parts };
+    }
+    if (std.mem.eql(u8, type_name, "MultiLineString")) {
+        if (coords != .array) return error.Malformed;
+        const parts = try a.alloc([]const geojson.Point, coords.array.items.len);
+        for (coords.array.items, 0..) |it, i| parts[i] = try coordsToPoints(a, it);
+        return .{ .kind = .line, .parts = parts };
+    }
+    if (std.mem.eql(u8, type_name, "Polygon") or std.mem.eql(u8, type_name, "MultiPolygon")) {
+        return .{ .kind = .polygon, .parts = &.{} };
+    }
+    return error.Malformed;
+}
 
 fn geomFromString(s: []const u8) eval_mod.GeomType {
     if (std.mem.eql(u8, s, "Point") or std.mem.eql(u8, s, "MultiPoint")) return .point;
@@ -452,7 +499,10 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
             if (feat_json.object.get("geometry")) |g| {
                 if (g == .object) {
                     if (g.object.get("type")) |t| {
-                        if (t == .string) fr.geom = geomFromString(t.string);
+                        if (t == .string) {
+                            fr.geom = geomFromString(t.string);
+                            fr.geometry = geomFromGeoJson(a, t.string, g.object.get("coordinates")) catch null;
+                        }
                     }
                 }
             }

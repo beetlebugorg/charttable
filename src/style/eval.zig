@@ -13,6 +13,7 @@ const std = @import("std");
 const exprs = @import("expr.zig");
 const colors = @import("color.zig");
 const vals = @import("value.zig");
+const geojson = @import("geojson.zig");
 
 pub const Value = vals.Value;
 pub const Color = vals.Color;
@@ -32,6 +33,8 @@ pub const Feature = struct {
     /// that cannot enumerate return null and the operator errors.
     props_fn: ?*const fn (?*const anyopaque) Value = null,
     geom: GeomType = .unknown,
+    /// lon/lat geometry for ["within"] / ["distance"]; optional.
+    geometry: ?geojson.Geometry = null,
     id: Value = .null,
 
     fn emptyGet(_: ?*const anyopaque, _: []const u8) Value {
@@ -124,6 +127,20 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
         .properties => {
             const f = ctx.feature.props_fn orelse return error.Eval;
             return f(ctx.feature.ptr);
+        },
+        .within => |arg| {
+            const v = try eval(a, arg, ctx);
+            var polys: std.ArrayList(geojson.Polygon) = .empty;
+            geojson.valueToPolygons(a, v, &polys) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Malformed => return error.Eval,
+            };
+            const geom = ctx.feature.geometry orelse return error.Eval;
+            const result = geojson.within(a, geom, polys.items) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Malformed => return error.Eval,
+            };
+            return .{ .boolean = result };
         },
         .var_ref => |i| {
             if (i >= ctx.bindings.items.len) return error.Eval;
@@ -871,5 +888,6 @@ fn lerpValue(a: std.mem.Allocator, va: Value, vb: Value, t: f64) Error!Value {
 test {
     _ = @import("expr_test.zig");
     _ = @import("legacy.zig");
+    _ = @import("geojson.zig");
     _ = @import("conformance_test.zig");
 }
