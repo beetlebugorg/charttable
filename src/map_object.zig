@@ -208,6 +208,20 @@ pub const Map = struct {
         return self.bindSource(name, archive.source(encoding, maxzoom));
     }
 
+    /// Bind a pmtiles archive of RASTER tiles (PNG) to a style source name.
+    /// Its tiles draw as world-space quads wherever the style puts the
+    /// matching `raster` layer.
+    pub fn bindRasterPmtiles(self: *Map, name: []const u8, archive: *caches.PmtilesSource) !usize {
+        var maxzoom: u8 = 22;
+        if (self.style) |*s| {
+            if (s.sources.get(name)) |src| switch (src) {
+                .raster => |r| maxzoom = @intFromFloat(std.math.clamp(r.maxzoom, 0, 22)),
+                .vector => |v| maxzoom = @intFromFloat(std.math.clamp(v.maxzoom, 0, 22)),
+            };
+        }
+        return self.bindSource(name, archive.rasterSource(maxzoom));
+    }
+
     /// Symbol assets. Changing them re-lays-out (an icon that was missing may
     /// now resolve), so this bumps the style generation.
     pub fn setAssets(self: *Map, assets: Assets) void {
@@ -273,7 +287,7 @@ pub const Map = struct {
         var have: std.ArrayListUnmanaged(u64) = .empty;
         defer have.deinit(self.gpa);
         for (self.wanted.items) |k| {
-            if (self.cache.get(@bitCast(k)) != null) try have.append(self.gpa, k);
+            if (self.cache.isResident(@bitCast(k))) try have.append(self.gpa, k);
         }
 
         if (!coverage_broke and self.sameResident(have.items)) return tick;
@@ -380,6 +394,16 @@ pub const Map = struct {
 
     // ---- internals -----------------------------------------------------------
 
+    /// The style source name a cache source index was bound to. A raster
+    /// layer draws only its own source's tiles, so the name has to travel
+    /// with the image.
+    fn sourceName(self: *const Map, index: u3) []const u8 {
+        for (self.bound.items) |b| {
+            if (b.index == index) return b.name;
+        }
+        return "";
+    }
+
     fn sameResident(self: *const Map, have: []const u64) bool {
         if (have.len != self.resident.items.len) return false;
         for (have, self.resident.items) |a, b| {
@@ -439,15 +463,30 @@ pub const Map = struct {
         const a = self.arenas[next].allocator();
 
         var tiles: std.ArrayListUnmanaged(map.SourcedTile) = .empty;
+        var rasters: std.ArrayListUnmanaged(map.RasterTile) = .empty;
         for (have) |k| {
             const key: caches.Key = @bitCast(k);
-            const tile = self.cache.get(key) orelse continue;
-            try tiles.append(a, .{ .id = key.tileId(), .tile = tile });
+            switch (self.cache.sourceKind(key)) {
+                .vector => {
+                    const tile = self.cache.get(key) orelse continue;
+                    try tiles.append(a, .{ .id = key.tileId(), .tile = tile });
+                },
+                .raster => {
+                    const img = self.cache.getRaster(key) orelse continue;
+                    try rasters.append(a, .{
+                        .id = key.tileId(),
+                        .source = self.sourceName(key.source),
+                        .w = img.w,
+                        .h = img.h,
+                        .rgba = img.rgba,
+                    });
+                },
+            }
         }
 
         const origin = self.cam.center;
         const zoom = self.buildTargetZoom();
-        self.built = try map.buildScene(a, style, tiles.items, .{
+        self.built = try map.buildSceneWithRasters(a, style, tiles.items, rasters.items, .{
             .zoom = zoom,
             .origin = origin,
         }, self.assets);
@@ -814,6 +853,73 @@ test "Map: pan across Annapolis rebuilds only on coverage breaks" {
         "\nmap pan: {d} rebuilds over the path, {d} tiles resident, {d} KB cached\n",
         .{ m.rebuilds, m.resident.items.len, m.cache.residentBytes() / 1024 },
     );
+}
+
+test "Map: a raster source draws as world-space quads in style order" {
+    const a = testing.allocator;
+    const png = @import("util/png.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // A 4x4 solid-orange tile image.
+    const px = try ar.alloc(u8, 4 * 4 * 4);
+    for (0..16) |i| px[i * 4 ..][0..4].* = .{ 255, 128, 0, 255 };
+    var stub = StubSource{ .bytes = try png.encode(ar, px, 4, 4) };
+
+    // The raster layer sits UNDER the fill in style order, which is the
+    // whole reason it is a layer and not a hardcoded underlay.
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"photo": {"type": "raster", "tiles": ["x/{z}/{x}/{y}"], "maxzoom": 14}},
+        \\ "layers": [
+        \\   {"id": "bg", "type": "background", "paint": {"background-color": "#000000"}},
+        \\   {"id": "picture", "type": "raster", "source": "photo"}]}
+    ;
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(style);
+    _ = try m.bindSource("photo", .{
+        .ptr = &stub,
+        .fetch = StubSource.fetch,
+        .kind = .raster,
+        .maxzoom = 14,
+    });
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    const b = m.scene() orelse return error.NoScene;
+    try testing.expect(b.ranges.len > 0);
+    var raster_ranges: usize = 0;
+    for (b.ranges) |r| {
+        if (r.kind != .raster) continue;
+        raster_ranges += 1;
+        try testing.expectEqual(types.Prim.quads, r.prim);
+        try testing.expectEqual(@as(u32, 6), r.count);
+        // Each tile brings its OWN image; no atlas has to be resident.
+        try testing.expect(r.pattern != types.NO_PATTERN);
+        try testing.expect(r.pattern < b.patterns.len);
+        try testing.expectEqual(types.Atlas.none, r.atlas);
+    }
+    try testing.expect(raster_ranges >= 4);
+    try testing.expectEqual(raster_ranges, b.patterns.len);
+    try testing.expectEqual(@as(u32, 4), b.patterns[0].w);
+    try testing.expectEqualSlices(u8, &.{ 255, 128, 0, 255 }, b.patterns[0].rgba[0..4]);
+
+    // A raster quad scales WITH the map: no screen-space offsets at all.
+    for (b.quads) |q| try testing.expectEqual(@as(f32, 0), q.ox);
+
+    // And the batcher turns them into raster draws without any atlas.
+    const batch = @import("scene/batch.zig");
+    var draws: [64]types.Draw = undefined;
+    const n = batch.batch(b.ranges, .{ .atlas_have = 0, .halo = .{ 0, 0, 0, 1 } }, &draws);
+    try testing.expect(n > 0);
+    var saw_raster = false;
+    for (draws[0..@min(n, draws.len)]) |d| {
+        if (d.pipeline == .raster) saw_raster = true;
+    }
+    try testing.expect(saw_raster);
 }
 
 test "Map: the wanted set wraps at the antimeridian" {

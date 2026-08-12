@@ -30,6 +30,7 @@ const coord = @import("coord.zig");
 const mvt = @import("mvt.zig");
 const mlt = @import("mlt.zig");
 const pmtiles = @import("pmtiles.zig");
+const png = @import("../util/png.zig");
 const Lock = @import("../util/lock.zig").Lock;
 const sleepMs = @import("../util/lock.zig").sleepMs;
 
@@ -58,13 +59,35 @@ pub const Fetch = union(enum) {
     failed,
 };
 
+/// What a source's tiles decode INTO. A vector source yields a decoded
+/// mvt.Tile; a raster source yields an RGBA image drawn as world-space quads
+/// (lookout's rationale, raster.zig: a raster tile IS a textured quad, so it
+/// needs no pipeline of its own).
+pub const Kind = enum { vector, raster };
+
 /// A place tiles come from. `fetch` runs on a WORKER thread and may block.
 pub const Source = struct {
     ptr: ?*anyopaque = null,
     fetch: *const fn (ptr: ?*anyopaque, gpa: Allocator, id: coord.TileId) Fetch,
+    kind: Kind = .vector,
     encoding: Encoding = .mvt,
     minzoom: u8 = 0,
     maxzoom: u8 = 22,
+};
+
+/// A decoded raster tile: RGBA8, w*h*4, owned by the slot's arena and valid
+/// while the tile is resident.
+pub const Image = struct {
+    w: u32,
+    h: u32,
+    rgba: []const u8,
+};
+
+/// What a resident slot holds.
+pub const Payload = union(enum) {
+    none,
+    vector: *mvt.Tile,
+    raster: Image,
 };
 
 /// Adapter: a pmtiles archive as a Source. `Reader.getCompressed` guards its
@@ -93,7 +116,20 @@ pub const PmtilesSource = struct {
         return .{
             .ptr = self,
             .fetch = fetch,
+            .kind = .vector,
             .encoding = encoding,
+            .minzoom = self.reader.header.min_zoom,
+            .maxzoom = @min(maxzoom, self.reader.header.max_zoom),
+        };
+    }
+
+    /// The same archive read as a RASTER source: its tiles are PNG images
+    /// (pmtiles TileType.png), decoded by util/png.zig.
+    pub fn rasterSource(self: *PmtilesSource, maxzoom: u8) Source {
+        return .{
+            .ptr = self,
+            .fetch = fetch,
+            .kind = .raster,
             .minzoom = self.reader.header.min_zoom,
             .maxzoom = @min(maxzoom, self.reader.header.max_zoom),
         };
@@ -139,7 +175,7 @@ pub const State = enum {
 
 const Slot = struct {
     state: State,
-    tile: ?*mvt.Tile = null,
+    payload: Payload = .none,
     arena: ?*std.heap.ArenaAllocator = null,
     bytes: usize = 0,
     /// `tick` count at last `want`, for the eviction sweep.
@@ -149,7 +185,7 @@ const Slot = struct {
 const Result = struct {
     key: u64,
     state: State,
-    tile: ?*mvt.Tile = null,
+    payload: Payload = .none,
     arena: ?*std.heap.ArenaAllocator = null,
     bytes: usize = 0,
 };
@@ -213,9 +249,9 @@ pub const Cache = struct {
             ar.deinit();
             self.gpa.destroy(ar);
         }
-        if (s.tile) |t| self.gpa.destroy(t);
+        if (s.payload == .vector) self.gpa.destroy(s.payload.vector);
         s.arena = null;
-        s.tile = null;
+        s.payload = .none;
     }
 
     fn freeResult(self: *Cache, r: Result) void {
@@ -223,7 +259,7 @@ pub const Cache = struct {
             ar.deinit();
             self.gpa.destroy(ar);
         }
-        if (r.tile) |t| self.gpa.destroy(t);
+        if (r.payload == .vector) self.gpa.destroy(r.payload.vector);
     }
 
     pub fn addSource(self: *Cache, src: Source) Allocator.Error!usize {
@@ -250,11 +286,39 @@ pub const Cache = struct {
         return .loading;
     }
 
-    /// The decoded tile, or null while it is loading, empty or failed.
+    /// The decoded VECTOR tile, or null while it is loading, empty, failed,
+    /// or a raster.
     pub fn get(self: *Cache, key: Key) ?*const mvt.Tile {
         const s = self.slots.getPtr(key.pack()) orelse return null;
         s.used = self.ticks;
-        return s.tile;
+        return switch (s.payload) {
+            .vector => |t| t,
+            else => null,
+        };
+    }
+
+    /// True when the slot holds decoded content of either kind.
+    pub fn isResident(self: *Cache, key: Key) bool {
+        const s = self.slots.getPtr(key.pack()) orelse return false;
+        s.used = self.ticks;
+        return s.payload != .none;
+    }
+
+    /// What KIND of content a key's source yields, for a caller sorting
+    /// resident tiles into vector and raster.
+    pub fn sourceKind(self: *const Cache, key: Key) Kind {
+        if (key.source >= self.sources.items.len) return .vector;
+        return self.sources.items[key.source].kind;
+    }
+
+    /// The decoded RASTER image. Borrowed: valid until the tile is evicted.
+    pub fn getRaster(self: *Cache, key: Key) ?Image {
+        const s = self.slots.getPtr(key.pack()) orelse return null;
+        s.used = self.ticks;
+        return switch (s.payload) {
+            .raster => |img| img,
+            else => null,
+        };
     }
 
     pub fn state(self: *const Cache, key: Key) ?State {
@@ -303,7 +367,7 @@ pub const Cache = struct {
             }
             self.freeSlot(s);
             s.state = r.state;
-            s.tile = r.tile;
+            s.payload = r.payload;
             s.arena = r.arena;
             s.bytes = r.bytes;
             s.used = self.ticks;
@@ -443,6 +507,18 @@ pub const Cache = struct {
             .not_ready => return .{ .key = k, .state = .loading },
             .bytes => {},
         }
+        if (src.kind == .raster) {
+            const img = png.read(a, got.bytes) catch return .{ .key = k, .state = .failed };
+            keep = true;
+            return .{
+                .key = k,
+                .state = .ready,
+                .payload = .{ .raster = .{ .w = img.w, .h = img.h, .rgba = img.rgba } },
+                .arena = ar,
+                .bytes = ar.queryCapacity(),
+            };
+        }
+
         const tile = self.gpa.create(mvt.Tile) catch
             return .{ .key = k, .state = .failed };
         var keep_tile = false;
@@ -457,7 +533,7 @@ pub const Cache = struct {
         return .{
             .key = k,
             .state = .ready,
-            .tile = tile,
+            .payload = .{ .vector = tile },
             .arena = ar,
             .bytes = ar.queryCapacity(),
         };

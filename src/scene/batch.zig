@@ -14,7 +14,9 @@ const t = @import("types.zig");
 fn classify(r: t.Range) t.Pipeline {
     return switch (r.prim) {
         .triangles => if (r.pattern != t.NO_PATTERN) .pattern else .fill,
-        .quads => switch (r.atlas) {
+        // A quads range naming an image samples THAT image, not an atlas:
+        // this is how a raster tile draws without a pipeline of its own.
+        .quads => if (r.pattern != t.NO_PATTERN) .raster else switch (r.atlas) {
             .sprite => .sprite,
             .glyph, .glyph_bold, .glyph_italic => .sdf,
             .none => .sprite, // untextured quads ride the sprite pipeline
@@ -26,6 +28,8 @@ fn classify(r: t.Range) t.Pipeline {
 /// glyph atlas; a range whose atlas (after fallback) never uploaded returns
 /// null and must be dropped — only the host knows what uploaded.
 fn resolveAtlas(r: t.Range, have: u8) ?t.Atlas {
+    // A raster range brings its own texture, so no atlas has to be resident.
+    if (r.prim == .quads and r.pattern != t.NO_PATTERN) return .none;
     if (r.prim != .quads or r.atlas == .none) return .none;
     var a = r.atlas;
     if ((have & t.AtlasBit.bit(a)) == 0 and (a == .glyph_bold or a == .glyph_italic))

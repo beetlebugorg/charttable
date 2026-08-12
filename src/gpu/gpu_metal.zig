@@ -467,7 +467,15 @@ pub const Gpu = struct {
                 },
                 .quads => {
                     if (s.qbuf == null or s.qpbuf == null) continue;
-                    const tex = self.atlasTexture(d.atlas) orelse continue;
+                    // A raster range samples the image the scene carries for
+                    // it, not an atlas — but it still rides the sprite
+                    // pipeline: a raster tile IS a textured world-space quad
+                    // with the antimeridian wrap and paint-order depth the
+                    // sprite shader already does (lookout raster.zig).
+                    const tex = if (d.pipeline == .raster) blk: {
+                        if (d.pattern >= s.patterns.len) continue;
+                        break :blk s.patterns[d.pattern].tex orelse continue;
+                    } else self.atlasTexture(d.atlas) orelse continue;
                     const is_sdf = d.pipeline == .sdf;
                     // Text halos render in the effective background colour
                     // (batch stamps it on the draw): night text must not glare

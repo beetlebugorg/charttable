@@ -100,6 +100,7 @@ pub const Kind = enum(u8) {
     line = 2,
     symbol = 3,
     text = 4,
+    raster = 5,
 };
 
 pub const Prim = enum(u8) {
@@ -135,10 +136,12 @@ pub const Pipeline = enum(u8) {
 
 pub const NO_PATTERN: u32 = 0xFFFF_FFFF;
 
-/// One area-fill pattern cell: RGBA8, w*h*4, row-major, rasterized at the
-/// scene's screen density (w and h ARE the on-screen period in device px).
-/// The host tiles it per fragment, phase-anchored to the WORLD origin so the
-/// pattern rides the map under a pan instead of swimming.
+/// One image the scene carries its own texture for, indexed by Range.pattern.
+///
+/// Two uses, same table: an area-fill PATTERN cell (w and h ARE the on-screen
+/// period in device px; the host tiles it per fragment, phase-anchored to the
+/// WORLD origin so it rides the map under a pan instead of swimming), and a
+/// RASTER tile (the whole image mapped once across its quad, sampled 0..1).
 pub const PatternCell = struct {
     w: u32,
     h: u32,

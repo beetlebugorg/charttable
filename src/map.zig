@@ -54,6 +54,19 @@ pub const Built = struct {
     eval_errors: usize = 0,
 };
 
+/// One decoded raster tile offered to the build. `rgba` is borrowed for the
+/// duration of the build (the tile cache owns it), and the scene borrows it
+/// on through Built.patterns, so the caller must not evict it before the
+/// backend has uploaded the scene.
+pub const RasterTile = struct {
+    id: coord.TileId,
+    /// Which style source this came from, so a layer draws only its own.
+    source: []const u8,
+    w: u32,
+    h: u32,
+    rgba: []const u8,
+};
+
 /// Symbol assets for the build; without them symbol layers are skipped.
 pub const Assets = struct {
     sprite: ?*const sprites.Sprite = null,
@@ -246,6 +259,20 @@ pub fn buildScene(
     view: View,
     assets: Assets,
 ) !Built {
+    return buildSceneWithRasters(arena, style, tiles, &.{}, view, assets);
+}
+
+/// buildScene plus raster-source tiles. Raster layers draw in style order
+/// like everything else — the style decides whether the picture sits under
+/// the chart or over it, which is the whole reason it is a layer.
+pub fn buildSceneWithRasters(
+    arena: std.mem.Allocator,
+    style: *const styles.Style,
+    tiles: []const SourcedTile,
+    rasters: []const RasterTile,
+    view: View,
+    assets: Assets,
+) !Built {
     var out = Built{};
     var verts: std.ArrayList(types.Vertex) = .empty;
     var paint: std.ArrayList(types.PaintVertex) = .empty;
@@ -284,7 +311,10 @@ pub fn buildScene(
             },
             .fill, .line => {},
             .symbol => if (assets.sprite == null and assets.glyph_atlas == null) continue,
-            .raster => continue, // raster sources: later
+            .raster => {
+                try layoutRasterLayer(arena, sl, layer_i, rasters, view, layerDepth(layer_i, n_layers), &quads, &quad_paint, &patterns, &ranges);
+                continue;
+            },
         }
         const source_layer = sl.source_layer orelse continue;
         const depth = layerDepth(layer_i, n_layers);
@@ -519,6 +549,80 @@ pub fn buildScene(
     out.patterns = patterns.items;
     out.missing_images = missing.keys();
     return out;
+}
+
+/// One raster layer: every tile of its source becomes a world-space quad
+/// covering that tile's rect, sampling the tile's own image.
+///
+/// No new pipeline and no new vertex stream — a raster tile IS a textured
+/// quad, and the sprite path already carries the antimeridian wrap and the
+/// paint-order depth (lookout raster.zig's rationale). The corner offsets are
+/// zero: unlike a symbol, a raster tile scales WITH the map.
+///
+/// Known cost: the scene borrows each image and the backend makes a texture
+/// per scene rebuild, so a rebuild re-uploads every visible raster tile. The
+/// fix is a texture cache keyed by tile id in the backend; until raster is
+/// load-bearing, correctness first.
+fn layoutRasterLayer(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    layer_i: usize,
+    rasters: []const RasterTile,
+    view: View,
+    depth: f32,
+    quads: *std.ArrayList(types.Quad),
+    quad_paint: *std.ArrayList(types.PaintVertex),
+    patterns: *std.ArrayList(types.PatternCell),
+    ranges: *std.ArrayList(types.Range),
+) !void {
+    const want_source = sl.source orelse return;
+    for (rasters) |rt| {
+        if (!std.mem.eql(u8, rt.source, want_source)) continue;
+        if (rt.w == 0 or rt.h == 0) continue;
+        if (rt.rgba.len < @as(usize, rt.w) * rt.h * 4) continue;
+
+        const rect = rt.id.worldRect();
+        const x0: f32 = @floatCast(rect.x0 - view.origin.x);
+        const y0: f32 = @floatCast(rect.y0 - view.origin.y);
+        const x1: f32 = @floatCast(rect.x1 - view.origin.x);
+        const y1: f32 = @floatCast(rect.y1 - view.origin.y);
+
+        const image: u32 = @intCast(patterns.items.len);
+        try patterns.append(arena, .{ .w = rt.w, .h = rt.h, .rgba = rt.rgba });
+
+        const first: u32 = @intCast(quads.items.len);
+        const corners = [4][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
+        const uvs = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+        const order = [6]u8{ 0, 1, 2, 0, 2, 3 };
+        try quads.ensureUnusedCapacity(arena, 6);
+        try quad_paint.ensureUnusedCapacity(arena, 6);
+        for (order) |ci| {
+            quads.appendAssumeCapacity(.{
+                .x = corners[ci][0],
+                .y = corners[ci][1],
+                .ox = 0,
+                .oy = 0,
+                .u = uvs[ci][0],
+                .v = uvs[ci][1],
+                .weight = 0,
+                .zmin = types.ZMIN_ALL,
+                .zmax = types.ZMAX_ALL,
+                .flags = 0,
+                .flip = 0,
+                .tangent_q = 0,
+                .depth = depth,
+            });
+            quad_paint.appendAssumeCapacity(.{ .color = .{ 255, 255, 255, 255 } });
+        }
+        try ranges.append(arena, .{
+            .first = first,
+            .count = 6,
+            .paint_key = @intCast(layer_i),
+            .pattern = image,
+            .kind = .raster,
+            .prim = .quads,
+        });
+    }
 }
 
 /// Resolve a pattern-fill layer's cell for the current feature, interning it
