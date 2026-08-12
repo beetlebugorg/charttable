@@ -95,7 +95,7 @@ int charttable_add_source_pmtiles(charttable *, const char *name,
                                   const char *path);
 
 /* Set one paint property from a JSON fragment ("#ff0000", 0.5, or a whole
- * expression). A colour or opacity the layer applies uniformly refills the
+ * expression). A color or opacity the layer applies uniformly refills the
  * paint stream and never re-lays-out: returns 1 when it was served that way,
  * 0 when it needed a rebuild, negative on error. */
 int charttable_set_paint_property(charttable *, const char *layer,

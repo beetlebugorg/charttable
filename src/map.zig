@@ -45,7 +45,7 @@ pub const PaintSpan = struct {
     first: u32,
     count: u32,
     layer: u32,
-    /// Whether this layer's colour moves with the camera. A zoom change
+    /// Whether this layer's color moves with the camera. A zoom change
     /// refills only these; a setPaintProperty refills whichever layer it
     /// touched, zoom-dependent or not.
     zoom_dependent: bool,
@@ -54,7 +54,7 @@ pub const PaintSpan = struct {
 pub const Built = struct {
     vertices: []const types.Vertex = &.{},
     /// MUTABLE by design: `refillPaint` rewrites it in place when the camera
-    /// moves a zoom-only colour, which is the whole point of keeping paint in
+    /// moves a zoom-only color, which is the whole point of keeping paint in
     /// its own stream (DESIGN.md: paint changes never re-layout).
     paint: []types.PaintVertex = &.{},
     indices: []const u32 = &.{},
@@ -81,14 +81,14 @@ pub const Built = struct {
 };
 
 const PaintKind = struct {
-    /// The colour is the same for every feature in the layer, so a refill
+    /// The color is the same for every feature in the layer, so a refill
     /// can serve a change to it without re-running the feature loop.
     refillable: bool,
     /// ...and it moves with the camera, so a zoom change must.
     zoom_dependent: bool,
 };
 
-/// How this layer's COLOUR and OPACITY behave. A feature-driven colour is
+/// How this layer's COLOR and OPACITY behave. A feature-driven color is
 /// NOT refillable: each feature has its own value, and a refill has no
 /// feature to evaluate against.
 ///
@@ -130,9 +130,9 @@ pub fn refillPaint(
     return refillSpans(arena, style, built, zoom, .zoom_moved);
 }
 
-/// Refill the spans belonging to ONE layer, whatever its zoom behaviour —
+/// Refill the spans belonging to ONE layer, whatever its zoom behavior —
 /// what a host's setPaintProperty needs. Returns false when that layer's
-/// colour is per-feature, in which case the caller must rebuild.
+/// color is per-feature, in which case the caller must rebuild.
 pub fn refillLayerPaint(
     arena: std.mem.Allocator,
     style: *const styles.Style,
@@ -141,10 +141,10 @@ pub fn refillLayerPaint(
     layer: u32,
 ) bool {
     // The span says WHERE the layer's vertices are; whether a refill can
-    // reproduce its colour depends on the style as it is NOW. A host that
-    // just replaced a flat colour with a per-feature one has a stale span
-    // claiming refillable, and honouring it would paint every feature the
-    // same wrong colour.
+    // reproduce its color depends on the style as it is NOW. A host that
+    // just replaced a flat color with a per-feature one has a stale span
+    // claiming refillable, and honoring it would paint every feature the
+    // same wrong color.
     if (layer >= style.layers.len) return false;
     if (!paintKindOf(&style.layers[layer]).refillable) return false;
     return refillSpans(arena, style, built, zoom, .{ .layer = layer });
@@ -638,7 +638,7 @@ pub fn buildSceneWithRasters(
         // data-driven: tile57 concats "pat:" onto a feature property), so the
         // layer's triangles split into one range per distinct cell.
         const is_pattern = sl.kind == .fill and sl.get("fill-pattern") != null;
-        // Only layers whose colour or opacity moves with the camera alone
+        // Only layers whose color or opacity moves with the camera alone
         // need a span; everything else is baked correctly at layout.
         const paint_kind = if (is_pattern)
             PaintKind{ .refillable = false, .zoom_dependent = false }
@@ -1972,7 +1972,7 @@ test "buildScene: the overscale hatch draws over the fills, not instead of them"
 // position, with the sprite cell centered on it (the spec's default
 // icon-anchor). Checked numerically rather than against tile57's `png`
 // output: that tool renders tile57's OWN S-52 portrayal and takes no
-// --style, so it is an oracle for fill colours (same palette, same
+// --style, so it is an oracle for fill colors (same palette, same
 // expressions) and never was one for symbol geometry.
 test "buildScene: a point symbol anchors exactly on its feature" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

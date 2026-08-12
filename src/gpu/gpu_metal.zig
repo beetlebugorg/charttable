@@ -30,7 +30,7 @@ const msl_source = @embedFile("metal_msl");
 /// `struct U` static_asserts the same size at pipeline build.
 pub const Uniforms = scene.Uniforms;
 
-/// RGBA colour 0..1.
+/// RGBA color 0..1.
 pub const Color = extern struct { r: f32, g: f32, b: f32, a: f32 };
 
 /// Monotonic milliseconds from an arbitrary epoch.
@@ -77,7 +77,7 @@ pub const Gpu = struct {
     host_density: f32 = 0,
 
     /// Frame clear = the style's effective background (host sets it). Also
-    /// the SDF halo colour the batcher stamps on text draws.
+    /// the SDF halo color the batcher stamps on text draws.
     clear: Color = .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 },
 
     /// The opaque front-to-back depth pre-pass (phase A). A pure optimization
@@ -128,7 +128,7 @@ pub const Gpu = struct {
         index_count: u32 = 0,
         quad_vert_count: u32 = 0,
         /// Entries in pbuf, so an in-place paint refill can reject a skew
-        /// instead of writing someone else's colours over the stream.
+        /// instead of writing someone else's colors over the stream.
         paint_count: u32 = 0,
         ranges: []scene.Range = &.{},
         patterns: []PatternTex = &.{},
@@ -335,7 +335,7 @@ pub const Gpu = struct {
     }
 
     /// Refill the PAINT stream in place. Stream A (geometry) and the index
-    /// buffer are untouched, so a zoom-only colour change or a palette flip
+    /// buffer are untouched, so a zoom-only color change or a palette flip
     /// costs one memcpy instead of a rebuild — the "day/night for the price
     /// of a buffer refill" half of the two-stream contract.
     pub fn updatePaint(self: *Gpu, paint: []const scene.PaintVertex) !void {
@@ -493,7 +493,7 @@ pub const Gpu = struct {
                         break :blk s.patterns[d.pattern].tex orelse continue;
                     } else self.atlasTexture(d.atlas) orelse continue;
                     const is_sdf = d.pipeline == .sdf;
-                    // Text halos render in the effective background colour
+                    // Text halos render in the effective background color
                     // (batch stamps it on the draw): night text must not glare
                     // inside a hardcoded light halo.
                     if (is_sdf) uu.color = d.color;
@@ -574,7 +574,7 @@ pub const Gpu = struct {
 
 // ---- headless smoke test -----------------------------------------------------
 // The whole contract end to end: two vertex streams uploaded, an opaque
-// triangle drawn through the phase-A depth pre-pass in its PAINT colour, a
+// triangle drawn through the phase-A depth pre-pass in its PAINT color, a
 // blended triangle through phase B, and a range whose zmax sits below the
 // frame's zoom culled by the shader gate. macOS-only (needs a Metal device).
 
@@ -647,12 +647,12 @@ test "metal offscreen smoke: paint stream draws, zoom gate culls" {
             return .{ buf[i], buf[i + 1], buf[i + 2], buf[i + 3] };
         }
     };
-    // Centre: the opaque triangle's PAINT colour — and NOT green, which is
+    // Centre: the opaque triangle's PAINT color — and NOT green, which is
     // the zoom gate holding (B passes the depth test if it draws at all).
     try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, P.at(px, 128, 128));
-    // Inside C only: the blended phase-B triangle over the clear colour.
+    // Inside C only: the blended phase-B triangle over the clear color.
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, P.at(px, 230, 128));
-    // Outside everything: the clear colour.
+    // Outside everything: the clear color.
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, P.at(px, 5, 5));
 }
 

@@ -3,7 +3,7 @@
 // the same projection; the tiling itself is per-fragment so the cell keeps a
 // constant screen size and stays ANCHORED TO THE WORLD under a pan instead of
 // swimming with the screen. No paint stream: the cell's own texels are the
-// colour. Matches metal.metal pattern_vert.
+// color. Matches metal.metal pattern_vert.
 
 layout(location = 0) in vec2  a_pos;
 layout(location = 1) in vec2  a_off;

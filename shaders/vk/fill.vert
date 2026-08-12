@@ -1,5 +1,5 @@
 #version 450
-// charttable fill vertex shader (Vulkan / SDL_GPU): flat-colour triangles —
+// charttable fill vertex shader (Vulkan / SDL_GPU): flat-color triangles —
 // area fills and line work. The contract is src/scene/types.zig;
 // shaders/metal.metal is its reference statement and this must match it.
 //

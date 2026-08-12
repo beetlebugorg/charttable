@@ -5,7 +5,7 @@
 // flip. Matches metal.metal sprite_vert.
 //
 // Binding 0 is scene.Quad (40 B); binding 1 is the paint stream. A sprite
-// ignores the paint stream (its texels carry the colour); an SDF glyph tints
+// ignores the paint stream (its texels carry the color); an SDF glyph tints
 // by it.
 
 layout(location = 0) in vec2  a_pos;    // tile-local anchor

@@ -456,7 +456,7 @@ void ctm_bind_texture(ctm_frame *f, ctm_tex *t) {
 void ctm_set_uniforms(ctm_frame *f, const void *bytes, size_t len) {
     if (!f) return;
     [f->enc setVertexBytes:bytes length:len atIndex:2];
-    // The SDF text fragment stage reads the uniform too (halo colour).
+    // The SDF text fragment stage reads the uniform too (halo color).
     [f->enc setFragmentBytes:bytes length:len atIndex:1];
 }
 

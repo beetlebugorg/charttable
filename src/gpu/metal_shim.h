@@ -63,7 +63,7 @@ ctm_buf *ctm_new_buffer(ctm_ctx *c, const void *bytes, size_t len);
 void ctm_free_buffer(ctm_buf *b);
 /* Overwrite an existing buffer's contents in place (shared storage, so this
  * is a memcpy). Returns 0 when `len` exceeds the buffer. The paint stream
- * uses it: a zoom-only colour change refills stream B without touching
+ * uses it: a zoom-only color change refills stream B without touching
  * geometry or rebuilding the scene. */
 int ctm_write_buffer(ctm_buf *b, const void *bytes, size_t len);
 ctm_tex *ctm_new_texture_rgba(ctm_ctx *c, const void *rgba, uint32_t w, uint32_t h);
@@ -87,7 +87,7 @@ void ctm_bind_vbuf(ctm_frame *f, ctm_buf *b);
 void ctm_bind_paint(ctm_frame *f, ctm_buf *b);
 void ctm_bind_texture(ctm_frame *f, ctm_tex *t);
 /* The 128-byte scene.Uniforms block: vertex [[buffer(2)]] + fragment
- * [[buffer(1)]] (the SDF fragment stage reads the halo colour). */
+ * [[buffer(1)]] (the SDF fragment stage reads the halo color). */
 void ctm_set_uniforms(ctm_frame *f, const void *bytes, size_t len);
 void ctm_draw(ctm_frame *f, uint32_t first, uint32_t count);
 /* Indexed triangles against the bound vertex buffer; `first` in u32-index units. */

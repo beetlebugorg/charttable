@@ -99,7 +99,7 @@ pub const Map = struct {
     /// frame at generation N needs no upload — the "pan changed no buffers"
     /// probe the acceptance test asserts on.
     scene_generation: u64 = 0,
-    /// Bumps when stream B alone is refilled (a zoom-only colour moved).
+    /// Bumps when stream B alone is refilled (a zoom-only color moved).
     /// Separate from scene_generation so a host re-uploads ONE buffer
     /// instead of the whole scene — that separation is the reason paint is
     /// its own stream.
@@ -230,9 +230,9 @@ pub const Map = struct {
         return self.bindSource(name, archive.rasterSource(maxzoom));
     }
 
-    /// Set one paint property. A colour or opacity the layer applies
+    /// Set one paint property. A color or opacity the layer applies
     /// uniformly refills stream B and never re-lays-out (DESIGN.md's
-    /// invariant); anything else — a per-feature colour, a line width, a
+    /// invariant); anything else — a per-feature color, a line width, a
     /// property on a layer with no resident geometry — falls back to a
     /// rebuild, which is correct either way.
     ///
@@ -394,12 +394,12 @@ pub const Map = struct {
         return n;
     }
 
-    /// A zoom-only colour follows the camera, so when the camera moves
+    /// A zoom-only color follows the camera, so when the camera moves
     /// inside its coverage the scene's paint is stale even though its
     /// geometry is not. Refill stream B and leave everything else alone.
     ///
     /// Quantized to the same 1/256 zoom steps the vertex zoom window uses:
-    /// below that the colour change is not representable in the frame, and
+    /// below that the color change is not representable in the frame, and
     /// the quantization is what stops a continuous pinch refilling every
     /// frame for nothing.
     fn refillPaintIfMoved(self: *Map, style: *const styles.Style) bool {
@@ -476,7 +476,7 @@ pub const Map = struct {
 
     /// What a host has already uploaded. Two counters, because the two
     /// streams change independently: a rebuild replaces everything, a
-    /// zoom-only colour change replaces stream B alone.
+    /// zoom-only color change replaces stream B alone.
     pub const Uploaded = struct {
         scene: u64 = 0,
         paint: u64 = 0,
@@ -973,8 +973,8 @@ test "Map: pan across Annapolis rebuilds only on coverage breaks" {
 }
 
 // DESIGN.md's invariant, stated as a test: "Paint changes never re-layout."
-// A zoom-only colour follows the camera, so moving the camera inside the
-// built coverage MUST move the colour — and must do it by refilling stream B,
+// A zoom-only color follows the camera, so moving the camera inside the
+// built coverage MUST move the color — and must do it by refilling stream B,
 // not by rebuilding.
 test "Map: a zoom-only color refills stream B without re-laying-out" {
     const a = testing.allocator;
@@ -1010,7 +1010,7 @@ test "Map: a zoom-only color refills stream B without re-laying-out" {
     const verts = b.vertices.len;
 
     // Zoom a little, still well inside the coverage box and inside
-    // ZOOM_REBUILD. The colour must move; nothing else may.
+    // ZOOM_REBUILD. The color must move; nothing else may.
     m.cam.zoom = 14.5;
     m.cam.setTarget();
     const tick = try m.update();
@@ -1063,7 +1063,7 @@ test "Map: setPaintProperty refills; setLayoutProperty and setFilter rebuild" {
     const rebuilds = m.rebuilds;
     const scene_gen = m.scene_generation;
 
-    // A uniform colour: paint only. No rebuild, no new geometry.
+    // A uniform color: paint only. No rebuild, no new geometry.
     var doc = std.heap.ArenaAllocator.init(a);
     defer doc.deinit();
     const red = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(), "\"#ff0000\"", .{});
@@ -1080,7 +1080,7 @@ test "Map: setPaintProperty refills; setLayoutProperty and setFilter rebuild" {
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, m.scene().?.paint[0].color);
     try testing.expectEqual(rebuilds, m.rebuilds);
 
-    // A per-feature colour cannot be refilled: it must rebuild.
+    // A per-feature color cannot be refilled: it must rebuild.
     const ddriven = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(),
         \\["match", ["get", "kind"], "water", "#101010", "#202020"]
     , .{});

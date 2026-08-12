@@ -776,7 +776,7 @@ test "vector and raster sources parse; unknown source types degrade" {
 }
 
 // A representative excerpt of tile57's emitted style: the background, an
-// area fill carrying the mariner nested-let colour expression (the alpha-
+// area fill carrying the mariner nested-let color expression (the alpha-
 // suffix `"TOKEN,0.5"` fold), a dashed line layer, and a text layer with
 // the data-driven text-anchor match and per-feature font stack — the exact
 // shapes tile57/src/style/{maplibre,mariner}.zig emit.
@@ -841,7 +841,7 @@ test "integration: a representative tile57-shaped style parses with zero diagnos
     try expectEqualStrings("sprite", st.sprite.?);
     try expectEqualStrings("mlt", st.sources.get("chart").?.vector.encoding.?);
 
-    // the nested-let colour: data-driven, never folded. Its `binding` dep is
+    // the nested-let color: data-driven, never folded. Its `binding` dep is
     // false OUTSIDE the expression — a closed let resolves its own bindings
     // (expr.zig strips the flag at the let node), so classification sees a
     // plain data-driven property.

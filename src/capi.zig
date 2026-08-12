@@ -261,7 +261,7 @@ export fn charttable_add_source_pmtiles(
 }
 
 /// Set one paint property from a JSON fragment (`"#ff0000"`, `0.5`, or a
-/// whole expression). A uniform colour or opacity refills the paint stream
+/// whole expression). A uniform color or opacity refills the paint stream
 /// and never re-lays-out; returns 1 when it was served that way, 0 when it
 /// needed a rebuild, negative on error.
 export fn charttable_set_paint_property(

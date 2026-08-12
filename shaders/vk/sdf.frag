@@ -1,7 +1,7 @@
 #version 450
 // SDF text: sample the signed-distance field (.r), antialias with the
 // screen-space derivative, tint by the paint stream. `v_weight` is the halo
-// width in SDF field units (0 = none); the halo renders in the colour the
+// width in SDF field units (0 = none); the halo renders in the color the
 // host stamped on the draw (u.color) -- the style's text-halo-color, or the
 // frame's effective background -- so night text is not trapped inside a
 // glaring light outline. Matches metal.metal sdf_frag.
@@ -19,7 +19,7 @@ layout(set = 3, binding = 0) uniform U {
     float wrap_x;
     float rot_sin;
     float rot_cos;
-    vec4  color;      // the SDF halo colour for this draw
+    vec4  color;      // the SDF halo color for this draw
     vec2  anchor_px;
     vec2  cell_px;
 } u;

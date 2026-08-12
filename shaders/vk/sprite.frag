@@ -1,5 +1,5 @@
 #version 450
-// A sprite keeps its authored colours: the paint stream is ignored here. A
+// A sprite keeps its authored colors: the paint stream is ignored here. A
 // fully transparent fragment must not reach the depth buffer -- a raster tile
 // drawn through this pipeline WITH depth write is transparent outside its
 // coverage, and those pixels would otherwise cut holes in what is underneath.

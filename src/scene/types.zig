@@ -127,7 +127,7 @@ pub const AtlasBit = struct {
 /// into sprite or D3D12 keeping it separate is a backend detail; the
 /// classification is shared.
 pub const Pipeline = enum(u8) {
-    fill = 0, // flat-colour triangles, colour per stream-B vertex
+    fill = 0, // flat-color triangles, color per stream-B vertex
     pattern = 1, // area fill tiled from a pattern cell
     sprite = 2, // symbol quads from the sprite atlas
     sdf = 3, // SDF glyph quads with halo tiers
