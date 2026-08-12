@@ -280,9 +280,25 @@ fn constantOrDiag(p: *P, prop: *const properties.Prop, layer_id: []const u8, v: 
 /// Classify and parse one property value per the spec's detection rule
 /// (see the module doc). Null = degraded (diagnostic recorded, default
 /// applies).
+fn expectedType(prop: *const properties.Prop) ?@import("typecheck.zig").Type {
+    const tc = @import("typecheck.zig");
+    return switch (prop.value_type) {
+        .number => tc.Type.number,
+        .color => tc.Type.color,
+        .boolean => tc.Type.boolean,
+        .string => tc.Type.string,
+        .enumeration => tc.Type.string,
+        .number_array => |len| .{ .array = .{ .item = .number, .len = if (len) |l| l else null } },
+        .string_array => .{ .array = .{ .item = .string, .len = null } },
+    };
+}
+
 fn parsePropValue(p: *P, prop: *const properties.Prop, layer_id: []const u8, j: std.json.Value) Error!?PropValue {
     if (isExpressionJson(j)) {
-        const parsed = exprs.parse(p.a, j) catch |e| switch (e) {
+        // Parse with the property's expected type: the typechecker then
+        // applies the spec's coercion contexts (a constant hex string in a
+        // color hole is a color literal) and rejects real mismatches.
+        const parsed = exprs.parseWithType(p.a, j, expectedType(prop)) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidExpression => {
                 try p.diag(layer_id, prop.name, "invalid or unsupported expression — default applies", .{});
