@@ -210,6 +210,8 @@ pub const Map = struct {
     /// The last rebuild ran out of tessellation budget and left tiles out of
     /// the scene. Not an error state: the next update picks them up.
     partial: bool = false,
+    /// How many tiles' geometry the live scene actually holds.
+    scene_tiles: usize = 0,
 
     /// Updates since the host last moved the camera.
     ///
@@ -565,9 +567,35 @@ pub const Map = struct {
             if (self.cache.isResident(@bitCast(k))) try have.append(self.gpa, k);
         }
 
-        if (!coverage_broke and self.sameResident(have.items)) {
+        // A partial scene rebuilds even when nothing else changed -- that is
+        // the budget's next batch -- but against the SAME wanted set, which
+        // `coverage_broke` being false leaves untouched.
+        if (!coverage_broke and !self.partial and self.sameResident(have.items)) {
             tick.paint_refilled = self.refillPaintIfMoved(&style);
             return tick;
+        }
+
+        // Never trade a scene that covers the screen for one that covers
+        // less of it. Crossing a zoom level makes every tile a miss at once,
+        // and the replacements arrive over the following frames -- so
+        // rebuilding the moment the level changes swaps a whole chart for
+        // whichever two tiles happened to be back, which is what "it blanks
+        // out on zoom" is. The old scene still projects correctly at the new
+        // camera; keep drawing it until the new set can stand in for it.
+        //
+        // Guarded on tiles still being in flight, so a view that genuinely
+        // has less to draw (open water, a failed tile) is never held back.
+        //
+        // Zooming OUT cannot use the same test: the view grows past the
+        // built box, coverage stops holding, and blank edges are then
+        // honest. But an EMPTY scene never is, in either direction, so long
+        // as tiles are still coming.
+        if (self.built != null and self.pendingWanted() > 0) {
+            const worse = if (self.coverageHolds())
+                have.items.len < self.resident.items.len
+            else
+                have.items.len == 0;
+            if (worse) return tick;
         }
 
         try self.rebuild(&style, have.items);
@@ -613,12 +641,19 @@ pub const Map = struct {
     /// True when the view has panned or zoomed out of the built coverage. The
     /// x distance WRAPS: crossing the antimeridian is a short hop, not a
     /// world-width jump.
+    /// Whether the scene already built still reaches every screen edge.
+    /// A scene that does can keep being drawn: a camera move inside its box
+    /// is a matrix change, not a layout change.
+    fn coverageHolds(self: *const Map) bool {
+        if (!self.has_coverage) return false;
+        const he = self.cam.halfExtents();
+        return @abs(cameras.wrapDx(self.cam.center.x, self.cov_origin.x)) + he.x <= self.cov_hw and
+            @abs(self.cam.center.y - self.cov_origin.y) + he.y <= self.cov_hh;
+    }
+
     pub fn needsRebuild(self: *Map) bool {
         if (self.style == null) return false;
-        if (!self.has_coverage) return true;
-        const he = self.cam.halfExtents();
-        if (@abs(cameras.wrapDx(self.cam.center.x, self.cov_origin.x)) + he.x > self.cov_hw or
-            @abs(self.cam.center.y - self.cov_origin.y) + he.y > self.cov_hh) return true;
+        if (!self.coverageHolds()) return true;
         // The build zoom is quantized, so this fires when the quantum
         // changes -- which is exactly when the cached geometry is stale.
         //
@@ -700,8 +735,8 @@ pub const Map = struct {
     /// Work outstanding, ignoring whether the current camera has been drawn:
     /// loading, an animation, a rebuild owed.
     fn busy(self: *Map) bool {
-        return self.dirty or self.cam.animating() or self.needsRebuild() or
-            self.pendingWanted() > 0;
+        return self.dirty or self.partial or self.cam.animating() or
+            self.needsRebuild() or self.pendingWanted() > 0;
     }
 
     /// True when anything the last drawn frame depended on has changed: the
@@ -1058,15 +1093,23 @@ pub const Map = struct {
         self.scene_generation += 1;
         self.paint_generation += 1;
         self.rebuilds += 1;
-        // Tiles left untessellated by the budget: come back next frame and
+        self.dirty = false;
+        // Tiles left untessellated by the budget: come back next update and
         // take the next batch. Their buckets are cached now, so the work
         // already done is not repeated.
-        // Clear first, then re-arm: tiles the budget left out mean this
-        // scene is incomplete, and the next update must come back for them.
-        self.dirty = false;
+        //
+        // Deliberately NOT `dirty`. Dirty means "re-choose the coverage AND
+        // rebuild", so using it here made every catch-up update re-pick the
+        // tile set at whatever zoom the camera had reached -- a level whose
+        // tiles had not loaded -- and build a scene out of nothing. That is
+        // a map that blanks whenever you zoom. `partial` means the narrower
+        // thing it should: finish tessellating the set already chosen.
         self.partial = deferred > 0;
-        if (self.partial) self.dirty = true;
 
+        // Tiles whose geometry is actually IN the scene, which is `have`
+        // minus whatever the budget deferred. The gap is what a test can
+        // watch to catch the scene silently losing ground.
+        self.scene_tiles = parts.items.len - 1; // less the global pass
         self.resident.clearRetainingCapacity();
         try self.resident.appendSlice(self.gpa, have);
         self.evictBuckets(self.wanted.items);
@@ -2041,4 +2084,95 @@ test "Map: the wanted set wraps at the antimeridian" {
         if (key.x == 15) saw_high = true;
     }
     try testing.expect(saw_low and saw_high);
+}
+
+// Crossing a zoom quantum invalidates every bucket at once, because the
+// build zoom is part of the bucket key. If the tessellation budget answers
+// that by leaving tiles OUT of the scene, a zoom blanks the map -- the exact
+// symptom this test exists to prevent. Tiles are always resident here (the
+// stub answers instantly), so any loss of coverage is the budget's doing.
+test "Map: a zoom never empties the scene" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    // maxzoom well above the start, or buildZoom clamps and the bucket key
+    // never moves -- which makes this test pass without testing anything.
+    _ = try m.bindSource("chart", stub.source(16));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    try testing.expect(m.scene().?.vertices.len > 0);
+    try testing.expect(m.resident.items.len > 2); // or the budget never bites
+    // A settled map draws every tile it holds -- the budget defers, never drops.
+    try testing.expectEqual(m.resident.items.len, m.scene_tiles);
+
+    // Vertex count is NOT the measure: zooming in puts fewer tiles on
+    // screen, so a smaller scene can still be a complete one. The invariant
+    // is simply that there is always something to draw -- this stub answers
+    // every tile, so no frame of this zoom has an honest reason to be empty.
+    //
+    // Comparing against `resident` would be worthless: a rebuild that drops
+    // everything empties resident too, so the two agree at zero and the
+    // check passes on exactly the frame it exists to catch.
+    const Check = struct {
+        fn scene(map_ptr: *Map, where: []const u8) !void {
+            if (map_ptr.scene().?.vertices.len == 0) {
+                std.debug.print(
+                    "\nblanked {s} at z{d} ({d} tiles resident)\n",
+                    .{ where, map_ptr.cam.zoom, map_ptr.resident.items.len },
+                );
+                return error.SceneBlanked;
+            }
+        }
+    };
+
+    // Step across quantum after quantum, the way a pinch does, and look at
+    // the scene the host would actually draw on each frame.
+    var steps: usize = 0;
+    while (steps < 20) : (steps += 1) {
+        m.zoomAt(0.05, 256, 256);
+        _ = try m.update();
+        try Check.scene(&m, "mid-gesture");
+    }
+
+    // Fingers up. The deferred rebuild lands here, and the catch-up runs
+    // over several updates -- every one of which the host draws.
+    var frames: usize = 0;
+    while (frames < 40) : (frames += 1) {
+        _ = try m.update();
+        try Check.scene(&m, "on catch-up");
+        @import("util/lock.zig").sleepMs(1);
+    }
+
+    // And once it settles, the scene is whole again at the new zoom.
+    try settle(&m);
+    try testing.expectEqual(m.resident.items.len, m.scene_tiles);
+    try testing.expect(m.scene().?.vertices.len > 0);
+
+    // Zooming OUT is the harder direction: the view grows past the built
+    // coverage box, so the scene genuinely stops reaching the screen edges
+    // and the "it still covers" guard cannot apply. It must still never go
+    // empty -- blank edges are the price of zooming out, a blank screen is
+    // not.
+    steps = 0;
+    while (steps < 24) : (steps += 1) {
+        m.zoomAt(-0.05, 256, 256);
+        _ = try m.update();
+        try Check.scene(&m, "zooming out");
+        @import("util/lock.zig").sleepMs(1);
+    }
+    frames = 0;
+    while (frames < 40) : (frames += 1) {
+        _ = try m.update();
+        try Check.scene(&m, "out, on catch-up");
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try settle(&m);
+    try testing.expect(m.scene().?.vertices.len > 0);
 }
