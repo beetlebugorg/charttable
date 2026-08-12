@@ -1395,8 +1395,19 @@ fn lerpValue(a: std.mem.Allocator, va: Value, vb: Value, t: f64) Error!Value {
     switch (va) {
         .number => |x| return .{ .number = x + ((try asNum(vb)) - x) * t },
         .string => |sa| {
-            const ca = colors.parse(sa) orelse return error.Eval;
-            return lerpValue(a, .{ .color = ca }, vb, t);
+            if (colors.parse(sa)) |ca| return lerpValue(a, .{ .color = ca }, vb, t);
+            // Two non-color strings interpolate as a projection transition
+            // ({from, to, transition} — the projectionDefinition rule; even
+            // identical names produce the transition object mid-range).
+            const sb = switch (vb) {
+                .string => |s2| s2,
+                else => return error.Eval,
+            };
+            const entries = try a.alloc(Value.Entry, 3);
+            entries[0] = .{ .key = "from", .value = .{ .string = sa } };
+            entries[1] = .{ .key = "to", .value = .{ .string = sb } };
+            entries[2] = .{ .key = "transition", .value = .{ .number = t } };
+            return .{ .object = entries };
         },
         .color => |ca| {
             const cb = switch (vb) {

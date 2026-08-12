@@ -19,10 +19,7 @@ const Value = exprs.Value;
 
 /// Spec features not yet implemented: fixtures under these directories are
 /// counted as skipped. Shrink this list; never grow it silently.
-const skip_ops = [_][]const u8{
-    "interpolate/projection",
-    "projection",
-};
+const skip_ops = [_][]const u8{};
 
 /// The ratchet: the harness fails if fewer fixtures fully pass. Raise this
 /// every time the number goes up; never lower it.
@@ -39,7 +36,7 @@ const skip_ops = [_][]const u8{
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
 /// from the fixtures alone). Revisit with more fixture data points; the
 /// pixel difference is below visibility.
-const PASS_FLOOR: usize = 485;
+const PASS_FLOOR: usize = 490;
 
 const Score = struct {
     total: usize = 0,
@@ -410,10 +407,12 @@ fn evalWithSpec(
         fmt_root[0] = .{ .key = "sections", .value = .{ .array = sections } };
         return .{ .object = fmt_root };
     } else if (std.mem.eql(u8, type_name, "projectionDefinition")) {
-        // a projection is a name string or a [from, to, t] transition array
+        // a projection is a name string, a [from, to, t] transition array,
+        // or the {from, to, transition} object interpolation produces
         switch (v) {
             .string => {},
             .array => |items| if (items.len != 3) return error.Eval,
+            .object => |entries| if (entries.len != 3) return error.Eval,
             else => return error.Eval,
         }
     } else if (std.mem.eql(u8, type_name, "enum")) {
