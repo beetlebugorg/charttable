@@ -34,6 +34,7 @@ pub const Gpu = struct {
     pub const SceneData = struct {
         vertices: []const scene.Vertex = &.{},
         paint: []const scene.PaintVertex = &.{},
+        paint_hi: []const scene.PaintVertex = &.{},
         indices: []const u32 = &.{},
         quads: []const scene.Quad = &.{},
         quad_paint: []const scene.PaintVertex = &.{},
