@@ -78,6 +78,17 @@ pub const PmtilesSource = struct {
         return if (bytes) |b| .{ .bytes = b } else .empty;
     }
 
+    /// The decoder the ARCHIVE declares, when it declares one. A pmtiles
+    /// header names its tile type, which is more authoritative than a style
+    /// that simply omits `encoding` (tile57's generated styles do).
+    pub fn headerEncoding(self: *const PmtilesSource) ?Encoding {
+        return switch (self.reader.header.tile_type) {
+            .mlt => .mlt,
+            .mvt => .mvt,
+            else => null,
+        };
+    }
+
     pub fn source(self: *PmtilesSource, encoding: Encoding, maxzoom: u8) Source {
         return .{
             .ptr = self,

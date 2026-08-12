@@ -184,6 +184,30 @@ pub const Map = struct {
         return idx;
     }
 
+    /// Bind a pmtiles archive to a style source name, taking the decoder and
+    /// the zoom band from the STYLE rather than the caller: the spec's
+    /// `encoding` field ("mlt" | "mvt", default mvt) picks mlt.decode or
+    /// mvt.decode, and the source's maxzoom bounds the tiles asked for.
+    /// The archive's own header narrows both further.
+    ///
+    /// `archive` must outlive the Map.
+    pub fn bindPmtiles(self: *Map, name: []const u8, archive: *caches.PmtilesSource) !usize {
+        // The archive's declared tile type is the fallback, not the default:
+        // a style that says `encoding` means it.
+        var encoding: caches.Encoding = archive.headerEncoding() orelse .mvt;
+        var maxzoom: u8 = 22;
+        if (self.style) |*s| {
+            if (s.sources.get(name)) |src| switch (src) {
+                .vector => |v| {
+                    if (v.encoding) |e| encoding = caches.Encoding.parse(e);
+                    maxzoom = @intFromFloat(std.math.clamp(v.maxzoom, 0, 22));
+                },
+                .raster => |r| maxzoom = @intFromFloat(std.math.clamp(r.maxzoom, 0, 22)),
+            };
+        }
+        return self.bindSource(name, archive.source(encoding, maxzoom));
+    }
+
     /// Symbol assets. Changing them re-lays-out (an icon that was missing may
     /// now resolve), so this bumps the style generation.
     pub fn setAssets(self: *Map, assets: Assets) void {
@@ -227,8 +251,9 @@ pub const Map = struct {
         var tick = Tick{};
         tick.tiles_landed = self.cache.tick();
 
+        // A style with no bound source still builds: its background layer is
+        // a real scene, and a map that never builds never reports idle.
         const style = self.style orelse return tick;
-        if (self.cache.sources.items.len == 0) return tick;
 
         // The tile set is re-chosen only when the view has left the built
         // coverage (or something forced a rebuild). Inside coverage the set
@@ -690,7 +715,10 @@ test "Map: pan across Annapolis rebuilds only on coverage breaks" {
     var m = Map.init(gpa, .{ .cache = .{ .workers = 3 } });
     defer m.deinit();
     try m.setStyleJson(style_json);
-    _ = try m.bindSource("chart", src.source(.mlt, 14));
+    // No decoder named here: the style's `encoding` (absent in tile57's
+    // generated style) falls back to the archive's own declared tile type.
+    try testing.expectEqual(caches.Encoding.mlt, src.headerEncoding().?);
+    _ = try m.bindPmtiles("chart", &src);
     m.setViewport(512, 512);
     m.setView(-76.4767, 38.9763, 14);
 

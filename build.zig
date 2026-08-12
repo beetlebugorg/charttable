@@ -46,6 +46,23 @@ pub fn build(b: *std.Build) void {
     ct_opts.addOption([]const u8, "out_dir", b.pathFromRoot("zig-out"));
     mod.addOptions("ct_build", ct_opts);
 
+    // The C ABI as a static library: `zig build lib` drops libcharttable.a
+    // and include/charttable.h into zig-out for a host to link (src/capi.zig
+    // holds the exports; the header is checked in, not generated).
+    const lib = b.addLibrary(.{
+        .name = "charttable",
+        .root_module = mod,
+        .linkage = .static,
+    });
+    const lib_step = b.step("lib", "Build the static library + C header");
+    lib_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
+    lib_step.dependOn(&b.addInstallFileWithDir(
+        b.path("include/charttable.h"),
+        .header,
+        "charttable.h",
+    ).step);
+    b.getInstallStep().dependOn(lib_step);
+
     // `zig build test` — the gate. Every source module is referenced from
     // src/root.zig so its tests ride this one build.
     const tests = b.addTest(.{ .root_module = mod });

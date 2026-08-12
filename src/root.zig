@@ -9,6 +9,7 @@
 pub const camera = @import("camera.zig");
 pub const map = @import("map.zig");
 pub const map_object = @import("map_object.zig");
+pub const capi = @import("capi.zig");
 pub const symbol_layout = @import("layout/symbol.zig");
 pub const scene = @import("scene/types.zig");
 pub const batch = @import("scene/batch.zig");
@@ -32,10 +33,18 @@ pub const png = @import("util/png.zig");
 pub const lock = @import("util/lock.zig");
 pub const clock = @import("util/clock.zig");
 
+comptime {
+    // Force the C ABI's `export fn`s to be analyzed and emitted. Zig is lazy:
+    // an imported file nothing references contributes no symbols, and
+    // libcharttable.a comes out with zero charttable_* exports in it.
+    _ = capi;
+}
+
 test {
     _ = camera;
     _ = map;
     _ = map_object;
+    _ = capi;
     _ = symbol_layout;
     _ = scene;
     _ = batch;
