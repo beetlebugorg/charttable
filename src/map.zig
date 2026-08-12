@@ -19,6 +19,9 @@ const mvt = @import("source/mvt.zig");
 const coord = @import("source/coord.zig");
 const fill = @import("layout/fill.zig");
 const line = @import("layout/line.zig");
+const symbol = @import("layout/symbol.zig");
+const sprites = @import("symbol/sprite.zig");
+const glyphs = @import("symbol/glyphs.zig");
 const types = @import("scene/types.zig");
 const cameras = @import("camera.zig");
 
@@ -37,10 +40,22 @@ pub const Built = struct {
     vertices: []const types.Vertex = &.{},
     paint: []const types.PaintVertex = &.{},
     indices: []const u32 = &.{},
+    quads: []const types.Quad = &.{},
+    quad_paint: []const types.PaintVertex = &.{},
     ranges: []const types.Range = &.{},
     background: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    /// icon-image names the sprite could not resolve, deduplicated — the
+    /// missing-image hook: the host renders them (tile57_render_symbol_run
+    /// for sounding digit runs), calls Sprite.addImage, and rebuilds.
+    missing_images: []const []const u8 = &.{},
     /// Features that failed a paint evaluation and fell to defaults.
     eval_errors: usize = 0,
+};
+
+/// Symbol assets for the build; without them symbol layers are skipped.
+pub const Assets = struct {
+    sprite: ?*const sprites.Sprite = null,
+    glyph_atlas: ?*const glyphs.GlyphAtlas = null,
 };
 
 /// Adapter: an MVT feature seen through the evaluator's Feature interface.
@@ -149,12 +164,21 @@ pub fn buildScene(
     style: *const styles.Style,
     tiles: []const SourcedTile,
     view: View,
+    assets: Assets,
 ) !Built {
     var out = Built{};
     var verts: std.ArrayList(types.Vertex) = .empty;
     var paint: std.ArrayList(types.PaintVertex) = .empty;
     var indices: std.ArrayList(u32) = .empty;
+    var quads: std.ArrayList(types.Quad) = .empty;
+    var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
     var ranges: std.ArrayList(types.Range) = .empty;
+    var missing: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var collider = symbol.Collider.init(arena);
+    // Projection of a world anchor to reference px for collision boxes; the
+    // view origin stands in for the screen center (they coincide for a
+    // centered build; a live Map passes its camera center here).
+    const world_to_px = 512.0 * std.math.pow(f64, 2.0, view.zoom);
 
     var ctx = eval_mod.Context{ .zoom = view.zoom };
 
@@ -175,7 +199,8 @@ pub fn buildScene(
                 continue;
             },
             .fill, .line => {},
-            .symbol, .raster => continue, // M4+
+            .symbol => if (assets.sprite == null and assets.glyph_atlas == null) continue,
+            .raster => continue, // raster sources: later
         }
         const source_layer = sl.source_layer orelse continue;
         const depth = layerDepth(layer_i, n_layers);
@@ -186,6 +211,11 @@ pub fn buildScene(
             const tl = st.tile.layer(source_layer) orelse continue;
             const rect = st.id.worldRect();
             const tile_span = rect.x1 - rect.x0;
+            const dx: f32 = @floatCast(rect.x0 - view.origin.x);
+            const dy: f32 = @floatCast(rect.y0 - view.origin.y);
+            const tile_quads_first: u32 = @intCast(quads.items.len);
+            var text_scratch: std.ArrayList(types.Quad) = .empty;
+            var text_paint_scratch: std.ArrayList(types.PaintVertex) = .empty;
             // Reference px per world unit at the view zoom (dash cutting).
             const px_per_unit = 512.0 * std.math.pow(f64, 2.0, view.zoom);
 
@@ -203,6 +233,8 @@ pub fn buildScene(
                 switch (sl.kind) {
                     .fill => if (f.geom_type != .polygon) continue,
                     .line => if (f.geom_type != .linestring and f.geom_type != .polygon) continue,
+                    // point placement; symbol-placement line decoration is later work
+                    .symbol => if (f.geom_type != .point) continue,
                     else => unreachable,
                 }
                 var mf = MvtFeature{ .layer = tl, .feature = f };
@@ -235,7 +267,24 @@ pub fn buildScene(
                 const before: u32 = @intCast(verts.items.len);
                 var color: Color = .{ .r = 0, .g = 0, .b = 0, .a = 1 };
                 switch (sl.kind) {
+                    .symbol => {
+                        try layoutSymbolFeature(arena, sl, &ctx, assets, f, .{
+                            .rect = rect,
+                            .dx = dx,
+                            .dy = dy,
+                            .tile_extent = tl.extent,
+                            .world_to_px = world_to_px,
+                            .view = view,
+                            .depth = feat_depth,
+                        }, &quads, &quad_paint, &text_scratch, &text_paint_scratch, &collider, &missing, &out.eval_errors);
+                        continue;
+                    },
                     .fill => {
+                        // A pattern fill draws its cell texture, not a flat
+                        // color; until the pattern pipeline is wired into
+                        // the build, emitting it as flat color would bury
+                        // the layers beneath. Skip.
+                        if (sl.get("fill-pattern") != null) continue;
                         const cv = evalProp(arena, resolveProp(sl, "fill-color").?, &ctx, .null, &out.eval_errors);
                         color = asColor(cv) orelse continue;
                         const ov = evalProp(arena, resolveProp(sl, "fill-opacity").?, &ctx, .{ .number = 1 }, &out.eval_errors);
@@ -270,14 +319,39 @@ pub fn buildScene(
                 if (rgba[3] != OPAQUE_ALPHA) all_opaque = false;
                 try paint.ensureUnusedCapacity(arena, added);
                 for (0..added) |_| paint.appendAssumeCapacity(.{ .color = rgba });
-                const dx: f32 = @floatCast(rect.x0 - view.origin.x);
-                const dy: f32 = @floatCast(rect.y0 - view.origin.y);
                 for (verts.items[before..]) |*v| {
                     v.x += dx;
                     v.y += dy;
                 }
             }
 
+            if (sl.kind == .symbol) {
+                const icon_count: u32 = @intCast(quads.items.len - tile_quads_first);
+                if (icon_count > 0) {
+                    try ranges.append(arena, .{
+                        .first = tile_quads_first,
+                        .count = icon_count,
+                        .paint_key = @intCast(layer_i),
+                        .kind = .symbol,
+                        .prim = .quads,
+                        .atlas = .sprite,
+                    });
+                }
+                if (text_scratch.items.len > 0) {
+                    const text_first: u32 = @intCast(quads.items.len);
+                    try quads.appendSlice(arena, text_scratch.items);
+                    try quad_paint.appendSlice(arena, text_paint_scratch.items);
+                    try ranges.append(arena, .{
+                        .first = text_first,
+                        .count = @intCast(text_scratch.items.len),
+                        .paint_key = @intCast(layer_i),
+                        .kind = .text,
+                        .prim = .quads,
+                        .atlas = .glyph,
+                    });
+                }
+                continue;
+            }
             const count: u32 = @intCast(indices.items.len - first_index);
             _ = first_vert;
             if (count == 0) continue;
@@ -295,8 +369,147 @@ pub fn buildScene(
     out.vertices = verts.items;
     out.paint = paint.items;
     out.indices = indices.items;
+    out.quads = quads.items;
+    out.quad_paint = quad_paint.items;
     out.ranges = ranges.items;
+    out.missing_images = missing.keys();
     return out;
+}
+
+const SymbolCtx = struct {
+    rect: coord.WorldRect,
+    dx: f32,
+    dy: f32,
+    tile_extent: u32,
+    world_to_px: f64,
+    view: View,
+    depth: f32,
+};
+
+/// One symbol feature: resolve icon and text, collide, emit quads (already
+/// rebased to the scene origin). Icons go straight to `quads`; text goes to
+/// the per-tile scratch so each (layer × tile) yields one sprite range and
+/// one glyph range.
+fn layoutSymbolFeature(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    ctx: *eval_mod.Context,
+    assets: Assets,
+    f: *const mvt.Feature,
+    sc: SymbolCtx,
+    quads: *std.ArrayList(types.Quad),
+    quad_paint: *std.ArrayList(types.PaintVertex),
+    text_scratch: *std.ArrayList(types.Quad),
+    text_paint_scratch: *std.ArrayList(types.PaintVertex),
+    collider: *symbol.Collider,
+    missing: *std.StringArrayHashMapUnmanaged(void),
+    errors: *usize,
+) error{OutOfMemory}!void {
+    if (f.parts.len == 0 or f.parts[0].len == 0) return;
+    const ext: f32 = @floatFromInt(sc.tile_extent);
+    const span: f32 = @floatCast(sc.rect.x1 - sc.rect.x0);
+
+    const allow_overlap = boolProp(sl, "icon-allow-overlap", arena, ctx, errors) or
+        boolProp(sl, "text-allow-overlap", arena, ctx, errors);
+    const ignore_placement = boolProp(sl, "icon-ignore-placement", arena, ctx, errors);
+
+    for (f.parts[0]) |pt| {
+        // Tile-local anchor, rebased to the scene origin.
+        const ax = @as(f32, @floatFromInt(pt.x)) / ext * span + sc.dx;
+        const ay = @as(f32, @floatFromInt(pt.y)) / ext * span + sc.dy;
+        // Projected px for collision (view.origin is the screen center).
+        const px: f32 = @floatCast(@as(f64, ax) * sc.world_to_px);
+        const py: f32 = @floatCast(@as(f64, ay) * sc.world_to_px);
+
+        var common = symbol.Common{ .x = ax, .y = ay, .depth = sc.depth };
+
+        // ---- icon
+        if (assets.sprite) |sp| icon: {
+            const nv = evalProp(arena, resolveProp(sl, "icon-image") orelse break :icon, ctx, .null, errors);
+            const name = switch (nv) {
+                .string => |n| n,
+                else => break :icon,
+            };
+            if (name.len == 0) break :icon;
+            const icon = sp.lookup(name) orelse {
+                try missing.put(arena, try arena.dupe(u8, name), {});
+                break :icon;
+            };
+            const size: f32 = @floatCast(asNum(evalProp(arena, resolveProp(sl, "icon-size").?, ctx, .{ .number = 1 }, errors), 1));
+            common.rotate_deg = @floatCast(asNum(evalProp(arena, resolveProp(sl, "icon-rotate").?, ctx, .{ .number = 0 }, errors), 0));
+            if (resolveProp(sl, "icon-rotation-alignment")) |rap| {
+                const rav = evalProp(arena, rap, ctx, .null, errors);
+                common.map_align = rav == .string and std.mem.eql(u8, rav.string, "map");
+            }
+            const box = try symbol.layoutIcon(arena, icon, size, common, quads);
+            const placed = try collider.place(.{
+                .x0 = px + box.x0,
+                .y0 = py + box.y0,
+                .x1 = px + box.x1,
+                .y1 = py + box.y1,
+            }, allow_overlap, ignore_placement);
+            if (!placed) {
+                quads.shrinkRetainingCapacity(quads.items.len - 6);
+            } else {
+                try quad_paint.ensureUnusedCapacity(arena, 6);
+                for (0..6) |_| quad_paint.appendAssumeCapacity(.{ .color = .{ 255, 255, 255, 255 } });
+            }
+        }
+
+        // ---- text
+        if (assets.glyph_atlas) |ga| text: {
+            const tv = evalProp(arena, resolveProp(sl, "text-field") orelse break :text, ctx, .null, errors);
+            const text = switch (tv) {
+                .string => |t| t,
+                else => break :text,
+            };
+            if (text.len == 0) break :text;
+            const size: f32 = @floatCast(asNum(evalProp(arena, resolveProp(sl, "text-size").?, ctx, .{ .number = 16 }, errors), 16));
+            var topts = symbol.TextOpts{ .size_px = size };
+            if (resolveProp(sl, "text-anchor")) |apv| {
+                const av = evalProp(arena, apv, ctx, .null, errors);
+                if (av == .string) {
+                    if (symbol.Anchor.parse(av.string)) |anch| topts.anchor = anch;
+                }
+            }
+            if (resolveProp(sl, "text-offset")) |opv| {
+                const ov = evalProp(arena, opv, ctx, .null, errors);
+                if (ov == .array and ov.array.len == 2 and ov.array[0] == .number and ov.array[1] == .number) {
+                    topts.offset_em = .{ @floatCast(ov.array[0].number), @floatCast(ov.array[1].number) };
+                }
+            }
+            var tcolor: Color = .{ .r = 0, .g = 0, .b = 0, .a = 1 };
+            if (resolveProp(sl, "text-color")) |cpv| {
+                if (asColor(evalProp(arena, cpv, ctx, .null, errors))) |c| tcolor = c;
+            }
+            var tcommon = common;
+            tcommon.rotate_deg = 0;
+            tcommon.map_align = false;
+            const scratch_before = text_scratch.items.len;
+            const box = (try symbol.layoutText(arena, text, ga, topts, tcommon, text_scratch)) orelse break :text;
+            const text_allow = boolProp(sl, "text-allow-overlap", arena, ctx, errors);
+            const placed = try collider.place(.{
+                .x0 = px + box.x0,
+                .y0 = py + box.y0,
+                .x1 = px + box.x1,
+                .y1 = py + box.y1,
+            }, text_allow, false);
+            if (!placed) {
+                text_scratch.shrinkRetainingCapacity(scratch_before);
+            } else {
+                const added = text_scratch.items.len - scratch_before;
+                const rgba = tcolor.rgba8();
+                try text_paint_scratch.ensureUnusedCapacity(arena, added);
+                for (0..added) |_| text_paint_scratch.appendAssumeCapacity(.{ .color = rgba });
+            }
+        }
+    }
+}
+
+fn boolProp(sl: *const styles.Layer, name: []const u8, arena: std.mem.Allocator, ctx: *eval_mod.Context, errors: *usize) bool {
+    const pv = resolveProp(sl, name) orelse return false;
+    const v = evalProp(arena, pv, ctx, .null, errors);
+    return v == .boolean and v.boolean;
 }
 
 fn dashArray(
@@ -405,7 +618,7 @@ test "buildScene: background, filtered fill, data-driven color, line" {
     const built = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
         .zoom = 3,
         .origin = .{ .x = rect.x0, .y = rect.y0 },
-    });
+    }, .{});
 
     // background resolved
     try std.testing.expectApproxEqAbs(@as(f32, 0x11) / 255.0, built.background.r, 1e-3);
@@ -449,7 +662,7 @@ test "first light: style to pixels through the Metal backend" {
     const built = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
         .zoom = 3,
         .origin = origin,
-    });
+    }, .{});
 
     var g = gpu.Gpu.init(.{ .width = 256, .height = 256 }) catch return error.SkipZigTest;
     defer g.deinit();
@@ -532,9 +745,40 @@ test "real chart: Annapolis first light" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
+    // With sprite/glyph assets in the environment, use the symbol-enabled
+    // style variant and load the atlases; otherwise fills and lines only.
+    var assets = Assets{};
+    var sprite_store: ?sprites.Sprite = null;
+    defer if (sprite_store) |*sp| sp.deinit();
+    var glyph_atlas: ?glyphs.GlyphAtlas = null;
+    defer if (glyph_atlas) |*ga| ga.deinit();
+    if (std.c.getenv("CHARTTABLE_TEST_SPRITE_DIR")) |sd| load_sprite: {
+        const dir = std.mem.span(sd);
+        const idx = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/sprite-mln.json", .{dir}), a, .limited(64 << 20)) catch break :load_sprite;
+        const sheet = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/sprite-mln.png", .{dir}), a, .limited(256 << 20)) catch break :load_sprite;
+        sprite_store = sprites.Sprite.load(gpa, idx, sheet) catch break :load_sprite;
+        assets.sprite = &sprite_store.?;
+    }
+    if (std.c.getenv("CHARTTABLE_TEST_GLYPHS_DIR")) |gd| load_glyphs: {
+        const dir = std.mem.span(gd);
+        var ga = glyphs.GlyphAtlas.init(gpa, glyphs.default_width) catch break :load_glyphs;
+        var loaded = false;
+        for ([_][]const u8{ "0-255", "256-511" }) |range| {
+            const pbf = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/Noto Sans Regular/{s}.pbf", .{ dir, range }), a, .limited(16 << 20)) catch continue;
+            _ = ga.addRange(pbf) catch continue;
+            loaded = true;
+        }
+        if (!loaded) {
+            ga.deinit();
+            break :load_glyphs;
+        }
+        glyph_atlas = ga;
+        assets.glyph_atlas = &glyph_atlas.?;
+    }
+    const style_name: []const u8 = if (assets.sprite != null) "chart-day-style-symbols.json" else "chart-day-style.json";
     const style_json = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        try std.fmt.allocPrint(a, "{s}/chart-day-style.json", .{ct_build.assets_dir}),
+        try std.fmt.allocPrint(a, "{s}/{s}", .{ ct_build.assets_dir, style_name }),
         a,
         .limited(4 * 1024 * 1024),
     );
@@ -566,7 +810,7 @@ test "real chart: Annapolis first light" {
     try std.testing.expect(tiles.items.len >= 4); // harbor coverage exists
 
     const origin = cameras.Vec2{ .x = center_w[0], .y = center_w[1] };
-    const built = try buildScene(a, &style, tiles.items, .{ .zoom = z, .origin = origin });
+    const built = try buildScene(a, &style, tiles.items, .{ .zoom = z, .origin = origin }, assets);
     try std.testing.expect(built.ranges.len > 10); // many styled layers drew
 
     var g = gpu.Gpu.init(.{ .width = 512, .height = 512 }) catch return error.SkipZigTest;
@@ -577,10 +821,17 @@ test "real chart: Annapolis first light" {
         .b = built.background.b,
         .a = built.background.a,
     };
+    if (assets.sprite) |sp| try g.uploadSpriteAtlas(sp.rgba, sp.width, sp.height);
+    if (assets.glyph_atlas) |ga| {
+        const rgba_atlas = try ga.toRgba(a);
+        try g.uploadGlyphAtlas(rgba_atlas, ga.width, ga.height);
+    }
     try g.uploadScene(a, .{
         .vertices = built.vertices,
         .paint = built.paint,
         .indices = built.indices,
+        .quads = built.quads,
+        .quad_paint = built.quad_paint,
         .ranges = built.ranges,
     });
     var cam = cameras.Camera{
@@ -619,9 +870,19 @@ test "real chart: Annapolis first light" {
     }
     const total: usize = 512 * 512;
     std.debug.print(
-        "\nannapolis first light: {d} tiles, {d} ranges, land {d}/{d} px, water {d}/{d} px\n",
-        .{ tiles.items.len, built.ranges.len, land, total, water, total },
+        "\nannapolis first light: {d} tiles, {d} ranges, {d} quad verts, {d} missing images, land {d}/{d} px, water {d}/{d} px\n",
+        .{ tiles.items.len, built.ranges.len, built.quads.len, built.missing_images.len, land, total, water, total },
     );
+    if (assets.sprite != null) {
+        // Symbols drew, and the sounding digit runs surfaced through the
+        // missing-image hook (composed at runtime by the host).
+        try std.testing.expect(built.quads.len > 600);
+        var saw_run = false;
+        for (built.missing_images) |name| {
+            if (std.mem.indexOfScalar(u8, name, ',') != null) saw_run = true;
+        }
+        try std.testing.expect(saw_run);
+    }
     // top-colors histogram while first light stabilizes
     var hist = std.AutoHashMap(u32, u32).init(gpa);
     defer hist.deinit();
@@ -672,8 +933,8 @@ test "buildScene: layer zoom bounds gate at fractional zoom" {
     const rect = id.worldRect();
     const view_lo = View{ .zoom = 10.4, .origin = .{ .x = rect.x0, .y = rect.y0 } };
     const view_hi = View{ .zoom = 10.6, .origin = .{ .x = rect.x0, .y = rect.y0 } };
-    const lo = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, view_lo);
-    const hi = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, view_hi);
+    const lo = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, view_lo, .{});
+    const hi = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, view_hi, .{});
     try std.testing.expectEqual(@as(usize, 0), lo.ranges.len);
     try std.testing.expectEqual(@as(usize, 1), hi.ranges.len);
 }
