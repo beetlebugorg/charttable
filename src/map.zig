@@ -179,6 +179,8 @@ pub fn buildScene(
         }
         const source_layer = sl.source_layer orelse continue;
         const depth = layerDepth(layer_i, n_layers);
+        const band = 1.0 / @as(f32, @floatFromInt(n_layers + 1));
+        const sort_prop = resolveProp(sl, if (sl.kind == .fill) "fill-sort-key" else "line-sort-key");
 
         for (tiles) |st| {
             const tl = st.tile.layer(source_layer) orelse continue;
@@ -191,28 +193,58 @@ pub fn buildScene(
             const first_vert: u32 = @intCast(verts.items.len);
             var all_opaque = true;
 
+            // Admit features (filter + geometry), evaluating the layer's
+            // sort key; draw order within the layer is ascending key, and
+            // each feature gets its own slice of the layer's depth band so
+            // the opaque pre-pass preserves the same order.
+            const Admitted = struct { f: *const mvt.Feature, key: f64, seq: u32 };
+            var admitted: std.ArrayList(Admitted) = .empty;
             for (tl.features) |*f| {
+                switch (sl.kind) {
+                    .fill => if (f.geom_type != .polygon) continue,
+                    .line => if (f.geom_type != .linestring and f.geom_type != .polygon) continue,
+                    else => unreachable,
+                }
                 var mf = MvtFeature{ .layer = tl, .feature = f };
                 ctx.feature = mf.ref();
                 if (sl.filter) |flt| {
                     if (!eval_mod.evalFilter(arena, flt.root, &ctx)) continue;
                 }
+                var key: f64 = 0;
+                if (sort_prop) |sp| {
+                    key = asNum(evalProp(arena, sp, &ctx, .{ .number = 0 }, &out.eval_errors), 0);
+                }
+                try admitted.append(arena, .{ .f = f, .key = key, .seq = @intCast(admitted.items.len) });
+            }
+            std.mem.sort(Admitted, admitted.items, {}, struct {
+                fn lt(_: void, x: Admitted, y: Admitted) bool {
+                    if (x.key != y.key) return x.key < y.key;
+                    return x.seq < y.seq; // stable: SENC order breaks ties
+                }
+            }.lt);
+
+            const n_feat: f32 = @floatFromInt(admitted.items.len + 1);
+            for (admitted.items, 0..) |adm, rank| {
+                const f = adm.f;
+                var mf = MvtFeature{ .layer = tl, .feature = f };
+                ctx.feature = mf.ref();
+                // Higher sort key draws on top: smaller depth, still inside
+                // this layer's band.
+                const feat_depth = depth - band * @as(f32, @floatFromInt(rank + 1)) / (n_feat + 1.0);
 
                 const before: u32 = @intCast(verts.items.len);
                 var color: Color = .{ .r = 0, .g = 0, .b = 0, .a = 1 };
                 switch (sl.kind) {
                     .fill => {
-                        if (f.geom_type != .polygon) continue;
                         const cv = evalProp(arena, resolveProp(sl, "fill-color").?, &ctx, .null, &out.eval_errors);
                         color = asColor(cv) orelse continue;
                         const ov = evalProp(arena, resolveProp(sl, "fill-opacity").?, &ctx, .{ .number = 1 }, &out.eval_errors);
                         color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
                         try fill.layoutPolygon(arena, f.parts, tl.extent, tile_span, .{
-                            .depth = depth,
+                            .depth = feat_depth,
                         }, &verts, &indices);
                     },
                     .line => {
-                        if (f.geom_type != .linestring and f.geom_type != .polygon) continue;
                         const cv = evalProp(arena, resolveProp(sl, "line-color").?, &ctx, .null, &out.eval_errors);
                         color = asColor(cv) orelse continue;
                         const ov = evalProp(arena, resolveProp(sl, "line-opacity").?, &ctx, .{ .number = 1 }, &out.eval_errors);
@@ -225,7 +257,7 @@ pub fn buildScene(
                             .join = joinOf(sl, arena, &ctx, &out.eval_errors),
                             .dasharray = dash,
                             .closed = f.geom_type == .polygon,
-                            .depth = depth,
+                            .depth = feat_depth,
                         }, &verts, &indices);
                     },
                     else => unreachable,
@@ -473,6 +505,153 @@ test "first light: style to pixels through the Metal backend" {
     // On the diagonal: the green line wins (later layer, smaller depth).
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, px.at(rgba, 128, 128));
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, px.at(rgba, 64, 64));
+}
+
+// The real thing: the Annapolis harbor chart (US5MD1MC) through the whole
+// stack — PMTiles → MLT decode → tile57's own day style → buildScene →
+// Metal — asserting the S-52 day palette's land and shallow-water fills
+// dominate the frame exactly as tile57's reference render has them.
+// Skips when the chart library or a GPU is absent.
+test "real chart: Annapolis first light" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpu = @import("gpu/gpu.zig");
+    const pmtiles = @import("source/pmtiles.zig");
+    const mlt = @import("source/mlt.zig");
+    const ct_build = @import("ct_build");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+
+    // The chart archive comes from the environment, never a hardcoded path.
+    const chart_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;
+    var reader = pmtiles.Reader.open(gpa, io, std.mem.span(chart_env)) catch
+        return error.SkipZigTest;
+    defer reader.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const style_json = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fmt.allocPrint(a, "{s}/chart-day-style.json", .{ct_build.assets_dir}),
+        a,
+        .limited(4 * 1024 * 1024),
+    );
+    var style = try styles.parse(gpa, style_json);
+    defer style.deinit();
+
+    // Annapolis harbor at z14; a 512px view spans exactly one tile width,
+    // so a 3x3 neighborhood covers it with margin.
+    const z: u8 = 14;
+    const center_w = coord.lonLatToWorld(-76.4767, 38.9763);
+    const center_tile = coord.fromWorld(center_w, z);
+    var tiles: std.ArrayList(SourcedTile) = .empty;
+    var dy: i32 = -1;
+    while (dy <= 1) : (dy += 1) {
+        var dx: i32 = -1;
+        while (dx <= 1) : (dx += 1) {
+            const tx: i64 = @as(i64, center_tile.x) + dx;
+            const ty: i64 = @as(i64, center_tile.y) + dy;
+            if (tx < 0 or ty < 0) continue;
+            const bytes = reader.getTile(a, z, @intCast(tx), @intCast(ty)) catch continue orelse continue;
+            const tile = try a.create(mvt.Tile);
+            tile.* = mlt.decode(a, bytes) catch continue;
+            try tiles.append(a, .{
+                .id = .{ .z = z, .x = @intCast(tx), .y = @intCast(ty) },
+                .tile = tile,
+            });
+        }
+    }
+    try std.testing.expect(tiles.items.len >= 4); // harbor coverage exists
+
+    const origin = cameras.Vec2{ .x = center_w[0], .y = center_w[1] };
+    const built = try buildScene(a, &style, tiles.items, .{ .zoom = z, .origin = origin });
+    try std.testing.expect(built.ranges.len > 10); // many styled layers drew
+
+    var g = gpu.Gpu.init(.{ .width = 512, .height = 512 }) catch return error.SkipZigTest;
+    defer g.deinit();
+    g.clear = .{
+        .r = built.background.r,
+        .g = built.background.g,
+        .b = built.background.b,
+        .a = built.background.a,
+    };
+    try g.uploadScene(a, .{
+        .vertices = built.vertices,
+        .paint = built.paint,
+        .indices = built.indices,
+        .ranges = built.ranges,
+    });
+    var cam = cameras.Camera{
+        .origin = origin,
+        .center = origin,
+        .zoom = z,
+        .vw = 512,
+        .vh = 512,
+    };
+    _ = &cam;
+    const u = types.Uniforms{
+        .mvp = cam.mvpOrigin(origin),
+        .px_to_clip = cam.pxToClip(),
+        .size_scale = 1,
+        .zoom = @floatFromInt(types.zq(cam.zoom)),
+        .zoom_t = 0,
+        .wrap_x = 0,
+        .rot_sin = 0,
+        .rot_cos = 1,
+        .color = .{ 0, 0, 0, 0 },
+        .anchor_px = .{ 0, 0 },
+        .cell_px = .{ 1, 1 },
+    };
+    const rgba = try g.renderOffscreen(a, u);
+
+    // The S-52 day palette colors sampled from tile57's reference render of
+    // the same view: LNDARE tan and DEPVS shallow-water blue. Fills resolve
+    // through the same style expressions, so matches are exact.
+    var land: usize = 0;
+    var water: usize = 0;
+    var i: usize = 0;
+    while (i < rgba.len) : (i += 4) {
+        const p = rgba[i .. i + 4];
+        if (p[0] == 161 and p[1] == 150 and p[2] == 83) land += 1;
+        if (p[0] == 130 and p[1] == 202 and p[2] == 255) water += 1;
+    }
+    const total: usize = 512 * 512;
+    std.debug.print(
+        "\nannapolis first light: {d} tiles, {d} ranges, land {d}/{d} px, water {d}/{d} px\n",
+        .{ tiles.items.len, built.ranges.len, land, total, water, total },
+    );
+    // top-colors histogram while first light stabilizes
+    var hist = std.AutoHashMap(u32, u32).init(gpa);
+    defer hist.deinit();
+    var hi: usize = 0;
+    while (hi < rgba.len) : (hi += 4) {
+        const key: u32 = @as(u32, rgba[hi]) << 16 | @as(u32, rgba[hi + 1]) << 8 | rgba[hi + 2];
+        const gop = try hist.getOrPut(key);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+    var it = hist.iterator();
+    var top: [6]struct { k: u32, n: u32 } = @splat(.{ .k = 0, .n = 0 });
+    while (it.next()) |kv| {
+        var j: usize = 0;
+        while (j < top.len) : (j += 1) {
+            if (kv.value_ptr.* > top[j].n) {
+                var m: usize = top.len - 1;
+                while (m > j) : (m -= 1) top[m] = top[m - 1];
+                top[j] = .{ .k = kv.key_ptr.*, .n = kv.value_ptr.* };
+                break;
+            }
+        }
+    }
+    for (top) |t2| std.debug.print("  color #{x:0>6} x{d}\n", .{ t2.k, t2.n });
+    std.Io.Dir.cwd().createDirPath(io, ct_build.out_dir) catch {};
+    g.savePng(a, try std.fmt.allocPrint(a, "{s}/annapolis-charttable.png", .{ct_build.out_dir}), u) catch |e| {
+        std.debug.print("savePng failed: {t}\n", .{e});
+    };
+    try std.testing.expect(water > total / 20); // >5% shallow-water blue
+    try std.testing.expect(land > total / 50); // >2% land tan
 }
 
 test "buildScene: layer zoom bounds gate at fractional zoom" {

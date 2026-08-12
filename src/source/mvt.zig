@@ -530,7 +530,8 @@ test "decodes a real baked tile when tile57's fixture is present (integration)" 
     // tile57's checked-in Annapolis z14 tile (161KB, from the Go reference
     // bake). Machines without a tile57 checkout skip.
     const io = std.Io.Threaded.global_single_threaded.io();
-    const path = "/Users/claude/Projects/tile57/src/testdata/annapolis_z14.mvt";
+    const tile57_env = std.c.getenv("CHARTTABLE_TILE57_DIR") orelse return error.SkipZigTest;
+    const path = try std.fmt.allocPrint(a, "{s}/src/testdata/annapolis_z14.mvt", .{std.mem.span(tile57_env)});
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch
         return error.SkipZigTest;
 

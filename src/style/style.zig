@@ -771,7 +771,9 @@ test "integration: tile57's checked-in template.json parses (when present)" {
     // without a tile57 checkout skip (same convention as source/mvt.zig's
     // fixture test).
     const io = std.Io.Threaded.global_single_threaded.io();
-    const path = "/Users/claude/Projects/tile57/bindings/wasm/assets/template.json";
+    const tile57_env = std.c.getenv("CHARTTABLE_TILE57_DIR") orelse return error.SkipZigTest;
+    const path = try std.fmt.allocPrint(t.allocator, "{s}/bindings/wasm/assets/template.json", .{std.mem.span(tile57_env)});
+    defer t.allocator.free(path);
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, t.allocator, .limited(16 << 20)) catch
         return error.SkipZigTest;
     defer t.allocator.free(data);

@@ -42,6 +42,8 @@ pub fn build(b: *std.Build) void {
     const ct_opts = b.addOptions();
     ct_opts.addOption([]const u8, "spec_fixture_dir", b.pathFromRoot("test/spec/expression"));
     ct_opts.addOption([]const u8, "report_path", b.pathFromRoot("test/spec/conformance-failures.txt"));
+    ct_opts.addOption([]const u8, "assets_dir", b.pathFromRoot("test/assets"));
+    ct_opts.addOption([]const u8, "out_dir", b.pathFromRoot("zig-out"));
     mod.addOptions("ct_build", ct_opts);
 
     // `zig build test` — the gate. Every source module is referenced from

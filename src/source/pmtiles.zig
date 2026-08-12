@@ -710,7 +710,8 @@ test "open() maps a real ENC archive when present (integration; skipped without 
     const gpa = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     // The M3 reference cell (DESIGN.md); machines without chart data skip.
-    const path = "/Users/claude/Charts/ENC_ROOT/US5MD1MC/US5MD1MC.pmtiles";
+    const path_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;
+    const path = std.mem.span(path_env);
     var r = Reader.open(gpa, io, path) catch |err| switch (err) {
         error.NotFound => return error.SkipZigTest,
         else => return err,

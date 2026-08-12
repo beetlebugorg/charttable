@@ -18,6 +18,7 @@ pub const properties = @import("style/properties.zig");
 pub const style = @import("style/style.zig");
 pub const coord = @import("source/coord.zig");
 pub const mvt = @import("source/mvt.zig");
+pub const mlt = @import("source/mlt.zig");
 pub const pmtiles = @import("source/pmtiles.zig");
 pub const fill = @import("layout/fill.zig");
 pub const line = @import("layout/line.zig");
@@ -39,6 +40,7 @@ test {
     _ = style;
     _ = coord;
     _ = mvt;
+    _ = mlt;
     _ = pmtiles;
     _ = fill;
     _ = line;
