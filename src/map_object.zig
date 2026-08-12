@@ -57,10 +57,37 @@ pub const ZOOM_REBUILD: f64 = 0.3;
 /// that fit, which is what a coarser zoom would have shown anyway.
 pub const MAX_TILES: usize = 256;
 
+/// How many updates after the host's last camera input the map still counts
+/// as mid-gesture. Long enough to bridge the gaps between pinch events (at
+/// 60 Hz this is a quarter second), short enough that letting go feels
+/// immediate. A slower host holds proportionally longer in wall-clock terms,
+/// which is what a slower host wants.
+pub const GESTURE_HOLD: u32 = 15;
+
 pub const Options = struct {
     cache: caches.Options = .{},
     overscan: f64 = OVERSCAN,
     zoom_rebuild: f64 = ZOOM_REBUILD,
+    /// The build zoom's quantum: the rebuild trigger and the bucket key.
+    zoom_quantum: f64 = 0.25,
+    /// How many tiles one rebuild may TESSELLATE. Cached buckets are free
+    /// and do not count, so this bounds only new work.
+    ///
+    /// A whole viewport of misses -- what landing a four-level pinch
+    /// produces -- is one long frame if it is done at once.
+    ///
+    /// Swept on the real chart library (paced pinch, z12->z16, worst frame
+    /// in ms over 3-4 runs each):
+    ///
+    ///     budget    1        2        3        4     unbounded
+    ///     worst   33-36    37-41    40-56    61-63    60-122
+    ///     total  298-318  214-286  197-305  205-247  227-335
+    ///
+    /// Lower is not simply better: the global symbol pass is rebuilt every
+    /// pass whatever the budget, so budget 1 pays it most often and turns a
+    /// short stall into a steady 9-12 ms p95. 2 takes nearly all of the peak
+    /// reduction without that. Set it very high to restore all-at-once.
+    tiles_per_build: usize = 2,
 };
 
 /// What one `update` did — the frame's damage report.
@@ -85,6 +112,42 @@ const Bucket = struct {
     zoom: f64,
 };
 
+/// Everything a drawn frame depended on: the camera AND which scene it drew.
+/// Both have to be here. Watching only the camera misses the case that
+/// actually matters during load — a tile lands, `update` rebuilds, and the
+/// camera has not moved, so a host that draws on damage never draws the new
+/// scene and the map stops half-loaded.
+const DrawnView = struct {
+    center: cameras.Vec2,
+    zoom: f64,
+    rotation: f64,
+    vw: f32,
+    vh: f32,
+    scene_generation: u64,
+    paint_generation: u64,
+
+    fn of(m: *const Map) DrawnView {
+        const c = m.cam;
+        return .{
+            .center = c.center,
+            .zoom = c.zoom,
+            .rotation = c.rotation,
+            .vw = c.vw,
+            .vh = c.vh,
+            .scene_generation = m.scene_generation,
+            .paint_generation = m.paint_generation,
+        };
+    }
+
+    fn eql(a: DrawnView, b: DrawnView) bool {
+        return a.center.x == b.center.x and a.center.y == b.center.y and
+            a.zoom == b.zoom and a.rotation == b.rotation and
+            a.vw == b.vw and a.vh == b.vh and
+            a.scene_generation == b.scene_generation and
+            a.paint_generation == b.paint_generation;
+    }
+};
+
 /// A style source bound to somewhere tiles actually come from. The style
 /// names sources; what answers for them is the host's to say (a pmtiles
 /// archive, a resource provider), so binding is explicit.
@@ -99,6 +162,18 @@ pub const Map = struct {
     cache: caches.Cache,
     cam: cameras.Camera,
     assets: Assets = .{},
+    /// The physical size multiplier for symbols, text and line widths — what
+    /// tile57's style Options calls size_scale: "the host's _featureSizeScale
+    /// from its calibrated CSS-pixel pitch". The sprite is rasterized at the
+    /// catalogue's own px-per-mm, so a host that wants S-52's PHYSICAL sizes
+    /// on ITS display has to say so; 1.0 draws the sprite cells verbatim.
+    ///
+    /// It rides the uniform, so changing it costs a frame, not a rebuild.
+    /// The collision pass runs at layout in unscaled px, so a large scale
+    /// packs symbols tighter than the collider assumed — the chart layers
+    /// that matter set icon-allow-overlap, and a placement pass that knows
+    /// the scale is later work.
+    size_scale: f32 = 1.0,
 
     style: ?styles.Style = null,
     /// Bumped by anything that invalidates layout: a new style, a changed
@@ -132,12 +207,42 @@ pub const Map = struct {
     /// Set by anything that must force a rebuild regardless of coverage.
     dirty: bool = true,
 
+    /// The last rebuild ran out of tessellation budget and left tiles out of
+    /// the scene. Not an error state: the next update picks them up.
+    partial: bool = false,
+
+    /// Updates since the host last moved the camera.
+    ///
+    /// A pinch is a rapid burst of INSTANT zooms, not an eased one, so
+    /// `cam.animating()` is false throughout and every quantum crossing
+    /// would rebuild. This is what makes a pinch behave like the eased path:
+    /// hold the layout while the fingers move, catch up when they rest.
+    ///
+    /// Counted in UPDATES, not seconds. charttable reads no clock, and
+    /// timing this off the dt a host passes would hold the layout forever
+    /// for a host that moves the camera and renders without ever ticking.
+    /// Every host calls update, so every host ages the window.
+    updates_since_input: u32 = std.math.maxInt(u32),
+
+    /// What the last drawn frame depended on. A pan or zoom inside the built
+    /// coverage rebuilds nothing and is still damage (the matrix changed);
+    /// so is a rebuild the camera did not cause. Without this, honest damage
+    /// tracking reports "nothing to do" and the view freezes -- mid-gesture,
+    /// or worse, half-loaded.
+    drawn: ?DrawnView = null,
+
     /// Tiles the last build used, so a tick can tell a tile LANDING from a
     /// mere camera move.
     resident: std.ArrayListUnmanaged(u64) = .empty,
     /// Cached per-tile geometry, keyed by cache key. Each entry owns its
     /// arena and remembers the style generation it was built for.
     buckets: std.AutoHashMapUnmanaged(u64, Bucket) = .empty,
+
+    /// Compiled property programs, shared by every build. Reset lazily when
+    /// the style generation moves rather than at each mutation site, so no
+    /// future setter can forget to invalidate it.
+    progs: map.ProgCache,
+    progs_generation: u64 = 0,
     /// Tiles re-tessellated across the Map's life, and tiles served from the
     /// bucket cache — the ratio is what per-tile caching buys.
     tiles_built: u64 = 0,
@@ -166,10 +271,22 @@ pub const Map = struct {
                 std.heap.ArenaAllocator.init(gpa),
                 std.heap.ArenaAllocator.init(gpa),
             },
+            .progs = map.ProgCache.init(gpa),
         };
     }
 
+    /// The program cache, emptied if the style has changed since it was
+    /// filled. Every build goes through here.
+    fn progCache(self: *Map) *map.ProgCache {
+        if (self.progs_generation != self.style_generation) {
+            self.progs.reset();
+            self.progs_generation = self.style_generation;
+        }
+        return &self.progs;
+    }
+
     pub fn deinit(self: *Map) void {
+        self.progs.deinit(self.gpa);
         self.dropBuckets();
         self.buckets.deinit(self.gpa);
         self.cache.deinit();
@@ -240,6 +357,23 @@ pub const Map = struct {
             };
         }
         return self.bindSource(name, archive.source(encoding, maxzoom));
+    }
+
+    /// Bind a whole pmtiles LIBRARY to a style source name: many archives,
+    /// one source, finest cell first. The library and its readers must
+    /// outlive the Map.
+    pub fn bindPmtilesLibrary(self: *Map, name: []const u8, lib: *caches.PmtilesLibrary) !usize {
+        var src = lib.source();
+        if (self.style) |*s| {
+            if (s.sources.get(name)) |ssrc| switch (ssrc) {
+                .vector => |v| {
+                    if (v.encoding) |e| src.encoding = caches.Encoding.parse(e);
+                    src.maxzoom = @min(src.maxzoom, @as(u8, @intFromFloat(std.math.clamp(v.maxzoom, 0, 22))));
+                },
+                .raster => |r| src.maxzoom = @min(src.maxzoom, @as(u8, @intFromFloat(std.math.clamp(r.maxzoom, 0, 22)))),
+            };
+        }
+        return self.bindSource(name, src);
     }
 
     /// Bind a pmtiles archive of RASTER tiles (PNG) to a style source name.
@@ -377,6 +511,17 @@ pub const Map = struct {
         self.cam.clampY();
     }
 
+    /// Set the physical size multiplier. Uniform-only: no rebuild.
+    pub fn setSizeScale(self: *Map, scale: f32) void {
+        if (!(scale > 0) or scale == self.size_scale) return;
+        self.size_scale = scale;
+        // Symbol placement is measured in DRAWN px, so a new scale changes
+        // which labels win: this is a layout change, not a uniform tweak.
+        self.style_generation += 1;
+        self.dirty = true;
+        self.drawn = null;
+    }
+
     pub fn camera(self: *Map) *cameras.Camera {
         return &self.cam;
     }
@@ -393,6 +538,7 @@ pub const Map = struct {
     pub fn update(self: *Map) !Tick {
         var tick = Tick{};
         tick.tiles_landed = self.cache.tick();
+        if (self.updates_since_input < std.math.maxInt(u32)) self.updates_since_input += 1;
 
         // A style with no bound source still builds: its background layer is
         // a real scene, and a map that never builds never reports idle.
@@ -470,38 +616,162 @@ pub const Map = struct {
     pub fn needsRebuild(self: *Map) bool {
         if (self.style == null) return false;
         if (!self.has_coverage) return true;
-        if (@abs(self.buildTargetZoom() - self.cov_zoom) > self.opts.zoom_rebuild) return true;
+        const he = self.cam.halfExtents();
+        if (@abs(cameras.wrapDx(self.cam.center.x, self.cov_origin.x)) + he.x > self.cov_hw or
+            @abs(self.cam.center.y - self.cov_origin.y) + he.y > self.cov_hh) return true;
+        // The build zoom is quantized, so this fires when the quantum
+        // changes -- which is exactly when the cached geometry is stale.
+        //
+        // But NOT mid-gesture. A zoom is a matrix change: the scene still
+        // projects correctly the whole way, and only its layout-time detail
+        // (dash periods, symbol spacing, which features the zoom filters
+        // admit) drifts. Rebuilding at every quantum of an eased pinch
+        // spends the gesture re-tessellating scenes nobody looks at for more
+        // than a frame. Let the camera land, then rebuild once. Leaving the
+        // coverage box is different -- that shows blank edges, and is
+        // handled above, before this.
+        const drift = @abs(self.buildZoom() - self.cov_zoom);
+        if (self.gesturing()) {
+            // Mid-gesture the scene is still projecting correctly, just at
+            // the detail of where the camera WAS. Let that ride -- but not
+            // forever: past a full zoom level the geometry is drawn at
+            // double or half its intended scale and the chart visibly
+            // coarsens. One level is the staleness budget for a gesture.
+            return drift >= 1.0;
+        }
+        if (drift != 0) return true;
         // A zoom-interpolated paint pair brackets one integer zoom. Drift
         // across that boundary and the two halves no longer bracket the
         // camera, so the shader would mix the wrong pair.
         if (self.built) |b| {
-            if (b.paint_hi.len > 0 and @floor(self.buildTargetZoom()) != b.paint_zoom_floor) return true;
+            if (b.paint_hi.len > 0 and @floor(self.buildZoom()) != b.paint_zoom_floor) return true;
         }
-        const he = self.cam.halfExtents();
-        return @abs(cameras.wrapDx(self.cam.center.x, self.cov_origin.x)) + he.x > self.cov_hw or
-            @abs(self.cam.center.y - self.cov_origin.y) + he.y > self.cov_hh;
+        return false;
     }
 
-    /// The zoom the NEXT scene should be built for: where the camera is
-    /// HEADING, clamped to the deepest zoom any bound source serves.
-    pub fn buildTargetZoom(self: *const Map) f64 {
+    /// The zoom a scene is built for: the camera's own zoom, QUANTIZED, and
+    /// clamped to the deepest zoom any bound source serves.
+    ///
+    /// The camera's own — not the eased target. A synchronous build replaces
+    /// the scene the moment it finishes, so building for a destination the
+    /// camera has not reached yet paints the destination's small tile set
+    /// under a wide view. (lookout can target the destination because it
+    /// builds off-thread and keeps drawing the old scene until the new one
+    /// is adopted; that is the same reason async build is worth doing here.)
+    ///
+    /// Quantized because it is the rebuild trigger AND the bucket key. A
+    /// continuously varying build zoom invalidates every cached tile on
+    /// every frame of a gesture; on a quantum, a rebuild only happens when
+    /// the quantum changes, and that is exactly when the cached geometry
+    /// really has gone stale. 1/4 of a zoom holds dash periods and line
+    /// widths within 2^(1/8) = 9% of true.
+    pub fn buildZoom(self: *const Map) f64 {
         var maxz: f64 = 24;
         for (self.cache.sources.items) |s| maxz = @min(maxz, @as(f64, @floatFromInt(s.maxzoom)));
-        const target = if (self.cam.target_zoom > 0) self.cam.target_zoom else self.cam.zoom;
-        return @min(target, maxz);
+        const q = self.opts.zoom_quantum;
+        const quantized = @round(self.cam.zoom / q) * q;
+        return @min(quantized, maxz);
     }
 
-    /// Honest damage: is there anything left to do?
+    /// Deprecated spelling kept for callers that meant "what will the next
+    /// build use".
+    pub fn buildTargetZoom(self: *const Map) f64 {
+        return self.buildZoom();
+    }
+
+    /// Viewport half-extents in world units AT THE BUILD ZOOM, overscanned.
+    /// Taking them from the camera's current zoom while choosing tiles at the
+    /// build zoom is the mismatch that made a zoom-in ask for the deep tiles
+    /// covering a wide view -- hundreds of them, every one thrown away.
+    fn buildExtents(self: *const Map) cameras.Vec2 {
+        const wp = 512.0 * std.math.pow(f64, 2.0, self.buildZoom());
+        return .{
+            .x = @as(f64, self.cam.vw) * 0.5 / wp * self.opts.overscan,
+            .y = @as(f64, self.cam.vh) * 0.5 / wp * self.opts.overscan,
+        };
+    }
+
+    /// Is there a frame to draw? Anything pending, plus a camera that has
+    /// moved since the last one reached the screen.
     pub fn needsRedraw(self: *Map) bool {
+        return self.frameStale() or self.busy();
+    }
+
+    /// Work outstanding, ignoring whether the current camera has been drawn:
+    /// loading, an animation, a rebuild owed.
+    fn busy(self: *Map) bool {
         return self.dirty or self.cam.animating() or self.needsRebuild() or
             self.pendingWanted() > 0;
+    }
+
+    /// True when anything the last drawn frame depended on has changed: the
+    /// camera moved, the scene was rebuilt, or the paint stream was refilled.
+    pub fn frameStale(self: *const Map) bool {
+        const then = self.drawn orelse return true;
+        return !DrawnView.of(self).eql(then);
+    }
+
+    /// The host calls this after a frame actually reaches the screen, so the
+    /// next `needsRedraw` can tell a moved camera from a still one.
+    pub fn markDrawn(self: *Map) void {
+        self.drawn = DrawnView.of(self);
+    }
+
+    /// Zoom about a screen point, keeping the build target in step. Setting
+    /// `zoom` alone leaves `target_zoom` behind, and the Map builds for where
+    /// the camera WAS -- so zooming in would keep serving the old tiles.
+    pub fn zoomAt(self: *Map, dz: f64, x_pt: f32, y_pt: f32) void {
+        self.cam.zoomAbout(dz, x_pt, y_pt);
+        self.cam.setTarget();
+        self.updates_since_input = 0;
+    }
+
+    /// Pan by a screen delta. Goes through the Map rather than the camera so
+    /// a drag counts as input for the gesture window.
+    pub fn pan(self: *Map, dx_pt: f32, dy_pt: f32) void {
+        self.cam.panPx(dx_pt, dy_pt);
+        self.updates_since_input = 0;
+    }
+
+    /// Advance animation by `dt` seconds.
+    pub fn advance(self: *Map, dt: f64) void {
+        if (dt > 0) self.cam.tick(dt);
+    }
+
+    /// True while the host is still working the camera: an easing animation,
+    /// or input within the last few updates.
+    fn gesturing(self: *const Map) bool {
+        return self.cam.animating() or self.updates_since_input < GESTURE_HOLD;
+    }
+
+    /// Ask for a zoom of `dz` about a screen point and EASE there over the
+    /// next frames, holding the world point under the cursor the whole way.
+    /// The build target leads the eased zoom, which is the point: a scene
+    /// built for where the camera is going lands useful, one built for where
+    /// it was arrives stale (lookout's buildTargetZoom note).
+    pub fn zoomToward(self: *Map, dz: f64, x_pt: f32, y_pt: f32) void {
+        self.cam.zoomToward(dz, x_pt, y_pt);
+        self.updates_since_input = 0;
+    }
+
+    /// Start a fling at `vx`, `vy` logical px/sec; (0,0) stops one. The
+    /// camera decays it in tick(), and `animating()` keeps frames coming
+    /// until it settles -- no timer, no polling.
+    pub fn fling(self: *Map, vx: f64, vy: f64) void {
+        self.cam.flingStart(vx, vy);
+        self.updates_since_input = 0;
     }
 
     /// Honest completeness (concerns C12: "placed", not "style loaded"). True
     /// when every tile the view asked for has an answer, the scene covers the
     /// view, and the camera has stopped moving.
+    ///
+    /// Deliberately NOT `!needsRedraw()`: a camera that moved but whose tiles
+    /// are all resident is COMPLETE, it just owes a frame. Conflating the two
+    /// makes a headless caller — or a host that only draws on damage — wait
+    /// forever for a map that is already finished.
     pub fn idle(self: *Map) bool {
-        return !self.needsRedraw();
+        return !self.busy();
     }
 
     pub fn scene(self: *const Map) ?*const Built {
@@ -518,7 +788,7 @@ pub const Map = struct {
         return .{
             .mvp = self.cam.mvpOrigin(origin),
             .px_to_clip = self.cam.pxToClip(),
-            .size_scale = 1,
+            .size_scale = self.size_scale,
             .zoom = @floatFromInt(types.zq(self.cam.zoom)),
             .zoom_t = @floatCast(self.cam.zoom - @floor(self.cam.zoom)),
             .wrap_x = @floatCast(cameras.wrapDx(self.cam.center.x, origin.x)),
@@ -584,6 +854,14 @@ pub const Map = struct {
         self.buckets.clearRetainingCapacity();
     }
 
+    /// Whether `bucketFor` would return without tessellating. Same validity
+    /// test as bucketFor itself, so the budget cannot be spent on a tile that
+    /// was going to be a cache hit.
+    fn bucketReady(self: *const Map, key: caches.Key, zoom: f64) bool {
+        const b = self.buckets.getPtr(key.pack()) orelse return false;
+        return b.style_generation == self.style_generation and b.zoom == zoom;
+    }
+
     /// The cached geometry for one tile, building it if the cache has none
     /// for this style generation. Built against the TILE'S OWN corner, so it
     /// stays valid however the camera moves.
@@ -611,6 +889,8 @@ pub const Map = struct {
             .zoom = zoom,
             .origin = .{ .x = rect.x0, .y = rect.y0 },
             .layers = .tile_local,
+            .size_scale = self.size_scale,
+            .progs = self.progCache(),
         }, self.assets);
         try self.buckets.put(self.gpa, k, .{
             .arena = arena,
@@ -653,10 +933,10 @@ pub const Map = struct {
     /// integer zoom nearest the build target and inside that source's band.
     /// Keys come out sorted so `sameResident` is an ordered compare.
     fn visibleTiles(self: *Map, out: *std.ArrayListUnmanaged(u64)) !void {
-        const zoom = self.buildTargetZoom();
-        const he = self.cam.halfExtents();
-        const hw = he.x * self.opts.overscan;
-        const hh = he.y * self.opts.overscan;
+        const zoom = self.buildZoom();
+        const he = self.buildExtents();
+        const hw = he.x;
+        const hh = he.y;
         const cx = self.cam.center.x;
         const cy = self.cam.center.y;
 
@@ -700,7 +980,7 @@ pub const Map = struct {
         const a = self.arenas[next].allocator();
 
         const origin = self.cam.center;
-        const zoom = self.buildTargetZoom();
+        const zoom = self.buildZoom();
 
         // Geometry: one cached bucket per tile, rebased at concatenation.
         // Rasters ride the merged pass with the symbols — they carry
@@ -710,12 +990,33 @@ pub const Map = struct {
         defer parts.deinit(self.gpa);
         var vector_tiles: std.ArrayListUnmanaged(map.SourcedTile) = .empty;
         var rasters: std.ArrayListUnmanaged(map.RasterTile) = .empty;
+        // How many tiles this pass may TESSELLATE. Cached buckets are free
+        // and never counted; only misses spend the budget.
+        //
+        // Landing four zoom levels at once means every tile is a miss, and
+        // doing them all in one update is the 60-110 ms hitch a pinch ends
+        // on. Geometry is ~18 ms per 6 tiles against 4 ms for the global
+        // pass, so spreading the misses over frames keeps each one inside a
+        // frame while the uncacheable part is paid once per frame regardless.
+        var budget: usize = self.opts.tiles_per_build;
+        var deferred: usize = 0;
         for (have) |k| {
             const key: caches.Key = @bitCast(k);
             switch (self.cache.sourceKind(key)) {
                 .vector => {
                     const tile = self.cache.get(key) orelse continue;
                     try vector_tiles.append(a, .{ .id = key.tileId(), .tile = tile });
+                    if (!self.bucketReady(key, zoom)) {
+                        if (budget == 0) {
+                            // No bucket and no budget: this tile simply is
+                            // not in this frame's scene. It is already in
+                            // vector_tiles, so its symbols still place and
+                            // collide -- only its fills and lines wait.
+                            deferred += 1;
+                            continue;
+                        }
+                        budget -= 1;
+                    }
                     const bucket = (try self.bucketFor(style, key, zoom)) orelse continue;
                     const rect = key.tileId().worldRect();
                     try parts.append(self.gpa, .{
@@ -745,6 +1046,8 @@ pub const Map = struct {
                 .zoom = zoom,
                 .origin = origin,
                 .layers = .global,
+                .size_scale = self.size_scale,
+                .progs = self.progCache(),
             }, self.assets),
             .dx = 0,
             .dy = 0,
@@ -755,7 +1058,14 @@ pub const Map = struct {
         self.scene_generation += 1;
         self.paint_generation += 1;
         self.rebuilds += 1;
+        // Tiles left untessellated by the budget: come back next frame and
+        // take the next batch. Their buckets are cached now, so the work
+        // already done is not repeated.
+        // Clear first, then re-arm: tiles the budget left out mean this
+        // scene is incomplete, and the next update must come back for them.
         self.dirty = false;
+        self.partial = deferred > 0;
+        if (self.partial) self.dirty = true;
 
         self.resident.clearRetainingCapacity();
         try self.resident.appendSlice(self.gpa, have);
@@ -766,11 +1076,11 @@ pub const Map = struct {
     /// Record what the scene just built actually covers, so needsRebuild can
     /// tell when the view has left it.
     fn recordCoverage(self: *Map, origin: cameras.Vec2, zoom: f64) void {
-        const he = self.cam.halfExtents();
+        const he = self.buildExtents();
         self.cov_origin = origin;
         self.cov_zoom = zoom;
-        self.cov_hw = he.x * self.opts.overscan;
-        self.cov_hh = he.y * self.opts.overscan;
+        self.cov_hw = he.x;
+        self.cov_hh = he.y;
         self.has_coverage = true;
     }
 };
@@ -1264,6 +1574,55 @@ test "Map: setPaintProperty refills; setLayoutProperty and setFilter rebuild" {
     try testing.expectError(error.UnknownProperty, m.setLayoutProperty("areas", "not-a-prop", none));
 }
 
+// A host that draws on damage must be told about damage it did not cause.
+// This is the load path: tiles land, update() rebuilds, the camera never
+// moved — and if needsRedraw only watched the camera, the window would sit
+// there half-loaded forever.
+test "Map: a rebuild the camera did not cause still asks for a frame" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+
+    // Drive the loop the way a host does: tick, and draw when told to.
+    var drew: usize = 0;
+    var spins: usize = 0;
+    while (spins < 2000) : (spins += 1) {
+        _ = try m.update();
+        if (m.needsRedraw()) {
+            m.markDrawn();
+            drew += 1;
+        }
+        if (m.idle() and !m.needsRedraw()) break;
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try testing.expect(m.idle());
+    try testing.expect(!m.needsRedraw());
+    // It drew as tiles arrived, not once.
+    try testing.expect(drew > 1);
+    // And the frame it settled on is the CURRENT scene.
+    try testing.expectEqual(m.scene_generation, m.drawn.?.scene_generation);
+
+    // A camera move is damage even with nothing loading.
+    m.cam.panPx(3, 0);
+    try testing.expect(m.needsRedraw());
+    m.markDrawn();
+    try testing.expect(!m.needsRedraw());
+
+    // So is a paint refill the camera did cause but the scene did not.
+    const gen = m.paint_generation;
+    m.paint_generation += 1; // stand in for a refill
+    try testing.expect(m.needsRedraw());
+    m.paint_generation = gen;
+}
+
 test "Map: a feature-driven color records no paint span" {
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1410,6 +1769,251 @@ test "Map: a raster source draws as world-space quads in style order" {
         if (d.pipeline == .raster) saw_raster = true;
     }
     try testing.expect(saw_raster);
+}
+
+// What a continuous zoom actually costs. Prints a breakdown rather than
+// asserting a time: a timing assertion on shared hardware is a flake
+// generator, but the COUNTS are stable and are what the optimization is
+// about — how many tiles get re-tessellated to move the camera.
+test "Map: the cost of a zoom sweep" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const pmtiles = @import("source/pmtiles.zig");
+    const ct_build = @import("ct_build");
+    const clock = @import("util/clock.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = testing.allocator;
+
+    const chart_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;
+    var reader = pmtiles.Reader.open(gpa, io, std.mem.span(chart_env)) catch return error.SkipZigTest;
+    defer reader.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const style_json = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fmt.allocPrint(a, "{s}/chart-day-style.json", .{ct_build.assets_dir}),
+        a,
+        .limited(4 * 1024 * 1024),
+    );
+
+    var src = caches.PmtilesSource{ .reader = &reader };
+    var m = Map.init(gpa, .{ .cache = .{ .workers = 3 } });
+    defer m.deinit();
+    try m.setStyleJson(style_json);
+    _ = try m.bindPmtiles("chart", &src);
+    m.setViewport(1024, 768);
+    m.setView(-76.4767, 38.9763, 12);
+    try settle(&m);
+
+    const rebuilds0 = m.rebuilds;
+    const built0 = m.tiles_built;
+    const reused0 = m.tiles_reused;
+    const t0 = clock.wallMs();
+
+    // The EASED path, which is what a wheel or a pinch drives: ask once,
+    // then tick frames while the camera glides there. The build target is
+    // the destination from the first frame, so the scene is laid out for
+    // where the gesture is going -- not re-laid-out at every step of it.
+    m.zoomToward(4.0, 512, 384);
+    var frames: usize = 0;
+    while (frames < 400 and !m.idle()) : (frames += 1) {
+        m.cam.tick(1.0 / 60.0);
+        _ = try m.update();
+        m.markDrawn();
+        @import("util/lock.zig").sleepMs(1);
+    }
+    const eased_ms = clock.wallMs() - t0;
+    const eased_rebuilds = m.rebuilds - rebuilds0;
+    const eased_built = m.tiles_built - built0;
+
+    // Back to the start. Without this the stepped path below would begin
+    // where the eased one ended and zoom PAST the source's maxzoom, where
+    // buildZoom clamps and nothing rebuilds at all -- a sweep that measures
+    // an idle map and flatters itself.
+    m.setView(-76.4767, 38.9763, 12);
+    try settle(&m);
+
+    // And the INSTANT path for contrast: every step is its own destination,
+    // so every step is a fresh build target.
+    const r1 = m.rebuilds;
+    const b1 = m.tiles_built;
+    const t1 = clock.wallMs();
+    // A live pinch: a burst of INSTANT zooms with frames between them.
+    var steps: usize = 0;
+    while (steps < 80) : (steps += 1) {
+        m.zoomAt(0.05, 512, 384);
+        _ = try m.update();
+    }
+    // Fingers up: the gesture window ages out and the map catches up.
+    var settle_frames: usize = 0;
+    while (settle_frames < 60) : (settle_frames += 1) _ = try m.update();
+    try settle(&m);
+    const step_ms = clock.wallMs() - t1;
+
+    std.debug.print(
+        "\nzoom z12->z16 EASED:   {d} ms, {d} rebuilds, {d} tiles tessellated ({d} frames)\n" ++
+            "zoom z12->z16 STEPPED: {d} ms, {d} rebuilds, {d} tiles tessellated\n" ++
+            "  buckets reused overall: {d}\n",
+        .{ eased_ms, eased_rebuilds, eased_built, frames, step_ms, m.rebuilds - r1, m.tiles_built - b1, m.tiles_reused - reused0 },
+    );
+    try testing.expect(m.rebuilds > rebuilds0);
+}
+
+// Where a rebuild's time actually goes, split the way rebuild() splits it:
+// per-tile geometry (cacheable), the global symbol + raster pass (not), and
+// the concatenation. Prints; asserts nothing but that it ran.
+test "Map: rebuild phase profile" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const pmtiles = @import("source/pmtiles.zig");
+    const ct_build = @import("ct_build");
+    const clock = @import("util/clock.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = testing.allocator;
+
+    const chart_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;
+    var reader = pmtiles.Reader.open(gpa, io, std.mem.span(chart_env)) catch return error.SkipZigTest;
+    defer reader.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var src = caches.PmtilesSource{ .reader = &reader };
+    var m = Map.init(gpa, .{ .cache = .{ .workers = 3 } });
+    defer m.deinit();
+
+    // Load the real sprite sheet and glyphs when the environment has them.
+    // Without assets every symbol layer is skipped, and the global pass --
+    // the half of a rebuild that CANNOT be cached per tile -- profiles as
+    // 0 ms, which is not a result, it is an absence.
+    const sprites = @import("symbol/sprite.zig");
+    const glyphs = @import("symbol/glyphs.zig");
+    var sprite_store: ?sprites.Sprite = null;
+    defer if (sprite_store) |*sp| sp.deinit();
+    var glyph_atlas: ?glyphs.GlyphAtlas = null;
+    defer if (glyph_atlas) |*ga| ga.deinit();
+    var assets = map.Assets{};
+    if (std.c.getenv("CHARTTABLE_TEST_SPRITE_DIR")) |sd| load_sprite: {
+        const dir = std.mem.span(sd);
+        const idx = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/sprite-mln.json", .{dir}), a, .limited(64 << 20)) catch break :load_sprite;
+        const sheet = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/sprite-mln.png", .{dir}), a, .limited(256 << 20)) catch break :load_sprite;
+        sprite_store = sprites.Sprite.load(gpa, idx, sheet) catch break :load_sprite;
+        assets.sprite = &sprite_store.?;
+    }
+    if (std.c.getenv("CHARTTABLE_TEST_GLYPHS_DIR")) |gd| load_glyphs: {
+        const dir = std.mem.span(gd);
+        var ga = glyphs.GlyphAtlas.init(gpa, glyphs.default_width) catch break :load_glyphs;
+        var loaded = false;
+        for ([_][]const u8{ "0-255", "256-511" }) |range| {
+            const pbf = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/Noto Sans Regular/{s}.pbf", .{ dir, range }), a, .limited(16 << 20)) catch continue;
+            _ = ga.addRange(pbf) catch continue;
+            loaded = true;
+        }
+        if (!loaded) {
+            ga.deinit();
+            break :load_glyphs;
+        }
+        glyph_atlas = ga;
+        assets.glyph_atlas = &glyph_atlas.?;
+    }
+    m.setAssets(assets);
+
+    // The symbol-enabled style only when there are atlases to draw it with:
+    // the other variant has no symbol layers at all, so profiling it would
+    // report the global pass as free no matter how much it costs.
+    const style_name: []const u8 = if (assets.sprite != null)
+        "chart-day-style-symbols.json"
+    else
+        "chart-day-style.json";
+    const style_json = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fmt.allocPrint(a, "{s}/{s}", .{ ct_build.assets_dir, style_name }),
+        a,
+        .limited(4 * 1024 * 1024),
+    );
+    try m.setStyleJson(style_json);
+    _ = try m.bindPmtiles("chart", &src);
+    m.setViewport(1024, 768);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    const style = &m.style.?;
+    const zoom = m.buildZoom();
+    const origin = m.cam.center;
+
+    // Per-tile geometry, uncached.
+    var tiles: std.ArrayListUnmanaged(map.SourcedTile) = .empty;
+    var geom_ms: i64 = 0;
+    for (m.resident.items) |k| {
+        const key: caches.Key = @bitCast(k);
+        const tile = m.cache.get(key) orelse continue;
+        try tiles.append(a, .{ .id = key.tileId(), .tile = tile });
+        const rect = key.tileId().worldRect();
+        var one: [1]map.SourcedTile = .{.{ .id = key.tileId(), .tile = tile }};
+        const t = clock.wallMs();
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        _ = try map.buildScene(scratch.allocator(), style, &one, .{
+            .zoom = zoom,
+            .origin = .{ .x = rect.x0, .y = rect.y0 },
+            .layers = .tile_local,
+        }, m.assets);
+        geom_ms += clock.wallMs() - t;
+    }
+
+    // The same geometry again, but with programs kept across builds -- the
+    // difference is the compile bill a per-tile build used to pay per tile.
+    var pc = map.ProgCache.init(gpa);
+    defer pc.deinit(gpa);
+    var cached_ms: i64 = 0;
+    for (m.resident.items) |k| {
+        const key: caches.Key = @bitCast(k);
+        const tile = m.cache.get(key) orelse continue;
+        const rect = key.tileId().worldRect();
+        var one: [1]map.SourcedTile = .{.{ .id = key.tileId(), .tile = tile }};
+        const tc = clock.wallMs();
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        _ = try map.buildScene(scratch.allocator(), style, &one, .{
+            .zoom = zoom,
+            .origin = .{ .x = rect.x0, .y = rect.y0 },
+            .layers = .tile_local,
+            .progs = &pc,
+        }, m.assets);
+        cached_ms += clock.wallMs() - tc;
+    }
+
+    // The global pass: symbols, their collision, and rasters.
+    var t = clock.wallMs();
+    {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        _ = try map.buildScene(scratch.allocator(), style, tiles.items, .{
+            .zoom = zoom,
+            .origin = origin,
+            .layers = .global,
+        }, m.assets);
+    }
+    const global_ms = clock.wallMs() - t;
+
+    // And everything at once, for scale.
+    t = clock.wallMs();
+    {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        _ = try map.buildScene(scratch.allocator(), style, tiles.items, .{
+            .zoom = zoom,
+            .origin = origin,
+        }, m.assets);
+    }
+    const whole_ms = clock.wallMs() - t;
+
+    std.debug.print(
+        "\nrebuild profile ({d} tiles @ z{d}): geometry {d} ms, {d} ms with programs " ++
+            "kept, global symbol pass {d} ms, monolithic {d} ms\n",
+        .{ tiles.items.len, zoom, geom_ms, cached_ms, global_ms, whole_ms },
+    );
+    try testing.expect(tiles.items.len > 0);
 }
 
 test "Map: the wanted set wraps at the antimeridian" {

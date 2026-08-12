@@ -401,6 +401,61 @@ const LayerProgs = struct {
     }
 };
 
+/// Compiled property programs, kept across builds.
+///
+/// Compiling is not free. Profiling a pinch put 27% of layout inside
+/// Prog.init/compileInto, because every build recompiled every layer -- and
+/// once tile-local geometry became a PER-TILE build, that bill was paid once
+/// per tile per rebuild rather than once per frame. A program depends only on
+/// the style, so it belongs to the style's lifetime, not the build's.
+///
+/// NOT thread-safe, and it cannot be made so cheaply: `bind` writes each
+/// program's key handles for the tile layer being read. One builder enters a
+/// cache at a time; an async build gives each worker its own.
+pub const ProgCache = struct {
+    arena: std.heap.ArenaAllocator,
+    /// Indexed by style-layer index. null = not compiled yet, which is
+    /// distinct from compiled-to-nothing (a layer whose properties are all
+    /// constants yields an empty LayerProgs, and that is worth remembering).
+    entries: std.ArrayListUnmanaged(?LayerProgs) = .empty,
+    /// Holds the one program the OOM path hands back unremembered.
+    scratch: LayerProgs = .{},
+
+    pub fn init(gpa: std.mem.Allocator) ProgCache {
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    }
+
+    pub fn deinit(self: *ProgCache, gpa: std.mem.Allocator) void {
+        self.entries.deinit(gpa);
+        self.arena.deinit();
+    }
+
+    /// Drop everything: the programs point into the arena and the style they
+    /// were compiled from is gone.
+    pub fn reset(self: *ProgCache) void {
+        self.entries.clearRetainingCapacity();
+        _ = self.arena.reset(.retain_capacity);
+    }
+
+    fn forLayer(self: *ProgCache, layer_i: usize, sl: *const styles.Layer) *LayerProgs {
+        if (self.entries.items.len <= layer_i) {
+            self.entries.ensureTotalCapacity(self.arena.child_allocator, layer_i + 1) catch
+                return self.uncached(sl);
+            while (self.entries.items.len <= layer_i) self.entries.appendAssumeCapacity(null);
+        }
+        const slot = &self.entries.items[layer_i];
+        if (slot.* == null) slot.* = LayerProgs.of(self.arena.allocator(), sl);
+        return &slot.*.?;
+    }
+
+    /// Out of memory for the cache itself: compile into the arena anyway and
+    /// hand back a program that simply is not remembered. Slower, never wrong.
+    fn uncached(self: *ProgCache, sl: *const styles.Layer) *LayerProgs {
+        self.scratch = LayerProgs.of(self.arena.allocator(), sl);
+        return &self.scratch;
+    }
+};
+
 pub const LayerFilter = enum {
     all,
     /// fill, line and background: layers whose layout depends on ONE tile
@@ -433,11 +488,23 @@ pub const View = struct {
     /// the whole resident set (DESIGN.md: "lay out per tile but PLACE
     /// globally").
     layers: LayerFilter = .all,
+    /// The physical size multiplier the FRAME will draw symbols and text at
+    /// (scene.Uniforms.size_scale). Layout keeps offsets unscaled — the
+    /// shader applies it — but collision has to know, because a label
+    /// occupies its drawn size on screen, not its authored one. Leave it at
+    /// 1 and a scaled-up chart collides as if everything were small, so
+    /// every label survives and they pile on top of each other.
+    size_scale: f32 = 1,
     /// Run the compiled expression tier (style/compile.zig) for the
     /// properties it can claim, falling back to the interpreter for the
     /// rest. Turning it OFF must not change a single pixel; that is what
     /// the flag is for.
     compiled: bool = true,
+    /// Where compiled programs live across builds. Leave it null and each
+    /// build compiles its own into the build arena, which is correct and is
+    /// what a one-shot render wants; a Map passes its own so a rebuild does
+    /// not recompile the whole style once per tile.
+    progs: ?*ProgCache = null,
 };
 
 fn resolveProp(l: *const styles.Layer, name: []const u8) ?styles.PropValue {
@@ -545,7 +612,7 @@ fn mapAligned(sl: *const styles.Layer, name: []const u8, placement: Placement, a
 /// Copy one sprite cell out of the sheet as an area-fill pattern cell,
 /// rescaled from atlas px to its ON-SCREEN period (scene.PatternCell: w and
 /// h ARE that period). Chart pattern cells are baked at ~2.8x, so the
-/// downscale is a box filter over the source footprint — a nearest-neighbour
+/// downscale is a box filter over the source footprint — a nearest-neighbor
 /// pick drops whole hatch strokes at that ratio.
 fn patternCell(arena: std.mem.Allocator, sp: *const sprites.Sprite, name: []const u8) ?types.PatternCell {
     const rect = sp.cell(name) orelse return null;
@@ -702,13 +769,19 @@ pub fn buildSceneWithRasters(
                 if (asColor(evalProp(arena, resolveProp(sl, "text-halo-color").?, &ctx, .null, &out.eval_errors))) |c| sym.halo = c;
             }
         }
-        // The compiled tier for this layer's hot properties, built once per
-        // layer per build. Compiling ~180 layers costs nothing against
-        // evaluating thousands of features.
-        var progs: LayerProgs = if (view.compiled) LayerProgs.of(arena, sl) else .{};
+        // The compiled tier for this layer's hot properties. Cached across
+        // builds when the caller keeps a ProgCache, because a per-tile build
+        // otherwise recompiles the whole style for every tile.
+        var own_progs: LayerProgs = .{};
+        const progs: *LayerProgs = if (!view.compiled) &own_progs else if (view.progs) |pc|
+            pc.forLayer(layer_i, sl)
+        else blk: {
+            own_progs = LayerProgs.of(arena, sl);
+            break :blk &own_progs;
+        };
         if (view.compiled) {
             inline for (.{ "filter", "color", "opacity", "width" }) |nm| {
-                if (@field(progs, nm) != null) out.compiled_props += 1;
+                if (@field(progs.*, nm) != null) out.compiled_props += 1;
             }
         }
 
@@ -813,6 +886,7 @@ pub fn buildSceneWithRasters(
                             .px_per_unit = px_per_unit,
                             .sym = sym,
                             .depth = feat_depth,
+                            .size_scale = view.size_scale,
                         }, &quads, &quad_paint, &text_scratch, &text_paint_scratch, &collider, &missing, &out.eval_errors);
                         continue;
                     },
@@ -1209,6 +1283,9 @@ const SymbolCtx = struct {
     px_per_unit: f64,
     sym: SymbolLayer,
     depth: f32,
+    /// What the frame will scale symbol/text offsets by; collision boxes are
+    /// measured in those drawn px.
+    size_scale: f32,
 };
 
 /// One symbol feature: resolve icon and text, collide, emit quads (already
@@ -1287,12 +1364,7 @@ fn layoutSymbolFeature(
                 @as(f32, @floatCast(asNum(evalProp(arena, resolveProp(sl, "icon-rotate").?, ctx, .{ .number = 0 }, errors), 0)));
             common.map_align = sc.sym.icon_map_align;
             const box = try symbol.layoutIcon(arena, icon, size, common, quads);
-            const placed = try collider.place(.{
-                .x0 = px + box.x0,
-                .y0 = py + box.y0,
-                .x1 = px + box.x1,
-                .y1 = py + box.y1,
-            }, allow_overlap, ignore_placement);
+            const placed = try collider.place(scaledBox(box, px, py, sc.size_scale), allow_overlap, ignore_placement);
             if (!placed) {
                 quads.shrinkRetainingCapacity(quads.items.len - 6);
             } else {
@@ -1350,12 +1422,7 @@ fn layoutSymbolFeature(
             const scratch_before = text_scratch.items.len;
             const box = (try symbol.layoutText(arena, text, ga, topts, tcommon, text_scratch)) orelse break :text;
             const text_allow = sc.sym.text_allow_overlap;
-            const placed = try collider.place(.{
-                .x0 = px + box.x0,
-                .y0 = py + box.y0,
-                .x1 = px + box.x1,
-                .y1 = py + box.y1,
-            }, text_allow, false);
+            const placed = try collider.place(scaledBox(box, px, py, sc.size_scale), text_allow, false);
             if (!placed) {
                 text_scratch.shrinkRetainingCapacity(scratch_before);
             } else {
@@ -1366,6 +1433,17 @@ fn layoutSymbolFeature(
             }
         }
     }
+}
+
+/// A symbol's screen box: authored offsets scaled the way the frame will
+/// draw them, around the projected anchor.
+fn scaledBox(box: symbol.Box, px: f32, py: f32, scale: f32) symbol.Box {
+    return .{
+        .x0 = px + box.x0 * scale,
+        .y0 = py + box.y0 * scale,
+        .x1 = px + box.x1 * scale,
+        .y1 = py + box.y1 * scale,
+    };
 }
 
 fn boolProp(sl: *const styles.Layer, name: []const u8, arena: std.mem.Allocator, ctx: *eval_mod.Context, errors: *usize) bool {
