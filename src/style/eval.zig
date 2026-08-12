@@ -59,6 +59,8 @@ pub const Context = struct {
     elevation: f64 = 0,
     heatmap_density: f64 = 0,
     line_progress: f64 = 0,
+    /// Sprite images the host has loaded (["image"] availability).
+    available_images: []const []const u8 = &.{},
     /// Runtime `let` bindings; managed by eval (push on let entry, pop on
     /// exit). Parse-time indices line up with this stack by construction.
     bindings: std.ArrayList(Value) = .empty,
@@ -128,6 +130,81 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
             const f = ctx.feature.props_fn orelse return error.Eval;
             return f(ctx.feature.ptr);
         },
+        .image_op => |name_e| {
+            const name = switch (try eval(a, name_e, ctx)) {
+                .string => |s| s,
+                else => return error.Eval,
+            };
+            var available = false;
+            for (ctx.available_images) |img| {
+                if (std.mem.eql(u8, img, name)) {
+                    available = true;
+                    break;
+                }
+            }
+            const entries = try a.alloc(Value.Entry, 2);
+            entries[0] = .{ .key = "name", .value = .{ .string = name } };
+            entries[1] = .{ .key = "available", .value = .{ .boolean = available } };
+            return .{ .object = entries };
+        },
+        .format_op => |sections| {
+            const out = try a.alloc(Value, sections.len);
+            for (sections, 0..) |sec, i| {
+                var text: []const u8 = "";
+                var image: Value = .null;
+                const content = try eval(a, sec.content, ctx);
+                if (isImageValue(content)) {
+                    image = content;
+                } else {
+                    text = try content.toString(a);
+                }
+                var scale: Value = .null;
+                if (sec.font_scale) |e2| scale = try eval(a, e2, ctx);
+                var font_stack: Value = .null;
+                if (sec.text_font) |e2| {
+                    const fonts = switch (try eval(a, e2, ctx)) {
+                        .array => |items| items,
+                        else => return error.Eval,
+                    };
+                    var joined: std.ArrayList(u8) = .empty;
+                    for (fonts, 0..) |f, j| {
+                        if (f != .string) return error.Eval;
+                        if (j != 0) try joined.append(a, ',');
+                        try joined.appendSlice(a, f.string);
+                    }
+                    font_stack = .{ .string = joined.items };
+                }
+                var text_color: Value = .null;
+                if (sec.text_color) |e2| {
+                    const cv = try eval(a, e2, ctx);
+                    text_color = switch (cv) {
+                        .color => cv,
+                        .string => |cs| if (colors.parse(cs)) |c| .{ .color = c } else return error.Eval,
+                        else => return error.Eval,
+                    };
+                }
+                var valign: Value = .null;
+                if (sec.vertical_align) |e2| {
+                    const vv = try eval(a, e2, ctx);
+                    if (vv != .string) return error.Eval;
+                    const s2 = vv.string;
+                    if (!std.mem.eql(u8, s2, "bottom") and !std.mem.eql(u8, s2, "center") and !std.mem.eql(u8, s2, "top"))
+                        return error.Eval;
+                    valign = vv;
+                }
+                const entries = try a.alloc(Value.Entry, 6);
+                entries[0] = .{ .key = "text", .value = .{ .string = text } };
+                entries[1] = .{ .key = "image", .value = image };
+                entries[2] = .{ .key = "scale", .value = scale };
+                entries[3] = .{ .key = "fontStack", .value = font_stack };
+                entries[4] = .{ .key = "textColor", .value = text_color };
+                entries[5] = .{ .key = "verticalAlign", .value = valign };
+                out[i] = .{ .object = entries };
+            }
+            const root = try a.alloc(Value.Entry, 1);
+            root[0] = .{ .key = "sections", .value = .{ .array = out } };
+            return .{ .object = root };
+        },
         .number_format => |nf| {
             const n = switch (try eval(a, nf.input, ctx)) {
                 .number => |x| x,
@@ -193,7 +270,9 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
             // properties are null, not errors.
             for (list) |sub| {
                 const v = try eval(a, sub, ctx);
-                if (v != .null) return v;
+                if (v == .null) continue;
+                if (isImageValue(v) and !imageAvailable(v)) continue;
+                return v;
             }
             return .null;
         },
@@ -352,6 +431,26 @@ fn formatDecimal(a: std.mem.Allocator, n: f64, min_frac: usize, max_frac: usize)
         try out.appendSlice(a, frac.items);
     }
     return out.items;
+}
+
+/// An ["image"] result: exactly {name, available}.
+fn isImageValue(v: Value) bool {
+    if (v != .object or v.object.len != 2) return false;
+    return std.mem.eql(u8, v.object[0].key, "name") and std.mem.eql(u8, v.object[1].key, "available");
+}
+
+fn imageAvailable(v: Value) bool {
+    return v.object[1].value == .boolean and v.object[1].value.boolean;
+}
+
+/// A ["format"] result's sections, or null.
+fn formattedSections(v: Value) ?[]const Value {
+    if (v != .object or v.object.len != 1) return null;
+    if (!std.mem.eql(u8, v.object[0].key, "sections")) return null;
+    return switch (v.object[0].value) {
+        .array => |items| items,
+        else => null,
+    };
 }
 
 fn arrayMatches(v: Value, item: anytype, len: ?usize) bool {
@@ -704,7 +803,20 @@ fn evalOp(a: std.mem.Allocator, call: Expr.OpCall, ctx: *Context) Error!Value {
         .pi_const => return .{ .number = std.math.pi },
         .ln2_const => return .{ .number = std.math.ln2 },
 
-        .to_string => return .{ .string = try vs[0].toString(a) },
+        .to_string => {
+            if (formattedSections(vs[0])) |sections| {
+                var joined: std.ArrayList(u8) = .empty;
+                for (sections) |sec| {
+                    if (sec != .object) continue;
+                    for (sec.object) |entry| {
+                        if (std.mem.eql(u8, entry.key, "text") and entry.value == .string)
+                            try joined.appendSlice(a, entry.value.string);
+                    }
+                }
+                return .{ .string = joined.items };
+            }
+            return .{ .string = try vs[0].toString(a) };
+        },
         .to_boolean => return .{ .boolean = vs[0].truthy() },
         .to_rgba => {
             const c = switch (vs[0]) {

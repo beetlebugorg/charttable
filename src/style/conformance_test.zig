@@ -23,9 +23,6 @@ const skip_ops = [_][]const u8{
     "interpolate/projection",
     "collator",
     "distance",
-    "format",
-    "image",
-    "object",
     "projection",
 };
 
@@ -43,7 +40,7 @@ const skip_ops = [_][]const u8{
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
 /// from the fixtures alone). Revisit with more fixture data points; the
 /// pixel difference is below visibility.
-const PASS_FLOOR: usize = 407;
+const PASS_FLOOR: usize = 425;
 
 const Score = struct {
     total: usize = 0,
@@ -362,6 +359,21 @@ fn evalWithSpec(
                 }
             }
         }
+    } else if (std.mem.eql(u8, type_name, "formatted")) {
+        // implicit coercion: any string-ish result becomes one section
+        if (v == .object) return v;
+        const entries = try a.alloc(Value.Entry, 6);
+        entries[0] = .{ .key = "text", .value = .{ .string = try v.toString(a) } };
+        entries[1] = .{ .key = "image", .value = .null };
+        entries[2] = .{ .key = "scale", .value = .null };
+        entries[3] = .{ .key = "fontStack", .value = .null };
+        entries[4] = .{ .key = "textColor", .value = .null };
+        entries[5] = .{ .key = "verticalAlign", .value = .null };
+        const sections = try a.alloc(Value, 1);
+        sections[0] = .{ .object = entries };
+        const fmt_root = try a.alloc(Value.Entry, 1);
+        fmt_root[0] = .{ .key = "sections", .value = .{ .array = sections } };
+        return .{ .object = fmt_root };
     } else if (std.mem.eql(u8, type_name, "projectionDefinition")) {
         // a projection is a name string or a [from, to, t] transition array
         switch (v) {
@@ -469,6 +481,19 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
                 .float => |f| f,
                 else => 0,
             };
+            if (globals.object.get("availableImages")) |imgs| {
+                if (imgs == .array) {
+                    const names = try a.alloc([]const u8, imgs.array.items.len);
+                    var n_names: usize = 0;
+                    for (imgs.array.items) |it| {
+                        if (it == .string) {
+                            names[n_names] = it.string;
+                            n_names += 1;
+                        }
+                    }
+                    ctx.available_images = names[0..n_names];
+                }
+            }
         }
 
         var feature = FixtureFeature{ .keys = &.{}, .values = &.{} };

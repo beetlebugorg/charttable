@@ -100,6 +100,8 @@ pub const Expr = union(enum) {
     properties, // the feature's full property object
     within: *const Expr, // GeoJSON area the feature must fall inside
     number_format: NumberFormat,
+    image_op: *const Expr, // name -> {name, available} against host images
+    format_op: []const FormatSection,
     let_bind: Let,
     op: OpCall,
     match_op: Match,
@@ -120,6 +122,15 @@ pub const Expr = union(enum) {
         attempt: *const Expr,
         otherwise: *const Expr,
     },
+
+    /// One ["format", ...] section: the content plus its style overrides.
+    pub const FormatSection = struct {
+        content: *const Expr,
+        font_scale: ?*const Expr = null,
+        text_font: ?*const Expr = null,
+        text_color: ?*const Expr = null,
+        vertical_align: ?*const Expr = null,
+    };
 
     /// ["number-format", n, {locale, currency, unit, min/max-fraction-digits}]
     pub const NumberFormat = struct {
@@ -351,6 +362,14 @@ const Parser = struct {
             if (args.len != 0) return error.InvalidExpression;
             return .{ .e = try p.node(.properties), .deps = .{ .feature = true } };
         }
+        if (std.mem.eql(u8, head, "image")) {
+            if (args.len != 1) return error.InvalidExpression;
+            const r = try p.parseJson(args[0]);
+            // availability is host state, so an image never folds
+            const deps = r.deps.merge(.{ .global = true });
+            return .{ .e = try p.node(.{ .image_op = p.fold(r.e, r.deps) }), .deps = deps };
+        }
+        if (std.mem.eql(u8, head, "format")) return p.parseFormat(args);
         if (std.mem.eql(u8, head, "number-format")) {
             if (args.len != 2 or args[1] != .object) return error.InvalidExpression;
             const input = try p.parseJson(args[0]);
@@ -531,6 +550,48 @@ const Parser = struct {
                 return .{ .e = try p.node(.{ .literal = v }), .deps = .{} };
             },
         }
+    }
+
+    fn parseFormat(p: *Parser, args: []const std.json.Value) ParseError!Res {
+        // ["format", part, {opts}?, part, {opts}?, ...] — an options object
+        // binds to the part before it.
+        var sections: std.ArrayList(Expr.FormatSection) = .empty;
+        var deps = Deps{};
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            if (args[i] == .object) return error.InvalidExpression; // options without a part
+            const part = try p.parseJson(args[i]);
+            deps = deps.merge(part.deps);
+            var sec = Expr.FormatSection{ .content = p.fold(part.e, part.deps) };
+            if (i + 1 < args.len and args[i + 1] == .object) {
+                i += 1;
+                const opts = args[i].object;
+                const fields = [_]struct { name: []const u8, slot: *?*const Expr }{
+                    .{ .name = "font-scale", .slot = &sec.font_scale },
+                    .{ .name = "text-font", .slot = &sec.text_font },
+                    .{ .name = "text-color", .slot = &sec.text_color },
+                    .{ .name = "vertical-align", .slot = &sec.vertical_align },
+                };
+                for (fields) |f| {
+                    if (opts.get(f.name)) |j| {
+                        const r = try p.parseJson(j);
+                        deps = deps.merge(r.deps);
+                        f.slot.* = p.fold(r.e, r.deps);
+                    }
+                }
+                // a constant vertical-align validates at parse
+                if (sec.vertical_align) |va| {
+                    if (va.* == .literal and va.literal == .string) {
+                        const v = va.literal.string;
+                        if (!std.mem.eql(u8, v, "bottom") and !std.mem.eql(u8, v, "center") and !std.mem.eql(u8, v, "top"))
+                            return error.InvalidExpression;
+                    }
+                }
+            }
+            try sections.append(p.arena, sec);
+        }
+        const e = try p.node(.{ .format_op = sections.items });
+        return .{ .e = e, .deps = deps }; // formatted output: never folded (host images)
     }
 
     fn parseLet(p: *Parser, args: []const std.json.Value) ParseError!Res {
