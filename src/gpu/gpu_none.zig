@@ -52,6 +52,11 @@ pub const Gpu = struct {
     pub fn deinit(self: *Gpu) void {
         _ = self;
     }
+    pub fn updatePaint(self: *Gpu, paint: []const scene.PaintVertex) !void {
+        _ = self;
+        _ = paint;
+        return error.Unsupported;
+    }
     pub fn setPixelDensity(self: *Gpu, d: f32) void {
         _ = self;
         _ = d;

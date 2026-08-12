@@ -75,7 +75,7 @@ const Handle = struct {
     m: map_object.Map,
 
     g: ?gpu.Gpu = null,
-    uploaded: u64 = 0,
+    uploaded: map_object.Map.Uploaded = .{},
 
     /// Archives the handle opened and therefore owns.
     archives: std.ArrayListUnmanaged(*Archive) = .empty,
@@ -174,7 +174,7 @@ export fn charttable_attach_surface(
         self.g = null;
         return ERR_SURFACE;
     };
-    self.uploaded = 0;
+    self.uploaded = .{};
     self.m.setViewport(@floatFromInt(w_px), @floatFromInt(h_px));
     return OK;
 }
@@ -184,7 +184,7 @@ export fn charttable_detach_surface(h: ?*anyopaque) callconv(.c) void {
     defer self.mu.unlock();
     if (self.g) |*g| g.deinit();
     self.g = null;
-    self.uploaded = 0;
+    self.uploaded = .{};
 }
 
 export fn charttable_resize(h: ?*anyopaque, w_pt: u32, h_pt: u32) callconv(.c) c_int {
@@ -214,7 +214,7 @@ export fn charttable_set_style_json(h: ?*anyopaque, json: [*]const u8, len: usiz
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
     self.m.setStyleJson(json[0..len]) catch return ERR_STYLE;
-    self.uploaded = 0;
+    self.uploaded = .{};
     return OK;
 }
 
@@ -295,7 +295,7 @@ export fn charttable_add_image(
     self.sprite.?.addImage(std.mem.span(name), rgba[0..n], w, h_px, pixel_ratio) catch return ERR_ARG;
     // New pixels mean an icon that was missing may now resolve: re-lay-out.
     self.m.setAssets(.{ .sprite = &self.sprite.?, .glyph_atlas = if (self.glyph_atlas) |*a| a else null });
-    self.uploaded = 0;
+    self.uploaded = .{};
     return OK;
 }
 
@@ -322,7 +322,7 @@ export fn charttable_set_sprite(
     self.sprite = loaded;
     errdefer loaded.deinit();
     self.m.setAssets(.{ .sprite = &self.sprite.?, .glyph_atlas = if (self.glyph_atlas) |*a| a else null });
-    self.uploaded = 0;
+    self.uploaded = .{};
     return OK;
 }
 
@@ -339,7 +339,7 @@ export fn charttable_add_glyphs(h: ?*anyopaque, pbf: [*]const u8, len: usize) ca
         .sprite = if (self.sprite) |*s| s else null,
         .glyph_atlas = &self.glyph_atlas.?,
     });
-    self.uploaded = 0;
+    self.uploaded = .{};
     return OK;
 }
 

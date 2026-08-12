@@ -65,6 +65,8 @@ pub const Tick = struct {
     tiles_landed: bool = false,
     /// Tiles still loading.
     pending: usize = 0,
+    /// Stream B was refilled for a zoom-only paint change (no re-layout).
+    paint_refilled: bool = false,
 };
 
 /// A style source bound to somewhere tiles actually come from. The style
@@ -97,7 +99,13 @@ pub const Map = struct {
     /// frame at generation N needs no upload — the "pan changed no buffers"
     /// probe the acceptance test asserts on.
     scene_generation: u64 = 0,
+    /// Bumps when stream B alone is refilled (a zoom-only colour moved).
+    /// Separate from scene_generation so a host re-uploads ONE buffer
+    /// instead of the whole scene — that separation is the reason paint is
+    /// its own stream.
+    paint_generation: u64 = 0,
     rebuilds: u64 = 0,
+    paint_refills: u64 = 0,
 
     /// Coverage of the scene as built, in world units around its origin.
     cov_origin: cameras.Vec2 = .{ .x = 0, .y = 0 },
@@ -290,7 +298,10 @@ pub const Map = struct {
             if (self.cache.isResident(@bitCast(k))) try have.append(self.gpa, k);
         }
 
-        if (!coverage_broke and self.sameResident(have.items)) return tick;
+        if (!coverage_broke and self.sameResident(have.items)) {
+            tick.paint_refilled = self.refillPaintIfMoved(&style);
+            return tick;
+        }
 
         try self.rebuild(&style, have.items);
         tick.rebuilt = true;
@@ -310,6 +321,26 @@ pub const Map = struct {
             if (st == .loading) n += 1;
         }
         return n;
+    }
+
+    /// A zoom-only colour follows the camera, so when the camera moves
+    /// inside its coverage the scene's paint is stale even though its
+    /// geometry is not. Refill stream B and leave everything else alone.
+    ///
+    /// Quantized to the same 1/256 zoom steps the vertex zoom window uses:
+    /// below that the colour change is not representable in the frame, and
+    /// the quantization is what stops a continuous pinch refilling every
+    /// frame for nothing.
+    fn refillPaintIfMoved(self: *Map, style: *const styles.Style) bool {
+        const b = if (self.built) |*bb| bb else return false;
+        if (b.paint_spans.len == 0) return false;
+        const zoom = self.cam.zoom;
+        if (types.zq(zoom) == types.zq(b.paint_zoom)) return false;
+        const a = self.arenas[self.live].allocator();
+        if (!map.refillPaint(a, style, b, zoom)) return false;
+        self.paint_generation += 1;
+        self.paint_refills += 1;
+        return true;
     }
 
     /// True when the view has panned or zoomed out of the built coverage. The
@@ -372,12 +403,26 @@ pub const Map = struct {
         };
     }
 
-    /// Upload the current scene into `g` if it has changed since the last
-    /// call, and report whether it did. Split from drawing so a host can
-    /// upload on a worker-fed frame boundary and draw whenever it likes.
-    pub fn uploadIfChanged(self: *Map, g: *gpu.Gpu, uploaded: *u64) !bool {
+    /// What a host has already uploaded. Two counters, because the two
+    /// streams change independently: a rebuild replaces everything, a
+    /// zoom-only colour change replaces stream B alone.
+    pub const Uploaded = struct {
+        scene: u64 = 0,
+        paint: u64 = 0,
+    };
+
+    /// Bring `g` up to date with the current scene and report whether
+    /// anything was sent. Split from drawing so a host can upload on a
+    /// worker-fed frame boundary and draw whenever it likes.
+    pub fn uploadIfChanged(self: *Map, g: *gpu.Gpu, state: *Uploaded) !bool {
         const b = self.built orelse return false;
-        if (uploaded.* == self.scene_generation) return false;
+        if (state.scene == self.scene_generation) {
+            // Geometry is current; only the paint stream may have moved.
+            if (state.paint == self.paint_generation) return false;
+            try g.updatePaint(b.paint);
+            state.paint = self.paint_generation;
+            return true;
+        }
         g.clear = .{ .r = b.background.r, .g = b.background.g, .b = b.background.b, .a = b.background.a };
         try g.uploadScene(self.gpa, .{
             .vertices = b.vertices,
@@ -388,7 +433,8 @@ pub const Map = struct {
             .ranges = b.ranges,
             .patterns = b.patterns,
         });
-        uploaded.* = self.scene_generation;
+        state.scene = self.scene_generation;
+        state.paint = self.paint_generation;
         return true;
     }
 
@@ -790,7 +836,7 @@ test "Map: pan across Annapolis rebuilds only on coverage breaks" {
             rd: *pmtiles.Reader,
             style_src: []const u8,
         ) !void {
-            var uploaded: u64 = 0;
+            var uploaded: Map.Uploaded = .{};
             _ = try m2.uploadIfChanged(g2, &uploaded);
             const mine = try g2.renderOffscreen(a2, m2.uniforms());
 
@@ -853,6 +899,104 @@ test "Map: pan across Annapolis rebuilds only on coverage breaks" {
         "\nmap pan: {d} rebuilds over the path, {d} tiles resident, {d} KB cached\n",
         .{ m.rebuilds, m.resident.items.len, m.cache.residentBytes() / 1024 },
     );
+}
+
+// DESIGN.md's invariant, stated as a test: "Paint changes never re-layout."
+// A zoom-only colour follows the camera, so moving the camera inside the
+// built coverage MUST move the colour — and must do it by refilling stream B,
+// not by rebuilding.
+test "Map: a zoom-only color refills stream B without re-laying-out" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    // Green at z14, red at z16, interpolated between: zoom-only, so it is
+    // paint, not geometry.
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "areas", "type": "fill", "source": "chart",
+        \\   "source-layer": "areas",
+        \\   "paint": {"fill-color": ["interpolate", ["linear"], ["zoom"],
+        \\      14, "#00ff00", 16, "#ff0000"]}}]}
+    ;
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    const b = m.scene() orelse return error.NoScene;
+    try testing.expect(b.paint_spans.len > 0); // the layer was recognized
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, b.paint[0].color);
+
+    const rebuilds = m.rebuilds;
+    const scene_gen = m.scene_generation;
+    const paint_gen = m.paint_generation;
+    const verts = b.vertices.len;
+
+    // Zoom a little, still well inside the coverage box and inside
+    // ZOOM_REBUILD. The colour must move; nothing else may.
+    m.cam.zoom = 14.5;
+    m.cam.setTarget();
+    const tick = try m.update();
+    try testing.expect(tick.paint_refilled);
+    try testing.expect(!tick.rebuilt);
+    try testing.expectEqual(rebuilds, m.rebuilds);
+    try testing.expectEqual(scene_gen, m.scene_generation);
+    try testing.expect(m.paint_generation > paint_gen);
+
+    const b2 = m.scene().?;
+    try testing.expectEqual(verts, b2.vertices.len); // no re-tessellation
+    const mid = b2.paint[0].color;
+    try testing.expect(mid[0] > 0 and mid[1] > 0); // partway from green to red
+    try testing.expect(mid[0] < 255 and mid[1] < 255);
+
+    // Same zoom again: nothing to do. Idle means idle.
+    const gen2 = m.paint_generation;
+    const again = try m.update();
+    try testing.expect(!again.paint_refilled);
+    try testing.expectEqual(gen2, m.paint_generation);
+
+    // And a PAN, which changes no zoom, must not touch paint either.
+    m.cam.panPx(4, 0);
+    const panned = try m.update();
+    try testing.expect(!panned.paint_refilled);
+    try testing.expectEqual(gen2, m.paint_generation);
+}
+
+test "Map: a feature-driven color records no paint span" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    // Data-driven, not zoom-driven: a refill could not serve it (each
+    // feature has its own value), so no span may be recorded.
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "areas", "type": "fill", "source": "chart",
+        \\   "source-layer": "areas",
+        \\   "paint": {"fill-color": ["match", ["get", "kind"],
+        \\      "water", "#0000ff", "#00ff00"]}}]}
+    ;
+    var m = Map.init(a, .{ .cache = .{ .workers = 1 } });
+    defer m.deinit();
+    try m.setStyleJson(style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+    try testing.expectEqual(@as(usize, 0), m.scene().?.paint_spans.len);
+
+    m.cam.zoom = 14.5;
+    m.cam.setTarget();
+    const tick = try m.update();
+    try testing.expect(!tick.paint_refilled);
 }
 
 test "Map: a raster source draws as world-space quads in style order" {

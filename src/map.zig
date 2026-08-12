@@ -37,9 +37,22 @@ pub const SourcedTile = struct {
 
 /// The build's output: everything Gpu.SceneData borrows, plus the effective
 /// background. Slices live in the arena the caller passed.
+/// Where one (layer x tile) bucket's vertices sit in stream B. A zoom-only
+/// paint property is the SAME value for every feature in the layer, so a
+/// refill needs nothing per feature — just the span and the layer to
+/// re-evaluate. Recorded only for layers that actually have one.
+pub const PaintSpan = struct {
+    first: u32,
+    count: u32,
+    layer: u32,
+};
+
 pub const Built = struct {
     vertices: []const types.Vertex = &.{},
-    paint: []const types.PaintVertex = &.{},
+    /// MUTABLE by design: `refillPaint` rewrites it in place when the camera
+    /// moves a zoom-only colour, which is the whole point of keeping paint in
+    /// its own stream (DESIGN.md: paint changes never re-layout).
+    paint: []types.PaintVertex = &.{},
     indices: []const u32 = &.{},
     quads: []const types.Quad = &.{},
     quad_paint: []const types.PaintVertex = &.{},
@@ -56,7 +69,63 @@ pub const Built = struct {
     /// Per-layer properties the compiled tier claimed. The rest keep
     /// running through the interpreter, which is always correct.
     compiled_props: usize = 0,
+    /// Spans a zoom-only paint change can refill. Empty when no layer has
+    /// one, which is the common case and costs nothing to check.
+    paint_spans: []const PaintSpan = &.{},
+    /// The zoom `paint` currently holds values for.
+    paint_zoom: f64 = 0,
 };
+
+/// True when this layer's COLOUR or OPACITY varies with zoom alone — the
+/// case a refill can serve. A zoom-only line-WIDTH is deliberately excluded:
+/// width is baked into the vertex offsets at layout, so it is geometry, and
+/// changing it needs a rebuild like any other layout property.
+fn hasZoomOnlyPaint(sl: *const styles.Layer) bool {
+    const names: [2][]const u8 = switch (sl.kind) {
+        .fill => .{ "fill-color", "fill-opacity" },
+        .line => .{ "line-color", "line-opacity" },
+        else => return false,
+    };
+    for (names) |n| {
+        const lp = sl.get(n) orelse continue;
+        if (lp.class == .zoom_only) return true;
+    }
+    return false;
+}
+
+/// Re-evaluate the zoom-only paint of every recorded span at `zoom` and
+/// rewrite stream B in place. Geometry, indices and ranges are untouched, so
+/// the host re-uploads one buffer and draws — no re-tessellation, no rebuild.
+///
+/// Returns true when anything changed. A zoom-AND-data property is not
+/// handled here: that one needs the (v@z0, v@z1) pair the shader mixes,
+/// which is the paint-stream growth the style-compiler spec calls stage 4.
+pub fn refillPaint(
+    arena: std.mem.Allocator,
+    style: *const styles.Style,
+    built: *Built,
+    zoom: f64,
+) bool {
+    if (built.paint_spans.len == 0) return false;
+    if (zoom == built.paint_zoom) return false;
+    var ctx = eval_mod.Context{ .zoom = zoom };
+    var errors: usize = 0;
+    for (built.paint_spans) |span| {
+        if (span.layer >= style.layers.len) continue;
+        const sl = &style.layers[span.layer];
+        const color_name: []const u8 = if (sl.kind == .fill) "fill-color" else "line-color";
+        const opacity_name: []const u8 = if (sl.kind == .fill) "fill-opacity" else "line-opacity";
+        const cv = evalProp(arena, resolveProp(sl, color_name) orelse continue, &ctx, .null, &errors);
+        var color = asColor(cv) orelse continue;
+        const ov = evalProp(arena, resolveProp(sl, opacity_name) orelse continue, &ctx, .{ .number = 1 }, &errors);
+        color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
+        const rgba = color.rgba8();
+        const end = @min(built.paint.len, span.first + span.count);
+        for (built.paint[span.first..end]) |*pv| pv.color = rgba;
+    }
+    built.paint_zoom = zoom;
+    return true;
+}
 
 /// One decoded raster tile offered to the build. `rgba` is borrowed for the
 /// duration of the build (the tile cache owns it), and the scene borrows it
@@ -424,6 +493,7 @@ pub fn buildSceneWithRasters(
     var quads: std.ArrayList(types.Quad) = .empty;
     var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
     var ranges: std.ArrayList(types.Range) = .empty;
+    var paint_spans: std.ArrayList(PaintSpan) = .empty;
     var patterns: std.ArrayList(types.PatternCell) = .empty;
     // Pattern image name -> index into `patterns`; a name that resolved to no
     // cell is remembered as NO_PATTERN so the sheet is walked once per name.
@@ -505,6 +575,9 @@ pub fn buildSceneWithRasters(
         // data-driven: tile57 concats "pat:" onto a feature property), so the
         // layer's triangles split into one range per distinct cell.
         const is_pattern = sl.kind == .fill and sl.get("fill-pattern") != null;
+        // Only layers whose colour or opacity moves with the camera alone
+        // need a span; everything else is baked correctly at layout.
+        const zoom_paint = !is_pattern and hasZoomOnlyPaint(sl);
 
         for (tiles) |st| {
             const tl = st.tile.layer(source_layer) orelse continue;
@@ -522,6 +595,7 @@ pub fn buildSceneWithRasters(
             const px_per_unit = 512.0 * std.math.pow(f64, 2.0, view.zoom);
 
             const first_index: u32 = @intCast(indices.items.len);
+            const first_paint: u32 = @intCast(paint.items.len);
             var all_opaque = true;
             // Pattern-fill run state: the layer's triangles split into one
             // range per distinct cell (a draw binds exactly one cell texture).
@@ -690,6 +764,13 @@ pub fn buildSceneWithRasters(
                 }
                 continue;
             }
+            if (zoom_paint and paint.items.len > first_paint) {
+                try paint_spans.append(arena, .{
+                    .first = first_paint,
+                    .count = @intCast(paint.items.len - first_paint),
+                    .layer = @intCast(layer_i),
+                });
+            }
             const count: u32 = @intCast(indices.items.len - run_first);
             if (count == 0) continue;
             try ranges.append(arena, .{
@@ -712,6 +793,8 @@ pub fn buildSceneWithRasters(
     out.quads = quads.items;
     out.quad_paint = quad_paint.items;
     out.ranges = ranges.items;
+    out.paint_spans = paint_spans.items;
+    out.paint_zoom = view.zoom;
     out.patterns = patterns.items;
     out.missing_images = missing.keys();
     return out;

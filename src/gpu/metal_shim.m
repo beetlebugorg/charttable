@@ -247,6 +247,13 @@ ctm_buf *ctm_new_buffer(ctm_ctx *c, const void *bytes, size_t len) {
     }
 }
 
+int ctm_write_buffer(ctm_buf *b, const void *bytes, size_t len) {
+    if (!b || !bytes || len == 0) return 0;
+    if (len > [b->buf length]) return 0;
+    memcpy([b->buf contents], bytes, len);
+    return 1;
+}
+
 void ctm_free_buffer(ctm_buf *b) {
     if (!b) return;
     [b->buf release];

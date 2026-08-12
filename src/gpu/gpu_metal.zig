@@ -127,6 +127,9 @@ pub const Gpu = struct {
         qpbuf: ?*mc.ctm_buf = null, // scene.PaintVertex stream, parallel to qbuf
         index_count: u32 = 0,
         quad_vert_count: u32 = 0,
+        /// Entries in pbuf, so an in-place paint refill can reject a skew
+        /// instead of writing someone else's colours over the stream.
+        paint_count: u32 = 0,
         ranges: []scene.Range = &.{},
         patterns: []PatternTex = &.{},
         /// Scratch for scene/batch.zig. Sized to the range count, which is
@@ -306,6 +309,7 @@ pub const Gpu = struct {
             out.pbuf = try self.newBuffer(std.mem.sliceAsBytes(data.paint));
             out.ibuf = try self.newBuffer(std.mem.sliceAsBytes(data.indices));
             out.index_count = @intCast(data.indices.len);
+            out.paint_count = @intCast(data.paint.len);
         }
         if (data.quads.len > 0) {
             out.qbuf = try self.newBuffer(std.mem.sliceAsBytes(data.quads));
@@ -328,6 +332,18 @@ pub const Gpu = struct {
             }
         }
         return out;
+    }
+
+    /// Refill the PAINT stream in place. Stream A (geometry) and the index
+    /// buffer are untouched, so a zoom-only colour change or a palette flip
+    /// costs one memcpy instead of a rebuild — the "day/night for the price
+    /// of a buffer refill" half of the two-stream contract.
+    pub fn updatePaint(self: *Gpu, paint: []const scene.PaintVertex) !void {
+        const s = if (self.scene) |*sc| sc else return error.NoScene;
+        const buf = s.pbuf orelse return error.NoScene;
+        if (paint.len != s.paint_count) return error.PaintStreamMismatch;
+        const bytes = std.mem.sliceAsBytes(paint);
+        if (mc.ctm_write_buffer(buf, bytes.ptr, bytes.len) == 0) return error.MetalFailure;
     }
 
     fn newBuffer(self: *Gpu, bytes: []const u8) !*mc.ctm_buf {

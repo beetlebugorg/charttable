@@ -61,6 +61,11 @@ void ctm_layer_sync(ctm_ctx *c, uint32_t *w_px, uint32_t *h_px);
  * the shader samples .r). */
 ctm_buf *ctm_new_buffer(ctm_ctx *c, const void *bytes, size_t len);
 void ctm_free_buffer(ctm_buf *b);
+/* Overwrite an existing buffer's contents in place (shared storage, so this
+ * is a memcpy). Returns 0 when `len` exceeds the buffer. The paint stream
+ * uses it: a zoom-only colour change refills stream B without touching
+ * geometry or rebuilding the scene. */
+int ctm_write_buffer(ctm_buf *b, const void *bytes, size_t len);
 ctm_tex *ctm_new_texture_rgba(ctm_ctx *c, const void *rgba, uint32_t w, uint32_t h);
 void ctm_free_texture(ctm_tex *t);
 
