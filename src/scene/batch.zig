@@ -47,7 +47,7 @@ pub fn batch(ranges: []const t.Range, opts: t.BatchOpts, out: []t.Draw) usize {
             (r.flags & t.Range.FLAG_OPAQUE) != 0) continue;
         const atlas = resolveAtlas(r, opts.atlas_have) orelse continue;
         const pipe = classify(r);
-        // An SDF draw carries the halo colour: the range's own when the style
+        // An SDF draw carries the halo color: the range's own when the style
         // set text-halo-color, else the scene's effective background.
         const color: [4]f32 = if (pipe != .sdf) .{ 0, 0, 0, 0 } else if ((r.flags & t.Range.FLAG_HALO) != 0) .{
             @as(f32, @floatFromInt(r.halo[0])) / 255.0,
@@ -151,7 +151,7 @@ test "overflow returns the true count and draws nothing from a short buffer" {
     try expectEqual(@as(usize, 3), batch(&ranges, .{ .atlas_have = all_atlases, .halo = halo }, &out1));
 }
 
-test "a range's own halo colour wins over the scene background" {
+test "a range's own halo color wins over the scene background" {
     var styled = quad(0, 6, .glyph);
     styled.flags = t.Range.FLAG_HALO;
     styled.halo = .{ 255, 128, 0, 255 };
@@ -164,7 +164,7 @@ test "a range's own halo colour wins over the scene background" {
     try expectEqual(@as(f32, 1.0), out[1].color[0]);
     try expectEqual(@as(f32, 128.0 / 255.0), out[1].color[1]);
     try expectEqual(@as(f32, 0.0), out[1].color[2]);
-    // A halo colour never reaches a non-SDF draw.
+    // A halo color never reaches a non-SDF draw.
     var tris = tri(0, 3, false);
     tris.flags = t.Range.FLAG_HALO;
     tris.halo = .{ 255, 128, 0, 255 };

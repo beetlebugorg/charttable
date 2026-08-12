@@ -157,7 +157,7 @@ pub const Range = extern struct {
     prim: Prim,
     atlas: Atlas = .none,
     flags: u8 = 0, // FLAG_*
-    /// The SDF halo colour for a text range, straight-alpha RGBA, valid only
+    /// The SDF halo color for a text range, straight-alpha RGBA, valid only
     /// with FLAG_HALO. Without the flag the halo is the scene's effective
     /// background — right for a chart (S-52 halos ARE the background) and the
     /// only sane default for a style that sets no text-halo-color.

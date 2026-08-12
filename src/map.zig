@@ -950,7 +950,7 @@ test "first light: style to pixels through the Metal backend" {
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, px.at(rgba, 64, 64));
 }
 
-/// Test helper: decode the (2*radius+1)^2 tile neighbourhood around `center`
+/// Test helper: decode the (2*radius+1)^2 tile neighborhood around `center`
 /// at zoom `z`, skipping what the archive does not hold.
 fn loadTileNeighborhood(
     a: std.mem.Allocator,
@@ -1209,7 +1209,7 @@ test "real chart: Annapolis first light" {
     // ---- pattern fills over the depth areas -------------------------------
     // The sandwich the S-52 patterns need: fill-areas#oscl UNDER the hatch
     // UNDER fill-areas. A pattern layer must draw OVER the depth areas and
-    // still let them through — the thing a flat-colour fallback would bury,
+    // still let them through — the thing a flat-color fallback would bury,
     // which is why buildScene used to skip fill-pattern layers entirely.
     //
     // AP(OVERSC01) itself needs a MULTI-CELL bundle: tile57's baker emits the

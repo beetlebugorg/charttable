@@ -215,7 +215,7 @@ fragment float4 sprite_frag(QuadOut in [[stage_in]],
 // SDF text: sample the signed-distance field (.r), antialias with the
 // screen-space derivative, tint by the PAINT stream. `weight` is the halo /
 // embolden width in SDF field units (0 = none); the halo renders in the
-// colour the host stamped on the draw (u.color) — the style's
+// color the host stamped on the draw (u.color) — the style's
 // text-halo-color, or the frame's effective background — so night text is not
 // trapped inside a glaring light outline.
 //
