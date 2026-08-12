@@ -64,6 +64,10 @@ pub const Built = struct {
     /// Area-fill pattern cells, indexed by Range.pattern.
     patterns: []const types.PatternCell = &.{},
     background: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    /// Whether a background layer actually resolved one. A build that
+    /// covers only some layers (a symbols-only pass) leaves the default,
+    /// and concatenation must not let that default win.
+    background_set: bool = false,
     /// icon-image names the sprite could not resolve, deduplicated — the
     /// missing-image hook: the host renders them (tile57_render_symbol_run
     /// for sounding digit runs), calls Sprite.addImage, and rebuilds.
@@ -357,11 +361,38 @@ const LayerProgs = struct {
     }
 };
 
+pub const LayerFilter = enum {
+    all,
+    /// fill, line and background: layers whose layout depends on ONE tile
+    /// and nothing else, so a build of them caches per tile.
+    tile_local,
+    /// symbol and raster. Symbols collide against the whole resident set, so
+    /// a per-tile collider would let labels overlap at every seam; raster
+    /// tiles borrow image memory the tile cache owns, so caching them per
+    /// tile would outlive the eviction that frees it. Both are built once
+    /// over everything.
+    global,
+
+    fn admits(self: LayerFilter, kind: properties.LayerType) bool {
+        const is_global = kind == .symbol or kind == .raster;
+        return switch (self) {
+            .all => true,
+            .tile_local => !is_global,
+            .global => is_global,
+        };
+    }
+};
+
 pub const View = struct {
     zoom: f64,
     /// World point the scene's vertex coordinates are relative to. Use the
     /// camera origin so Camera.mvpOrigin(origin) draws it directly.
     origin: cameras.Vec2,
+    /// Which layers this build covers, so tile-local geometry can be built
+    /// (and cached) per tile while symbols and rasters are built once over
+    /// the whole resident set (DESIGN.md: "lay out per tile but PLACE
+    /// globally").
+    layers: LayerFilter = .all,
     /// Run the compiled expression tier (style/compile.zig) for the
     /// properties it can claim, falling back to the interpreter for the
     /// rest. Turning it OFF must not change a single pixel; that is what
@@ -572,6 +603,7 @@ pub fn buildSceneWithRasters(
 
     const n_layers = style.layers.len;
     for (style.layers, 0..) |*sl, layer_i| {
+        if (!view.layers.admits(sl.kind)) continue;
         if (sl.minzoom) |mz| {
             if (view.zoom < mz) continue;
         }
@@ -582,7 +614,10 @@ pub fn buildSceneWithRasters(
             .background => {
                 if (resolveProp(sl, "background-color")) |pv| {
                     const v = evalProp(arena, pv, &ctx, .null, &out.eval_errors);
-                    if (asColor(v)) |c| out.background = c;
+                    if (asColor(v)) |c| {
+                        out.background = c;
+                        out.background_set = true;
+                    }
                 }
                 continue;
             },
@@ -939,6 +974,108 @@ fn layoutRasterLayer(
             .prim = .quads,
         });
     }
+}
+
+/// One already-built piece of a scene, plus where it belongs relative to the
+/// scene's origin. A per-tile geometry build is made with the tile's own NW
+/// corner as its origin, so it is reusable at any camera position; the offset
+/// is applied here, at concatenation.
+pub const ScenePart = struct {
+    built: Built,
+    dx: f32,
+    dy: f32,
+};
+
+/// Stitch pre-built parts into one scene: rebase each part's positions,
+/// offset its indices and range starts, re-intern its pattern cells, then
+/// STABLE-SORT the ranges by paint_key.
+///
+/// The sort is the whole trick. Parts come out tile-major, and draw order is
+/// layer-major; sorting by paint_key restores style order, and keeping it
+/// stable keeps tiles in a deterministic order within each layer so two
+/// builds of the same set are byte-identical.
+pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
+    var out = Built{};
+    var verts: std.ArrayList(types.Vertex) = .empty;
+    var paint: std.ArrayList(types.PaintVertex) = .empty;
+    var indices: std.ArrayList(u32) = .empty;
+    var quads: std.ArrayList(types.Quad) = .empty;
+    var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
+    var ranges: std.ArrayList(types.Range) = .empty;
+    var patterns: std.ArrayList(types.PatternCell) = .empty;
+    var spans: std.ArrayList(PaintSpan) = .empty;
+    var missing: std.StringArrayHashMapUnmanaged(void) = .empty;
+
+    for (parts) |part| {
+        const b = part.built;
+        const vbase: u32 = @intCast(verts.items.len);
+        const ibase: u32 = @intCast(indices.items.len);
+        const qbase: u32 = @intCast(quads.items.len);
+        const pbase: u32 = @intCast(patterns.items.len);
+        const paint_base: u32 = @intCast(paint.items.len);
+
+        try verts.ensureUnusedCapacity(arena, b.vertices.len);
+        for (b.vertices) |v| {
+            var moved = v;
+            moved.x += part.dx;
+            moved.y += part.dy;
+            verts.appendAssumeCapacity(moved);
+        }
+        try quads.ensureUnusedCapacity(arena, b.quads.len);
+        for (b.quads) |q| {
+            var moved = q;
+            moved.x += part.dx;
+            moved.y += part.dy;
+            quads.appendAssumeCapacity(moved);
+        }
+        try paint.appendSlice(arena, b.paint);
+        try quad_paint.appendSlice(arena, b.quad_paint);
+        try indices.ensureUnusedCapacity(arena, b.indices.len);
+        for (b.indices) |ix| indices.appendAssumeCapacity(ix + vbase);
+        try patterns.appendSlice(arena, b.patterns);
+
+        try ranges.ensureUnusedCapacity(arena, b.ranges.len);
+        for (b.ranges) |r| {
+            var moved = r;
+            moved.first += switch (r.prim) {
+                .triangles => ibase,
+                .quads => qbase,
+            };
+            if (r.pattern != types.NO_PATTERN) moved.pattern = r.pattern + pbase;
+            ranges.appendAssumeCapacity(moved);
+        }
+        try spans.ensureUnusedCapacity(arena, b.paint_spans.len);
+        for (b.paint_spans) |sp| {
+            var moved = sp;
+            moved.first += paint_base;
+            spans.appendAssumeCapacity(moved);
+        }
+        for (b.missing_images) |name| try missing.put(arena, name, {});
+        if (b.background_set) {
+            out.background = b.background;
+            out.background_set = true;
+        }
+        out.eval_errors += b.eval_errors;
+        out.compiled_props += b.compiled_props;
+        out.paint_zoom = b.paint_zoom;
+    }
+
+    std.mem.sort(types.Range, ranges.items, {}, struct {
+        fn lt(_: void, x: types.Range, y: types.Range) bool {
+            return x.paint_key < y.paint_key;
+        }
+    }.lt);
+
+    out.vertices = verts.items;
+    out.paint = paint.items;
+    out.indices = indices.items;
+    out.quads = quads.items;
+    out.quad_paint = quad_paint.items;
+    out.ranges = ranges.items;
+    out.patterns = patterns.items;
+    out.paint_spans = spans.items;
+    out.missing_images = missing.keys();
+    return out;
 }
 
 /// Resolve a pattern-fill layer's cell for the current feature, interning it
@@ -1774,6 +1911,114 @@ test "real chart: Annapolis first light" {
         try std.testing.expect(over_water > total / 10);
         g.savePng(a, try std.fmt.allocPrint(a, "{s}/annapolis-overscale.png", .{ct_build.out_dir}), ou) catch {};
     }
+}
+
+// Per-tile buckets, proven equivalent. Geometry built one tile at a time
+// against the tile's OWN origin, symbols built once over all tiles (so
+// collision stays global), then concatenated — must land exactly where a
+// single monolithic build does.
+test "concatScenes: per-tile geometry plus a global symbol pass equals one build" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [
+        \\   {"id": "bg", "type": "background", "paint": {"background-color": "#112233"}},
+        \\   {"id": "water", "type": "fill", "source": "chart", "source-layer": "areas",
+        \\    "filter": ["==", ["get", "kind"], "water"],
+        \\    "paint": {"fill-color": "#0000ff"}},
+        \\   {"id": "edges", "type": "line", "source": "chart", "source-layer": "lines",
+        \\    "paint": {"line-color": "#00ff00", "line-width": 2}}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+
+    const tile = try testTile(a);
+    const ids = [_]coord.TileId{
+        .{ .z = 10, .x = 300, .y = 400 },
+        .{ .z = 10, .x = 301, .y = 400 },
+        .{ .z = 10, .x = 300, .y = 401 },
+    };
+    var tiles: std.ArrayList(SourcedTile) = .empty;
+    for (ids) |id| try tiles.append(a, .{ .id = id, .tile = &tile });
+
+    const origin = ids[0].worldRect();
+    const view = View{ .zoom = 10, .origin = .{ .x = origin.x0, .y = origin.y0 } };
+    const whole = try buildScene(a, &style, tiles.items, view, .{});
+
+    // The split build: each tile's geometry against its OWN corner, so the
+    // result is reusable at any camera position.
+    var parts: std.ArrayList(ScenePart) = .empty;
+    for (ids) |id| {
+        const rect = id.worldRect();
+        var one: [1]SourcedTile = .{.{ .id = id, .tile = &tile }};
+        const part = try buildScene(a, &style, &one, .{
+            .zoom = 10,
+            .origin = .{ .x = rect.x0, .y = rect.y0 },
+            .layers = .tile_local,
+        }, .{});
+        try parts.append(a, .{
+            .built = part,
+            .dx = @floatCast(rect.x0 - view.origin.x),
+            .dy = @floatCast(rect.y0 - view.origin.y),
+        });
+    }
+    // Symbols once over everything, keeping one collider for the whole set.
+    try parts.append(a, .{
+        .built = try buildScene(a, &style, tiles.items, .{
+            .zoom = 10,
+            .origin = view.origin,
+            .layers = .global,
+        }, .{}),
+        .dx = 0,
+        .dy = 0,
+    });
+    const stitched = try concatScenes(a, parts.items);
+
+    try std.testing.expectEqual(whole.vertices.len, stitched.vertices.len);
+    try std.testing.expectEqual(whole.indices.len, stitched.indices.len);
+    try std.testing.expectEqual(whole.ranges.len, stitched.ranges.len);
+    try std.testing.expectEqual(whole.background.r, stitched.background.r);
+
+    // The buffers themselves are NOT byte-identical, and must not be
+    // expected to be: a monolithic build lays vertices out layer-major, a
+    // stitched one tile-major. What has to match is what gets DRAWN — the
+    // ranges in order, and the vertex+paint each one walks.
+    const drawn = try drawSequence(a, whole);
+    const drawn2 = try drawSequence(a, stitched);
+    try std.testing.expectEqualSlices(u8, drawn, drawn2);
+
+    // Ranges came out tile-major and were sorted back into style order.
+    for (stitched.ranges[1..], 0..) |r, i| {
+        try std.testing.expect(r.paint_key >= stitched.ranges[i].paint_key);
+    }
+}
+
+/// Everything a scene draws, in order, as bytes: per range its spec, then
+/// each vertex it walks paired with that vertex's paint. Two scenes with the
+/// same sequence render identically however their buffers are laid out.
+fn drawSequence(a: std.mem.Allocator, b: Built) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (b.ranges) |r| {
+        try out.appendSlice(a, &.{ @intFromEnum(r.kind), @intFromEnum(r.prim), @intFromEnum(r.atlas), r.flags });
+        try out.appendSlice(a, std.mem.asBytes(&r.paint_key));
+        try out.appendSlice(a, std.mem.asBytes(&r.count));
+        switch (r.prim) {
+            .triangles => for (r.first..r.first + r.count) |i| {
+                const ix = b.indices[i];
+                try out.appendSlice(a, std.mem.asBytes(&b.vertices[ix]));
+                try out.appendSlice(a, std.mem.asBytes(&b.paint[ix]));
+            },
+            .quads => for (r.first..r.first + r.count) |i| {
+                try out.appendSlice(a, std.mem.asBytes(&b.quads[i]));
+                try out.appendSlice(a, std.mem.asBytes(&b.quad_paint[i]));
+            },
+        }
+    }
+    return out.items;
 }
 
 test "buildScene: a pattern fill splits into one range per cell" {

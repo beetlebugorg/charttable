@@ -13,13 +13,18 @@
 //! use (the camera's target, not its still-easing value), or a continuous
 //! pinch re-spawns identical builds all the way through the ease.
 //!
-//! What is deliberately NOT here yet, and why it is safe to defer: per-tile
-//! buckets (DESIGN.md's model). buildScene merges every visible tile into one
-//! single-origin scene, so a tile set change re-tessellates all of them. That
-//! is correct, just wasteful; the fix is to cache `Built` per (tile, style
-//! generation) and concatenate + rebase, which needs buildScene split at the
-//! rebase step. The scene contract already keeps geometry tile-local up to
-//! that point.
+//! PER-TILE BUCKETS (DESIGN.md's model). A tile's GEOMETRY is built against
+//! that tile's own corner and cached by (tile, style generation), so a pan
+//! that brings in two new tiles re-tessellates two tiles, not the nine that
+//! are visible. SYMBOLS are deliberately not cached that way: collision is
+//! global across the resident set, and a per-tile collider would let labels
+//! overlap at every seam. So symbols are laid out once over all tiles and
+//! concatenated with the cached geometry (DESIGN.md: "lay out per tile but
+//! PLACE globally").
+//!
+//! Still on the owner thread: the build does not yet run on a worker with a
+//! pointer-swap adopt, so a coverage break costs a frame. Per-tile caching
+//! shrinks that cost; it does not remove it.
 //!
 //! THREADING. Everything here runs on the owner thread. The only work that
 //! leaves it is tile fetch + decode, inside source/cache.zig.
@@ -68,6 +73,16 @@ pub const Tick = struct {
     pending: usize = 0,
     /// Stream B was refilled for a zoom-only paint change (no re-layout).
     paint_refilled: bool = false,
+};
+
+/// One tile's cached geometry: everything the tile contributes to a scene
+/// except symbols, built against its own corner and reusable until the style
+/// or the build zoom changes.
+const Bucket = struct {
+    arena: std.heap.ArenaAllocator,
+    built: map.Built,
+    style_generation: u64,
+    zoom: f64,
 };
 
 /// A style source bound to somewhere tiles actually come from. The style
@@ -120,6 +135,14 @@ pub const Map = struct {
     /// Tiles the last build used, so a tick can tell a tile LANDING from a
     /// mere camera move.
     resident: std.ArrayListUnmanaged(u64) = .empty,
+    /// Cached per-tile geometry, keyed by cache key. Each entry owns its
+    /// arena and remembers the style generation it was built for.
+    buckets: std.AutoHashMapUnmanaged(u64, Bucket) = .empty,
+    /// Tiles re-tessellated across the Map's life, and tiles served from the
+    /// bucket cache — the ratio is what per-tile caching buys.
+    tiles_built: u64 = 0,
+    tiles_reused: u64 = 0,
+
     /// The tile set the current coverage asks for. Chosen when a rebuild is
     /// triggered and then held: re-deriving it from the live camera every
     /// frame would make any pan at all change the set, and the overscan that
@@ -147,6 +170,8 @@ pub const Map = struct {
     }
 
     pub fn deinit(self: *Map) void {
+        self.dropBuckets();
+        self.buckets.deinit(self.gpa);
         self.cache.deinit();
         if (self.style) |*s| s.deinit();
         for (&self.arenas) |*a| a.deinit();
@@ -260,6 +285,10 @@ pub const Map = struct {
             self.paint_refills += 1;
             return true;
         }
+        // A paint change a refill cannot serve rebuilds -- and the cached
+        // per-tile buckets hold that layer's evaluated paint, so they are
+        // stale too. Invalidating them is what style_generation is for.
+        self.style_generation += 1;
         self.dirty = true;
         return false;
     }
@@ -542,6 +571,69 @@ pub const Map = struct {
         return "";
     }
 
+    fn dropBuckets(self: *Map) void {
+        var it = self.buckets.valueIterator();
+        while (it.next()) |b| b.arena.deinit();
+        self.buckets.clearRetainingCapacity();
+    }
+
+    /// The cached geometry for one tile, building it if the cache has none
+    /// for this style generation. Built against the TILE'S OWN corner, so it
+    /// stays valid however the camera moves.
+    fn bucketFor(
+        self: *Map,
+        style: *const styles.Style,
+        key: caches.Key,
+        zoom: f64,
+    ) !?*Bucket {
+        const k = key.pack();
+        if (self.buckets.getPtr(k)) |b| {
+            if (b.style_generation == self.style_generation and b.zoom == zoom) {
+                self.tiles_reused += 1;
+                return b;
+            }
+            b.arena.deinit();
+            _ = self.buckets.remove(k);
+        }
+        const tile = self.cache.get(key) orelse return null;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        errdefer arena.deinit();
+        const rect = key.tileId().worldRect();
+        var one: [1]map.SourcedTile = .{.{ .id = key.tileId(), .tile = tile }};
+        const built = try map.buildScene(arena.allocator(), style, &one, .{
+            .zoom = zoom,
+            .origin = .{ .x = rect.x0, .y = rect.y0 },
+            .layers = .tile_local,
+        }, self.assets);
+        try self.buckets.put(self.gpa, k, .{
+            .arena = arena,
+            .built = built,
+            .style_generation = self.style_generation,
+            .zoom = zoom,
+        });
+        self.tiles_built += 1;
+        return self.buckets.getPtr(k);
+    }
+
+    /// Drop cached geometry for tiles the current coverage no longer wants.
+    fn evictBuckets(self: *Map, keep: []const u64) void {
+        var stale: [MAX_TILES]u64 = undefined;
+        var n: usize = 0;
+        var it = self.buckets.iterator();
+        while (it.next()) |kv| {
+            if (std.mem.indexOfScalar(u64, keep, kv.key_ptr.*) != null) continue;
+            if (n == stale.len) break;
+            stale[n] = kv.key_ptr.*;
+            n += 1;
+        }
+        for (stale[0..n]) |k| {
+            if (self.buckets.fetchRemove(k)) |kv| {
+                var b = kv.value;
+                b.arena.deinit();
+            }
+        }
+    }
+
     fn sameResident(self: *const Map, have: []const u64) bool {
         if (have.len != self.resident.items.len) return false;
         for (have, self.resident.items) |a, b| {
@@ -600,14 +692,30 @@ pub const Map = struct {
         _ = self.arenas[next].reset(.retain_capacity);
         const a = self.arenas[next].allocator();
 
-        var tiles: std.ArrayListUnmanaged(map.SourcedTile) = .empty;
+        const origin = self.cam.center;
+        const zoom = self.buildTargetZoom();
+
+        // Geometry: one cached bucket per tile, rebased at concatenation.
+        // Rasters ride the merged pass with the symbols — they carry
+        // borrowed image memory the cache owns, so caching them per tile
+        // would outlive the eviction that frees it.
+        var parts: std.ArrayListUnmanaged(map.ScenePart) = .empty;
+        defer parts.deinit(self.gpa);
+        var vector_tiles: std.ArrayListUnmanaged(map.SourcedTile) = .empty;
         var rasters: std.ArrayListUnmanaged(map.RasterTile) = .empty;
         for (have) |k| {
             const key: caches.Key = @bitCast(k);
             switch (self.cache.sourceKind(key)) {
                 .vector => {
                     const tile = self.cache.get(key) orelse continue;
-                    try tiles.append(a, .{ .id = key.tileId(), .tile = tile });
+                    try vector_tiles.append(a, .{ .id = key.tileId(), .tile = tile });
+                    const bucket = (try self.bucketFor(style, key, zoom)) orelse continue;
+                    const rect = key.tileId().worldRect();
+                    try parts.append(self.gpa, .{
+                        .built = bucket.built,
+                        .dx = @floatCast(rect.x0 - origin.x),
+                        .dy = @floatCast(rect.y0 - origin.y),
+                    });
                 },
                 .raster => {
                     const img = self.cache.getRaster(key) orelse continue;
@@ -622,19 +730,29 @@ pub const Map = struct {
             }
         }
 
-        const origin = self.cam.center;
-        const zoom = self.buildTargetZoom();
-        self.built = try map.buildSceneWithRasters(a, style, tiles.items, rasters.items, .{
-            .zoom = zoom,
-            .origin = origin,
-        }, self.assets);
+        // Symbols and rasters once over every tile: collision stays global,
+        // and raster images stay borrowed from the tile cache rather than
+        // cached past their owner's lifetime.
+        try parts.append(self.gpa, .{
+            .built = try map.buildSceneWithRasters(a, style, vector_tiles.items, rasters.items, .{
+                .zoom = zoom,
+                .origin = origin,
+                .layers = .global,
+            }, self.assets),
+            .dx = 0,
+            .dy = 0,
+        });
+
+        self.built = try map.concatScenes(a, parts.items);
         self.live = next;
         self.scene_generation += 1;
+        self.paint_generation += 1;
         self.rebuilds += 1;
         self.dirty = false;
 
         self.resident.clearRetainingCapacity();
         try self.resident.appendSlice(self.gpa, have);
+        self.evictBuckets(self.wanted.items);
         self.recordCoverage(origin, zoom);
     }
 
@@ -1168,6 +1286,56 @@ test "Map: a feature-driven color records no paint span" {
     m.cam.setTarget();
     const tick = try m.update();
     try testing.expect(!tick.paint_refilled);
+}
+
+test "Map: a pan re-tessellates only the tiles that arrived" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    const built_first = m.tiles_built;
+    try testing.expect(built_first > 0);
+    try testing.expectEqual(m.resident.items.len, m.buckets.count());
+
+    // Pan clear of the coverage box. The new tile set overlaps the old, so
+    // the tiles that were already resident must come from the bucket cache
+    // rather than being tessellated again.
+    const reused_before = m.tiles_reused;
+    m.cam.panPx(300, 0);
+    try testing.expect(m.needsRebuild());
+    try settle(&m);
+    try testing.expect(m.tiles_reused > reused_before);
+    // And it did not rebuild the world: fewer fresh builds than tiles drawn.
+    try testing.expect(m.tiles_built - built_first < m.resident.items.len);
+
+    // A style change invalidates every bucket, because a bucket holds that
+    // style's evaluated paint as well as its geometry.
+    const built_before_style = m.tiles_built;
+    const other =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [
+        \\   {"id": "bg", "type": "background", "paint": {"background-color": "#ff0000"}},
+        \\   {"id": "areas", "type": "fill", "source": "chart", "source-layer": "areas",
+        \\    "paint": {"fill-color": "#123456"}}]}
+    ;
+    try m.setStyleJson(other);
+    try settle(&m);
+    try testing.expect(m.tiles_built > built_before_style);
+    try testing.expectEqual([4]u8{ 0x12, 0x34, 0x56, 255 }, m.scene().?.paint[0].color);
+    try testing.expectApproxEqAbs(@as(f32, 1), m.scene().?.background.r, 1e-3);
+
+    // Buckets never outlive the coverage that wants them.
+    try testing.expect(m.buckets.count() <= m.wanted.items.len);
 }
 
 test "Map: a raster source draws as world-space quads in style order" {
