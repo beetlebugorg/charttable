@@ -157,6 +157,80 @@ pub const Style = struct {
         }
         return null;
     }
+
+    fn layerMut(self: *Style, id: []const u8) ?*Layer {
+        const mutable = @constCast(self.layers);
+        for (mutable) |*l| {
+            if (std.mem.eql(u8, l.id, id)) return l;
+        }
+        return null;
+    }
+
+    pub const SetError = error{ UnknownLayer, UnknownProperty, BadValue, OutOfMemory };
+
+    /// Replace one property's value from a JSON fragment, as the host's
+    /// setPaintProperty / setLayoutProperty do. The new value is parsed the
+    /// same way the document's own section was, so an expression, a legacy
+    /// function and a constant all behave identically to having been written
+    /// in the style file.
+    ///
+    /// Everything allocates in the Style's arena and the old value is
+    /// ORPHANED, not freed — a host that re-sets a property thousands of
+    /// times grows the arena. That is the same trade the sprite atlas makes,
+    /// and it keeps every borrowed slice a caller holds valid.
+    pub fn setProperty(
+        self: *Style,
+        layer_id: []const u8,
+        name: []const u8,
+        json_value: std.json.Value,
+    ) SetError!void {
+        const l = self.layerMut(layer_id) orelse return error.UnknownLayer;
+        const prop = properties.find(l.kind, name) orelse return error.UnknownProperty;
+        const a = self.arena.allocator();
+        var p = P{ .a = a, .diags = .empty };
+        const pv = (parsePropValue(&p, prop, layer_id, json_value) catch
+            return error.OutOfMemory) orelse return error.BadValue;
+        const entry = LayerProp{
+            .prop = prop,
+            .value = pv,
+            .class = switch (pv) {
+                .constant => .constant,
+                .expression => |parsed| compile.Class.of(parsed.deps),
+            },
+        };
+        // In place when the layer already set it, appended otherwise.
+        for (@constCast(l.props)) |*lp| {
+            if (std.mem.eql(u8, lp.prop.name, name)) {
+                lp.* = entry;
+                return;
+            }
+        }
+        var grown = a.alloc(LayerProp, l.props.len + 1) catch return error.OutOfMemory;
+        @memcpy(grown[0..l.props.len], l.props);
+        grown[l.props.len] = entry;
+        l.props = grown;
+    }
+
+    /// Replace a layer's filter wholesale, or clear it with null. THE WHOLE
+    /// FILTER: there is no merge, no partial update, and no way to add one
+    /// clause — say so loudly, because a host that assumes otherwise silently
+    /// widens what draws (concerns C13).
+    pub fn setFilter(self: *Style, layer_id: []const u8, json_filter: ?std.json.Value) SetError!void {
+        const l = self.layerMut(layer_id) orelse return error.UnknownLayer;
+        const j = json_filter orelse {
+            l.filter = null;
+            return;
+        };
+        const a = self.arena.allocator();
+        l.filter = exprs.parse(a, j) catch return error.BadValue;
+    }
+
+    /// The spec's `visibility` layout property, which every layer type has.
+    pub fn setVisibility(self: *Style, layer_id: []const u8, on: bool) SetError!void {
+        return self.setProperty(layer_id, "visibility", .{
+            .string = if (on) "visible" else "none",
+        });
+    }
 };
 
 // ---- expression detection ---------------------------------------------------

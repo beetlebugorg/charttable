@@ -94,6 +94,27 @@ const char *charttable_style_diagnostics(charttable *, size_t *out_len);
 int charttable_add_source_pmtiles(charttable *, const char *name,
                                   const char *path);
 
+/* Set one paint property from a JSON fragment ("#ff0000", 0.5, or a whole
+ * expression). A colour or opacity the layer applies uniformly refills the
+ * paint stream and never re-lays-out: returns 1 when it was served that way,
+ * 0 when it needed a rebuild, negative on error. */
+int charttable_set_paint_property(charttable *, const char *layer,
+                                  const char *name, const char *json_value,
+                                  size_t len);
+
+/* Layout is geometry, so this always rebuilds. */
+int charttable_set_layout_property(charttable *, const char *layer,
+                                   const char *name, const char *json_value,
+                                   size_t len);
+
+/* Replace a layer's filter WHOLESALE; NULL clears it. There is no merge and
+ * no partial update -- whatever you pass becomes the ENTIRE filter, and a
+ * host that assumes otherwise silently widens what draws. */
+int charttable_set_filter(charttable *, const char *layer,
+                          const char *json_filter, size_t len);
+
+int charttable_set_layer_visibility(charttable *, const char *layer, int on);
+
 /* ---- images ------------------------------------------------------------- */
 
 /* The style's sprite sheet: MapLibre sprite index JSON + its PNG. Replaces

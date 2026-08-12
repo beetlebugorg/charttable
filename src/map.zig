@@ -45,6 +45,10 @@ pub const PaintSpan = struct {
     first: u32,
     count: u32,
     layer: u32,
+    /// Whether this layer's colour moves with the camera. A zoom change
+    /// refills only these; a setPaintProperty refills whichever layer it
+    /// touched, zoom-dependent or not.
+    zoom_dependent: bool,
 };
 
 pub const Built = struct {
@@ -76,21 +80,38 @@ pub const Built = struct {
     paint_zoom: f64 = 0,
 };
 
-/// True when this layer's COLOUR or OPACITY varies with zoom alone — the
-/// case a refill can serve. A zoom-only line-WIDTH is deliberately excluded:
-/// width is baked into the vertex offsets at layout, so it is geometry, and
-/// changing it needs a rebuild like any other layout property.
-fn hasZoomOnlyPaint(sl: *const styles.Layer) bool {
+const PaintKind = struct {
+    /// The colour is the same for every feature in the layer, so a refill
+    /// can serve a change to it without re-running the feature loop.
+    refillable: bool,
+    /// ...and it moves with the camera, so a zoom change must.
+    zoom_dependent: bool,
+};
+
+/// How this layer's COLOUR and OPACITY behave. A feature-driven colour is
+/// NOT refillable: each feature has its own value, and a refill has no
+/// feature to evaluate against.
+///
+/// line-WIDTH is deliberately not considered: width is baked into the vertex
+/// offsets at layout, so it is geometry, and changing it needs a rebuild
+/// like any other layout property.
+fn paintKindOf(sl: *const styles.Layer) PaintKind {
     const names: [2][]const u8 = switch (sl.kind) {
         .fill => .{ "fill-color", "fill-opacity" },
         .line => .{ "line-color", "line-opacity" },
-        else => return false,
+        else => return .{ .refillable = false, .zoom_dependent = false },
     };
+    var zoomy = false;
     for (names) |n| {
         const lp = sl.get(n) orelse continue;
-        if (lp.class == .zoom_only) return true;
+        switch (lp.class) {
+            .constant => {},
+            .zoom_only => zoomy = true,
+            // Per-feature: a refill cannot reproduce it.
+            .data_driven, .zoom_and_data => return .{ .refillable = false, .zoom_dependent = false },
+        }
     }
-    return false;
+    return .{ .refillable = true, .zoom_dependent = zoomy };
 }
 
 /// Re-evaluate the zoom-only paint of every recorded span at `zoom` and
@@ -106,13 +127,54 @@ pub fn refillPaint(
     built: *Built,
     zoom: f64,
 ) bool {
+    return refillSpans(arena, style, built, zoom, .zoom_moved);
+}
+
+/// Refill the spans belonging to ONE layer, whatever its zoom behaviour —
+/// what a host's setPaintProperty needs. Returns false when that layer's
+/// colour is per-feature, in which case the caller must rebuild.
+pub fn refillLayerPaint(
+    arena: std.mem.Allocator,
+    style: *const styles.Style,
+    built: *Built,
+    zoom: f64,
+    layer: u32,
+) bool {
+    // The span says WHERE the layer's vertices are; whether a refill can
+    // reproduce its colour depends on the style as it is NOW. A host that
+    // just replaced a flat colour with a per-feature one has a stale span
+    // claiming refillable, and honouring it would paint every feature the
+    // same wrong colour.
+    if (layer >= style.layers.len) return false;
+    if (!paintKindOf(&style.layers[layer]).refillable) return false;
+    return refillSpans(arena, style, built, zoom, .{ .layer = layer });
+}
+
+const RefillWhich = union(enum) {
+    zoom_moved,
+    layer: u32,
+};
+
+fn refillSpans(
+    arena: std.mem.Allocator,
+    style: *const styles.Style,
+    built: *Built,
+    zoom: f64,
+    which: RefillWhich,
+) bool {
     if (built.paint_spans.len == 0) return false;
-    if (zoom == built.paint_zoom) return false;
+    if (which == .zoom_moved and zoom == built.paint_zoom) return false;
     var ctx = eval_mod.Context{ .zoom = zoom };
     var errors: usize = 0;
+    var touched = false;
     for (built.paint_spans) |span| {
+        switch (which) {
+            .zoom_moved => if (!span.zoom_dependent) continue,
+            .layer => |want| if (span.layer != want) continue,
+        }
         if (span.layer >= style.layers.len) continue;
         const sl = &style.layers[span.layer];
+        if (!paintKindOf(sl).refillable) continue;
         const color_name: []const u8 = if (sl.kind == .fill) "fill-color" else "line-color";
         const opacity_name: []const u8 = if (sl.kind == .fill) "fill-opacity" else "line-opacity";
         const cv = evalProp(arena, resolveProp(sl, color_name) orelse continue, &ctx, .null, &errors);
@@ -122,9 +184,10 @@ pub fn refillPaint(
         const rgba = color.rgba8();
         const end = @min(built.paint.len, span.first + span.count);
         for (built.paint[span.first..end]) |*pv| pv.color = rgba;
+        touched = true;
     }
-    built.paint_zoom = zoom;
-    return true;
+    if (which == .zoom_moved) built.paint_zoom = zoom;
+    return touched;
 }
 
 /// One decoded raster tile offered to the build. `rgba` is borrowed for the
@@ -577,7 +640,10 @@ pub fn buildSceneWithRasters(
         const is_pattern = sl.kind == .fill and sl.get("fill-pattern") != null;
         // Only layers whose colour or opacity moves with the camera alone
         // need a span; everything else is baked correctly at layout.
-        const zoom_paint = !is_pattern and hasZoomOnlyPaint(sl);
+        const paint_kind = if (is_pattern)
+            PaintKind{ .refillable = false, .zoom_dependent = false }
+        else
+            paintKindOf(sl);
 
         for (tiles) |st| {
             const tl = st.tile.layer(source_layer) orelse continue;
@@ -764,11 +830,12 @@ pub fn buildSceneWithRasters(
                 }
                 continue;
             }
-            if (zoom_paint and paint.items.len > first_paint) {
+            if (paint_kind.refillable and paint.items.len > first_paint) {
                 try paint_spans.append(arena, .{
                     .first = first_paint,
                     .count = @intCast(paint.items.len - first_paint),
                     .layer = @intCast(layer_i),
+                    .zoom_dependent = paint_kind.zoom_dependent,
                 });
             }
             const count: u32 = @intCast(indices.items.len - run_first);

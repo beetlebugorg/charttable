@@ -230,6 +230,77 @@ pub const Map = struct {
         return self.bindSource(name, archive.rasterSource(maxzoom));
     }
 
+    /// Set one paint property. A colour or opacity the layer applies
+    /// uniformly refills stream B and never re-lays-out (DESIGN.md's
+    /// invariant); anything else — a per-feature colour, a line width, a
+    /// property on a layer with no resident geometry — falls back to a
+    /// rebuild, which is correct either way.
+    ///
+    /// Returns true when it was served as a paint-only change.
+    pub fn setPaintProperty(
+        self: *Map,
+        layer_id: []const u8,
+        name: []const u8,
+        json_value: std.json.Value,
+    ) !bool {
+        const style = if (self.style) |*s| s else return error.NoStyle;
+        try style.setProperty(layer_id, name, json_value);
+        const idx = self.layerIndex(layer_id) orelse {
+            self.dirty = true;
+            return false;
+        };
+        const b = if (self.built) |*bb| bb else {
+            self.dirty = true;
+            return false;
+        };
+        const a = self.arenas[self.live].allocator();
+        if (map.refillLayerPaint(a, style, b, self.cam.zoom, idx)) {
+            self.paint_generation += 1;
+            self.paint_refills += 1;
+            return true;
+        }
+        self.dirty = true;
+        return false;
+    }
+
+    /// Set one layout property. Layout is geometry, so this always rebuilds.
+    pub fn setLayoutProperty(
+        self: *Map,
+        layer_id: []const u8,
+        name: []const u8,
+        json_value: std.json.Value,
+    ) !void {
+        const style = if (self.style) |*s| s else return error.NoStyle;
+        try style.setProperty(layer_id, name, json_value);
+        self.style_generation += 1;
+        self.dirty = true;
+    }
+
+    /// Replace a layer's filter WHOLESALE (or clear it with null). There is
+    /// no merge and no partial update — a host that assumes otherwise
+    /// silently widens what draws.
+    pub fn setFilter(self: *Map, layer_id: []const u8, json_filter: ?std.json.Value) !void {
+        const style = if (self.style) |*s| s else return error.NoStyle;
+        try style.setFilter(layer_id, json_filter);
+        self.style_generation += 1;
+        self.dirty = true;
+    }
+
+    pub fn setLayerVisibility(self: *Map, layer_id: []const u8, on: bool) !void {
+        const style = if (self.style) |*s| s else return error.NoStyle;
+        try style.setVisibility(layer_id, on);
+        self.style_generation += 1;
+        self.dirty = true;
+    }
+
+    fn layerIndex(self: *const Map, layer_id: []const u8) ?u32 {
+        const style = self.style orelse return null;
+        for (style.layers, 0..) |*l, i| {
+            if (std.mem.eql(u8, l.id, layer_id)) return @intCast(i);
+        }
+        return null;
+    }
+
     /// Symbol assets. Changing them re-lays-out (an icon that was missing may
     /// now resolve), so this bumps the style generation.
     pub fn setAssets(self: *Map, assets: Assets) void {
@@ -966,6 +1037,85 @@ test "Map: a zoom-only color refills stream B without re-laying-out" {
     const panned = try m.update();
     try testing.expect(!panned.paint_refilled);
     try testing.expectEqual(gen2, m.paint_generation);
+}
+
+test "Map: setPaintProperty refills; setLayoutProperty and setFilter rebuild" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "areas", "type": "fill", "source": "chart",
+        \\   "source-layer": "areas", "paint": {"fill-color": "#00ff00"}}]}
+    ;
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    try testing.expectEqual([4]u8{ 0, 255, 0, 255 }, m.scene().?.paint[0].color);
+    const rebuilds = m.rebuilds;
+    const scene_gen = m.scene_generation;
+
+    // A uniform colour: paint only. No rebuild, no new geometry.
+    var doc = std.heap.ArenaAllocator.init(a);
+    defer doc.deinit();
+    const red = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(), "\"#ff0000\"", .{});
+    try testing.expect(try m.setPaintProperty("areas", "fill-color", red));
+    try testing.expectEqual(rebuilds, m.rebuilds);
+    try testing.expectEqual(scene_gen, m.scene_generation);
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, m.scene().?.paint[0].color);
+
+    // An expression is fine too, as long as it is not per-feature.
+    const zoomy = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(),
+        \\["interpolate", ["linear"], ["zoom"], 10, "#0000ff", 20, "#0000ff"]
+    , .{});
+    try testing.expect(try m.setPaintProperty("areas", "fill-color", zoomy));
+    try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, m.scene().?.paint[0].color);
+    try testing.expectEqual(rebuilds, m.rebuilds);
+
+    // A per-feature colour cannot be refilled: it must rebuild.
+    const ddriven = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(),
+        \\["match", ["get", "kind"], "water", "#101010", "#202020"]
+    , .{});
+    try testing.expect(!try m.setPaintProperty("areas", "fill-color", ddriven));
+    try testing.expect(m.dirty);
+    try settle(&m);
+    try testing.expect(m.rebuilds > rebuilds);
+    try testing.expectEqual([4]u8{ 32, 32, 32, 255 }, m.scene().?.paint[0].color);
+
+    // Layout and filter changes always rebuild.
+    const after = m.rebuilds;
+    const none = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(), "\"none\"", .{});
+    try m.setLayoutProperty("areas", "visibility", none);
+    try testing.expect(m.dirty);
+    try settle(&m);
+    try testing.expect(m.rebuilds > after);
+
+    const filt = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(),
+        \\["==", ["get", "kind"], "nothing-matches-this"]
+    , .{});
+    const before_filter = m.rebuilds;
+    try m.setFilter("areas", filt);
+    try settle(&m);
+    try testing.expect(m.rebuilds > before_filter);
+    // The filter admits nothing, so the layer draws nothing.
+    try testing.expectEqual(@as(usize, 0), m.scene().?.ranges.len);
+
+    // Clearing it brings the features back.
+    try m.setFilter("areas", null);
+    try settle(&m);
+    try testing.expect(m.scene().?.ranges.len > 0);
+
+    // An unknown layer or property is refused, not guessed at.
+    try testing.expectError(error.UnknownLayer, m.setLayoutProperty("nope", "visibility", none));
+    try testing.expectError(error.UnknownProperty, m.setLayoutProperty("areas", "not-a-prop", none));
 }
 
 test "Map: a feature-driven color records no paint span" {

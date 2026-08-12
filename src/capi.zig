@@ -260,6 +260,83 @@ export fn charttable_add_source_pmtiles(
     return OK;
 }
 
+/// Set one paint property from a JSON fragment (`"#ff0000"`, `0.5`, or a
+/// whole expression). A uniform colour or opacity refills the paint stream
+/// and never re-lays-out; returns 1 when it was served that way, 0 when it
+/// needed a rebuild, negative on error.
+export fn charttable_set_paint_property(
+    h: ?*anyopaque,
+    layer: [*:0]const u8,
+    name: [*:0]const u8,
+    json_value: [*]const u8,
+    len: usize,
+) callconv(.c) c_int {
+    const self = locked(h) orelse return ERR_HANDLE;
+    defer self.mu.unlock();
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_value[0..len], .{}) catch
+        return ERR_ARG;
+    const paint_only = self.m.setPaintProperty(std.mem.span(layer), std.mem.span(name), v) catch |e|
+        return setErr(e);
+    return if (paint_only) 1 else 0;
+}
+
+export fn charttable_set_layout_property(
+    h: ?*anyopaque,
+    layer: [*:0]const u8,
+    name: [*:0]const u8,
+    json_value: [*]const u8,
+    len: usize,
+) callconv(.c) c_int {
+    const self = locked(h) orelse return ERR_HANDLE;
+    defer self.mu.unlock();
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_value[0..len], .{}) catch
+        return ERR_ARG;
+    self.m.setLayoutProperty(std.mem.span(layer), std.mem.span(name), v) catch |e| return setErr(e);
+    return OK;
+}
+
+/// Replace a layer's filter WHOLESALE. Passing NULL clears it. There is no
+/// merge and no partial update: whatever you pass becomes the entire filter,
+/// and a host that assumes otherwise silently widens what draws.
+export fn charttable_set_filter(
+    h: ?*anyopaque,
+    layer: [*:0]const u8,
+    json_filter: ?[*]const u8,
+    len: usize,
+) callconv(.c) c_int {
+    const self = locked(h) orelse return ERR_HANDLE;
+    defer self.mu.unlock();
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    var v: ?std.json.Value = null;
+    if (json_filter) |bytes| {
+        v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes[0..len], .{}) catch
+            return ERR_ARG;
+    }
+    self.m.setFilter(std.mem.span(layer), v) catch |e| return setErr(e);
+    return OK;
+}
+
+export fn charttable_set_layer_visibility(h: ?*anyopaque, layer: [*:0]const u8, on: c_int) callconv(.c) c_int {
+    const self = locked(h) orelse return ERR_HANDLE;
+    defer self.mu.unlock();
+    self.m.setLayerVisibility(std.mem.span(layer), on != 0) catch |e| return setErr(e);
+    return OK;
+}
+
+fn setErr(e: anyerror) c_int {
+    return switch (e) {
+        error.UnknownLayer, error.UnknownProperty => ERR_ARG,
+        error.BadValue => ERR_ARG,
+        error.NoStyle => ERR_STYLE,
+        else => ERR_MEMORY,
+    };
+}
+
 // ---- images ----------------------------------------------------------------
 
 export fn charttable_set_missing_image_callback(
