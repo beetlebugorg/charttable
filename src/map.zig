@@ -14,6 +14,7 @@ const styles = @import("style/style.zig");
 const properties = @import("style/properties.zig");
 const exprs = @import("style/expr.zig");
 const eval_mod = @import("style/eval.zig");
+const compile = @import("style/compile.zig");
 const vals = @import("style/value.zig");
 const mvt = @import("source/mvt.zig");
 const coord = @import("source/coord.zig");
@@ -52,6 +53,9 @@ pub const Built = struct {
     missing_images: []const []const u8 = &.{},
     /// Features that failed a paint evaluation and fell to defaults.
     eval_errors: usize = 0,
+    /// Per-layer properties the compiled tier claimed. The rest keep
+    /// running through the interpreter, which is always correct.
+    compiled_props: usize = 0,
 };
 
 /// One decoded raster tile offered to the build. `rgba` is borrowed for the
@@ -112,11 +116,125 @@ const MvtFeature = struct {
     }
 };
 
+/// An MVT feature seen through the COMPILED tier's field interface: values
+/// by pre-resolved key index, no string hashing per read. `resolve` runs
+/// once per (program x tile layer); `field` runs per feature.
+const MvtFields = struct {
+    layer: *const mvt.Layer,
+    feature: *const mvt.Feature,
+
+    fn resolve(ctx: ?*const anyopaque, key: []const u8) u32 {
+        const layer: *const mvt.Layer = @ptrCast(@alignCast(ctx.?));
+        return layer.keyIndex(key) orelse compile.NO_HANDLE;
+    }
+
+    fn field(ptr: ?*const anyopaque, handle: u32) Value {
+        const self: *const MvtFields = @ptrCast(@alignCast(ptr.?));
+        const v = self.layer.property(self.feature, handle) orelse return .null;
+        return MvtFeature.toValue(v);
+    }
+
+    fn hasField(ptr: ?*const anyopaque, handle: u32) bool {
+        const self: *const MvtFields = @ptrCast(@alignCast(ptr.?));
+        return self.layer.property(self.feature, handle) != null;
+    }
+};
+
+/// One expression compiled for this build, plus the key handles it was last
+/// bound with. Binding is per tile layer, not per feature.
+const Prog = struct {
+    program: compile.Program,
+    handles: []u32,
+    regs: []Value,
+    bound: ?*const mvt.Layer = null,
+
+    fn init(arena: std.mem.Allocator, root: *const exprs.Expr) ?Prog {
+        const p = compile.compile(arena, root) catch return null;
+        const handles = arena.alloc(u32, p.keyCount()) catch return null;
+        const regs = arena.alloc(Value, @max(1, p.regCount())) catch return null;
+        return .{ .program = p, .handles = handles, .regs = regs };
+    }
+
+    fn bind(self: *Prog, layer: *const mvt.Layer) void {
+        if (self.bound == layer) return;
+        self.program.bind(MvtFields.resolve, layer, self.handles);
+        self.bound = layer;
+    }
+
+    fn run(self: *Prog, arena: std.mem.Allocator, fields: *const MvtFields, zoom: f64) ?Value {
+        var st = compile.Run{
+            .zoom = zoom,
+            .fields = .{
+                .ptr = fields,
+                .get = MvtFields.field,
+                .has = MvtFields.hasField,
+                .geom = switch (fields.feature.geom_type) {
+                    .point => .point,
+                    .linestring => .line,
+                    .polygon => .polygon,
+                    .unknown => .unknown,
+                },
+                .id = if (fields.feature.id) |id| .{ .number = @floatFromInt(id) } else .null,
+            },
+            .handles = self.handles,
+            .regs = self.regs,
+        };
+        return compile.run(arena, &self.program, &st) catch null;
+    }
+};
+
+/// The compiled programs one style layer uses in the per-feature loop. Only
+/// the properties that are actually hot get one; everything else keeps going
+/// through the interpreter, which is always correct.
+const LayerProgs = struct {
+    filter: ?Prog = null,
+    color: ?Prog = null,
+    opacity: ?Prog = null,
+    width: ?Prog = null,
+
+    fn compileProp(arena: std.mem.Allocator, sl: *const styles.Layer, name: []const u8) ?Prog {
+        const pv = resolveProp(sl, name) orelse return null;
+        return switch (pv) {
+            .constant => null, // already a value; nothing to run
+            .expression => |p| Prog.init(arena, p.root),
+        };
+    }
+
+    fn of(arena: std.mem.Allocator, sl: *const styles.Layer) LayerProgs {
+        var lp = LayerProgs{};
+        if (sl.filter) |f| lp.filter = Prog.init(arena, f.root);
+        switch (sl.kind) {
+            .fill => {
+                lp.color = compileProp(arena, sl, "fill-color");
+                lp.opacity = compileProp(arena, sl, "fill-opacity");
+            },
+            .line => {
+                lp.color = compileProp(arena, sl, "line-color");
+                lp.opacity = compileProp(arena, sl, "line-opacity");
+                lp.width = compileProp(arena, sl, "line-width");
+            },
+            else => {},
+        }
+        return lp;
+    }
+
+    fn bind(self: *LayerProgs, layer: *const mvt.Layer) void {
+        inline for (.{ "filter", "color", "opacity", "width" }) |name| {
+            if (@field(self, name)) |*p| p.bind(layer);
+        }
+    }
+};
+
 pub const View = struct {
     zoom: f64,
     /// World point the scene's vertex coordinates are relative to. Use the
     /// camera origin so Camera.mvpOrigin(origin) draws it directly.
     origin: cameras.Vec2,
+    /// Run the compiled expression tier (style/compile.zig) for the
+    /// properties it can claim, falling back to the interpreter for the
+    /// rest. Turning it OFF must not change a single pixel; that is what
+    /// the flag is for.
+    compiled: bool = true,
 };
 
 fn resolveProp(l: *const styles.Layer, name: []const u8) ?styles.PropValue {
@@ -143,6 +261,32 @@ fn evalProp(
             return v;
         },
     }
+}
+
+/// Evaluate one property: through its compiled program when the compiler
+/// claimed it, else through the interpreter. Both paths land on the same
+/// Value (the conformance harness proves it fixture by fixture), so this is
+/// a speed choice, never a semantic one.
+fn runProp(
+    arena: std.mem.Allocator,
+    prog: *?Prog,
+    fields: *const MvtFields,
+    zoom: f64,
+    sl: *const styles.Layer,
+    name: []const u8,
+    ctx: *eval_mod.Context,
+    default: Value,
+    errors: *usize,
+) Value {
+    if (prog.*) |*p| {
+        if (p.run(arena, fields, zoom)) |v| {
+            if (v != .null) return v;
+            return default;
+        }
+        errors.* += 1;
+        return default;
+    }
+    return evalProp(arena, resolveProp(sl, name).?, ctx, default, errors);
 }
 
 fn asColor(v: Value) ?Color {
@@ -347,6 +491,16 @@ pub fn buildSceneWithRasters(
                 if (asColor(evalProp(arena, resolveProp(sl, "text-halo-color").?, &ctx, .null, &out.eval_errors))) |c| sym.halo = c;
             }
         }
+        // The compiled tier for this layer's hot properties, built once per
+        // layer per build. Compiling ~180 layers costs nothing against
+        // evaluating thousands of features.
+        var progs: LayerProgs = if (view.compiled) LayerProgs.of(arena, sl) else .{};
+        if (view.compiled) {
+            inline for (.{ "filter", "color", "opacity", "width" }) |nm| {
+                if (@field(progs, nm) != null) out.compiled_props += 1;
+            }
+        }
+
         // A pattern fill resolves its cell per feature (fill-pattern is
         // data-driven: tile57 concats "pat:" onto a feature property), so the
         // layer's triangles split into one range per distinct cell.
@@ -354,6 +508,9 @@ pub fn buildSceneWithRasters(
 
         for (tiles) |st| {
             const tl = st.tile.layer(source_layer) orelse continue;
+            // Resolve every program's key slots against THIS layer's key
+            // table, once -- the whole point of compiling.
+            progs.bind(tl);
             const rect = st.id.worldRect();
             const tile_span = rect.x1 - rect.x0;
             const dx: f32 = @floatCast(rect.x0 - view.origin.x);
@@ -389,7 +546,14 @@ pub fn buildSceneWithRasters(
                 var mf = MvtFeature{ .layer = tl, .feature = f };
                 ctx.feature = mf.ref();
                 if (sl.filter) |flt| {
-                    if (!eval_mod.evalFilter(arena, flt.root, &ctx)) continue;
+                    const fields = MvtFields{ .layer = tl, .feature = f };
+                    const keep = if (progs.filter) |*fp|
+                        // A filter is a boolean expression; anything else is
+                        // a reject, exactly as evalFilter treats it.
+                        (fp.run(arena, &fields, view.zoom) orelse Value.false_).truthy()
+                    else
+                        eval_mod.evalFilter(arena, flt.root, &ctx);
+                    if (!keep) continue;
                 }
                 var key: f64 = 0;
                 if (sort_prop) |sp| {
@@ -454,9 +618,10 @@ pub fn buildSceneWithRasters(
                             // parallel; the pattern pipeline ignores it.
                             color = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
                         } else {
-                            const cv = evalProp(arena, resolveProp(sl, "fill-color").?, &ctx, .null, &out.eval_errors);
+                            const fields = MvtFields{ .layer = tl, .feature = f };
+                            const cv = runProp(arena, &progs.color, &fields, view.zoom, sl, "fill-color", &ctx, .null, &out.eval_errors);
                             color = asColor(cv) orelse continue;
-                            const ov = evalProp(arena, resolveProp(sl, "fill-opacity").?, &ctx, .{ .number = 1 }, &out.eval_errors);
+                            const ov = runProp(arena, &progs.opacity, &fields, view.zoom, sl, "fill-opacity", &ctx, .{ .number = 1 }, &out.eval_errors);
                             color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
                         }
                         try fill.layoutPolygon(arena, f.parts, tl.extent, tile_span, .{
@@ -464,11 +629,12 @@ pub fn buildSceneWithRasters(
                         }, &verts, &indices);
                     },
                     .line => {
-                        const cv = evalProp(arena, resolveProp(sl, "line-color").?, &ctx, .null, &out.eval_errors);
+                        const fields = MvtFields{ .layer = tl, .feature = f };
+                        const cv = runProp(arena, &progs.color, &fields, view.zoom, sl, "line-color", &ctx, .null, &out.eval_errors);
                         color = asColor(cv) orelse continue;
-                        const ov = evalProp(arena, resolveProp(sl, "line-opacity").?, &ctx, .{ .number = 1 }, &out.eval_errors);
+                        const ov = runProp(arena, &progs.opacity, &fields, view.zoom, sl, "line-opacity", &ctx, .{ .number = 1 }, &out.eval_errors);
                         color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
-                        const wv = evalProp(arena, resolveProp(sl, "line-width").?, &ctx, .{ .number = 1 }, &out.eval_errors);
+                        const wv = runProp(arena, &progs.width, &fields, view.zoom, sl, "line-width", &ctx, .{ .number = 1 }, &out.eval_errors);
                         const dash = dashArray(arena, resolveProp(sl, "line-dasharray"), &ctx, &out.eval_errors);
                         try line.layoutLine(arena, f.parts, tl.extent, tile_span, px_per_unit, .{
                             .width_px = @floatCast(asNum(wv, 1)),
@@ -1218,8 +1384,8 @@ test "real chart: Annapolis first light" {
     }
     const total: usize = 512 * 512;
     std.debug.print(
-        "\nannapolis first light: {d} tiles, {d} ranges, {d} quad verts, {d} patterns, {d} missing images, land {d}/{d} px, water {d}/{d} px\n",
-        .{ tiles.items.len, built.ranges.len, built.quads.len, built.patterns.len, built.missing_images.len, land, total, water, total },
+        "\nannapolis first light: {d} tiles, {d} ranges, {d} quad verts, {d} patterns, {d} missing images, {d} compiled props, land {d}/{d} px, water {d}/{d} px\n",
+        .{ tiles.items.len, built.ranges.len, built.quads.len, built.patterns.len, built.missing_images.len, built.compiled_props, land, total, water, total },
     );
     if (assets.sprite != null) {
         // Symbols drew, and the sounding digit runs surfaced through the
@@ -1261,6 +1427,74 @@ test "real chart: Annapolis first light" {
     };
     try std.testing.expect(water > total / 20); // >5% shallow-water blue
     try std.testing.expect(land > total / 50); // >2% land tan
+
+    // ---- the compiled tier is a SPEED choice, never a semantic one --------
+    // The style compiler must produce the same scene as the interpreter,
+    // down to the pixel. Build the same view both ways and compare the
+    // buffers, then the frame.
+    {
+        const interp_built = try buildScene(a, &style, tiles.items, .{
+            .zoom = z,
+            .origin = origin,
+            .compiled = false,
+        }, assets);
+        try std.testing.expectEqual(built.ranges.len, interp_built.ranges.len);
+        try std.testing.expectEqual(built.vertices.len, interp_built.vertices.len);
+        try std.testing.expectEqual(built.eval_errors, interp_built.eval_errors);
+        try std.testing.expectEqualSlices(
+            types.PaintVertex,
+            built.paint,
+            interp_built.paint,
+        );
+        try std.testing.expectEqualSlices(u32, built.indices, interp_built.indices);
+
+        try g.uploadScene(a, .{
+            .vertices = interp_built.vertices,
+            .paint = interp_built.paint,
+            .indices = interp_built.indices,
+            .quads = interp_built.quads,
+            .quad_paint = interp_built.quad_paint,
+            .ranges = interp_built.ranges,
+            .patterns = interp_built.patterns,
+        });
+        const interp_rgba = try g.renderOffscreen(a, u);
+        try std.testing.expectEqualSlices(u8, interp_rgba, rgba);
+
+        // And what it bought. DESIGN.md says not to start the MSL codegen
+        // tier until this one is measured, so measure it: same view, same
+        // tiles, layout only (no GPU), both ways.
+        const clock = @import("util/clock.zig");
+        const reps = 3;
+        var t0 = clock.wallMs();
+        for (0..reps) |_| {
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            _ = try buildScene(scratch.allocator(), &style, tiles.items, .{ .zoom = z, .origin = origin, .compiled = false }, assets);
+        }
+        const interp_ms = clock.wallMs() - t0;
+        t0 = clock.wallMs();
+        for (0..reps) |_| {
+            var scratch = std.heap.ArenaAllocator.init(gpa);
+            defer scratch.deinit();
+            _ = try buildScene(scratch.allocator(), &style, tiles.items, .{ .zoom = z, .origin = origin, .compiled = true }, assets);
+        }
+        const compiled_ms = clock.wallMs() - t0;
+        std.debug.print(
+            "  compiled tier: {d} ranges, frame identical to the interpreter's; layout {d} ms -> {d} ms over {d} builds\n",
+            .{ built.ranges.len, interp_ms, compiled_ms, reps },
+        );
+
+        // Put the compiled scene back for the rest of the test.
+        try g.uploadScene(a, .{
+            .vertices = built.vertices,
+            .paint = built.paint,
+            .indices = built.indices,
+            .quads = built.quads,
+            .quad_paint = built.quad_paint,
+            .ranges = built.ranges,
+            .patterns = built.patterns,
+        });
+    }
 
     // ---- the missing-image round trip ------------------------------------
     // What a host does with Built.missing_images: rasterize each name (the
