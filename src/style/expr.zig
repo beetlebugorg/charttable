@@ -74,6 +74,8 @@ pub const Op = enum {
     typeof,
     err, // ["error", ...]: compiles, always errors at evaluation
     collator, // minimal: an options object consumed by ==/!= (tier 2: full)
+    is_supported_script, // true unless the host reports a missing script
+    resolved_locale, // the collator's locale (en-US-family only for now)
 };
 
 pub const InterpKind = union(enum) {
@@ -97,6 +99,7 @@ pub const Expr = union(enum) {
     line_progress,
     properties, // the feature's full property object
     within: *const Expr, // GeoJSON area the feature must fall inside
+    number_format: NumberFormat,
     let_bind: Let,
     op: OpCall,
     match_op: Match,
@@ -117,6 +120,15 @@ pub const Expr = union(enum) {
         attempt: *const Expr,
         otherwise: *const Expr,
     },
+
+    /// ["number-format", n, {locale, currency, unit, min/max-fraction-digits}]
+    pub const NumberFormat = struct {
+        input: *const Expr,
+        currency: ?*const Expr = null,
+        unit: ?*const Expr = null,
+        min_frac: ?*const Expr = null,
+        max_frac: ?*const Expr = null,
+    };
 
     /// ["get", key] reads the feature; ["get", key, object] reads an object.
     pub const Prop = struct {
@@ -207,24 +219,25 @@ pub const Parsed = struct {
 pub const ParseError = error{ InvalidExpression, OutOfMemory };
 
 const op_names = std.StaticStringMap(Op).initComptime(.{
-    .{ "==", .eq },               .{ "!=", .neq },                .{ "<", .lt },
-    .{ "<=", .le },               .{ ">", .gt },                  .{ ">=", .ge },
-    .{ "!", .not },               .{ "all", .all },               .{ "any", .any },
-    .{ "in", .in },               .{ "concat", .concat },         .{ "length", .length },
-    .{ "at", .at },               .{ "slice", .slice },           .{ "index-of", .index_of },
-    .{ "upcase", .upcase },       .{ "downcase", .downcase },     .{ "split", .split },
-    .{ "join", .join },           .{ "+", .add },                 .{ "-", .sub },
-    .{ "*", .mul },               .{ "/", .div },                 .{ "%", .mod },
-    .{ "^", .pow },               .{ "sqrt", .sqrt },             .{ "abs", .abs },
-    .{ "round", .round },         .{ "floor", .floor },           .{ "ceil", .ceil },
-    .{ "min", .min },             .{ "max", .max },               .{ "ln", .ln },
-    .{ "log10", .log10 },         .{ "log2", .log2 },             .{ "sin", .sin },
-    .{ "cos", .cos },             .{ "tan", .tan },               .{ "asin", .asin },
-    .{ "acos", .acos },           .{ "atan", .atan },             .{ "e", .e_const },
-    .{ "pi", .pi_const },         .{ "ln2", .ln2_const },         .{ "to-string", .to_string },
-    .{ "to-number", .to_number }, .{ "to-boolean", .to_boolean }, .{ "to-color", .to_color },
-    .{ "to-rgba", .to_rgba },     .{ "rgba", .rgba },             .{ "rgb", .rgb },
-    .{ "typeof", .typeof },       .{ "error", .err },             .{ "collator", .collator },
+    .{ "==", .eq },                                   .{ "!=", .neq },                          .{ "<", .lt },
+    .{ "<=", .le },                                   .{ ">", .gt },                            .{ ">=", .ge },
+    .{ "!", .not },                                   .{ "all", .all },                         .{ "any", .any },
+    .{ "in", .in },                                   .{ "concat", .concat },                   .{ "length", .length },
+    .{ "at", .at },                                   .{ "slice", .slice },                     .{ "index-of", .index_of },
+    .{ "upcase", .upcase },                           .{ "downcase", .downcase },               .{ "split", .split },
+    .{ "join", .join },                               .{ "+", .add },                           .{ "-", .sub },
+    .{ "*", .mul },                                   .{ "/", .div },                           .{ "%", .mod },
+    .{ "^", .pow },                                   .{ "sqrt", .sqrt },                       .{ "abs", .abs },
+    .{ "round", .round },                             .{ "floor", .floor },                     .{ "ceil", .ceil },
+    .{ "min", .min },                                 .{ "max", .max },                         .{ "ln", .ln },
+    .{ "log10", .log10 },                             .{ "log2", .log2 },                       .{ "sin", .sin },
+    .{ "cos", .cos },                                 .{ "tan", .tan },                         .{ "asin", .asin },
+    .{ "acos", .acos },                               .{ "atan", .atan },                       .{ "e", .e_const },
+    .{ "pi", .pi_const },                             .{ "ln2", .ln2_const },                   .{ "to-string", .to_string },
+    .{ "to-number", .to_number },                     .{ "to-boolean", .to_boolean },           .{ "to-color", .to_color },
+    .{ "to-rgba", .to_rgba },                         .{ "rgba", .rgba },                       .{ "rgb", .rgb },
+    .{ "typeof", .typeof },                           .{ "error", .err },                       .{ "collator", .collator },
+    .{ "is-supported-script", .is_supported_script }, .{ "resolved-locale", .resolved_locale },
 });
 
 const Binding = struct {
@@ -337,6 +350,35 @@ const Parser = struct {
         if (std.mem.eql(u8, head, "properties")) {
             if (args.len != 0) return error.InvalidExpression;
             return .{ .e = try p.node(.properties), .deps = .{ .feature = true } };
+        }
+        if (std.mem.eql(u8, head, "number-format")) {
+            if (args.len != 2 or args[1] != .object) return error.InvalidExpression;
+            const input = try p.parseJson(args[0]);
+            var deps = input.deps;
+            var nf = Expr.NumberFormat{ .input = p.fold(input.e, input.deps) };
+            const opts = args[1].object;
+            if (opts.get("currency") != null and opts.get("unit") != null)
+                return error.InvalidExpression; // mutually exclusive
+            const fields = [_]struct { name: []const u8, slot: *?*const Expr }{
+                .{ .name = "currency", .slot = &nf.currency },
+                .{ .name = "unit", .slot = &nf.unit },
+                .{ .name = "min-fraction-digits", .slot = &nf.min_frac },
+                .{ .name = "max-fraction-digits", .slot = &nf.max_frac },
+            };
+            for (fields) |f| {
+                if (opts.get(f.name)) |j| {
+                    const r = try p.parseJson(j);
+                    deps = deps.merge(r.deps);
+                    f.slot.* = p.fold(r.e, r.deps);
+                }
+            }
+            // locale parses for deps but is otherwise en-US-only for now
+            if (opts.get("locale")) |j| {
+                const r = try p.parseJson(j);
+                deps = deps.merge(r.deps);
+            }
+            const e = try p.node(.{ .number_format = nf });
+            return .{ .e = p.fold(e, deps), .deps = deps };
         }
         if (std.mem.eql(u8, head, "within")) {
             if (args.len != 1) return error.InvalidExpression;
@@ -724,7 +766,7 @@ fn checkArity(op: Op, n: usize) ParseError!void {
         .rgba, .rgb => n != 4 and n != 3,
         .e_const, .pi_const, .ln2_const => n != 0,
         .err => false,
-        .collator => n != 1,
+        .collator, .is_supported_script, .resolved_locale => n != 1,
     };
     if (bad) return error.InvalidExpression;
 }

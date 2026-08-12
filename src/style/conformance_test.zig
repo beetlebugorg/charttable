@@ -25,10 +25,7 @@ const skip_ops = [_][]const u8{
     "distance",
     "format",
     "image",
-    "is-supported-script",
-    "number-format",
     "object",
-    "resolved-locale",
     "projection",
 };
 
@@ -46,7 +43,7 @@ const skip_ops = [_][]const u8{
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
 /// from the fixtures alone). Revisit with more fixture data points; the
 /// pixel difference is below visibility.
-const PASS_FLOOR: usize = 400;
+const PASS_FLOOR: usize = 407;
 
 const Score = struct {
     total: usize = 0,

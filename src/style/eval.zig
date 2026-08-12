@@ -128,6 +128,38 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
             const f = ctx.feature.props_fn orelse return error.Eval;
             return f(ctx.feature.ptr);
         },
+        .number_format => |nf| {
+            const n = switch (try eval(a, nf.input, ctx)) {
+                .number => |x| x,
+                else => return error.Eval,
+            };
+            var min_frac: usize = 0;
+            var max_frac: usize = 3;
+            var prefix: []const u8 = "";
+            var suffix: []const u8 = "";
+            if (nf.currency) |ce| {
+                const code = switch (try eval(a, ce, ctx)) {
+                    .string => |s| s,
+                    else => return error.Eval,
+                };
+                const cur = currencyOf(code) orelse return error.Eval;
+                prefix = cur.symbol;
+                min_frac = cur.digits;
+                max_frac = cur.digits;
+            } else if (nf.unit) |ue| {
+                const name = switch (try eval(a, ue, ctx)) {
+                    .string => |s| s,
+                    else => return error.Eval,
+                };
+                suffix = unitOf(name) orelse return error.Eval;
+            }
+            if (nf.min_frac) |me| min_frac = fracDigits(try eval(a, me, ctx)) orelse min_frac;
+            if (nf.max_frac) |me| max_frac = fracDigits(try eval(a, me, ctx)) orelse max_frac;
+            if (max_frac < min_frac) max_frac = min_frac;
+            const body = try formatDecimal(a, n, min_frac, max_frac);
+            if (prefix.len == 0 and suffix.len == 0) return .{ .string = body };
+            return .{ .string = try std.mem.concat(a, u8, &.{ prefix, body, suffix }) };
+        },
         .within => |arg| {
             const v = try eval(a, arg, ctx);
             var polys: std.ArrayList(geojson.Polygon) = .empty;
@@ -224,6 +256,102 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
             };
         },
     }
+}
+
+// ---- number-format (en-US digits; a locale table can grow here) ------------
+
+const Currency = struct { symbol: []const u8, digits: usize };
+
+fn currencyOf(code: []const u8) ?Currency {
+    const table = [_]struct { code: []const u8, cur: Currency }{
+        .{ .code = "USD", .cur = .{ .symbol = "$", .digits = 2 } },
+        .{ .code = "EUR", .cur = .{ .symbol = "€", .digits = 2 } },
+        .{ .code = "JPY", .cur = .{ .symbol = "¥", .digits = 0 } },
+        .{ .code = "GBP", .cur = .{ .symbol = "£", .digits = 2 } },
+    };
+    for (table) |e| {
+        if (std.mem.eql(u8, e.code, code)) return e.cur;
+    }
+    return null;
+}
+
+fn unitOf(name: []const u8) ?[]const u8 {
+    const table = [_]struct { name: []const u8, suffix: []const u8 }{
+        .{ .name = "meter", .suffix = " m" },
+        .{ .name = "kilometer", .suffix = " km" },
+        .{ .name = "celsius", .suffix = "°C" },
+        .{ .name = "fahrenheit", .suffix = "°F" },
+        .{ .name = "kilobyte", .suffix = " kB" },
+        .{ .name = "megabyte", .suffix = " MB" },
+        .{ .name = "foot", .suffix = " ft" },
+        .{ .name = "mile", .suffix = " mi" },
+    };
+    for (table) |e| {
+        if (std.mem.eql(u8, e.name, name)) return e.suffix;
+    }
+    return null;
+}
+
+fn fracDigits(v: Value) ?usize {
+    return switch (v) {
+        .number => |n| if (n >= 0 and n <= 100) @intFromFloat(n) else null,
+        else => null,
+    };
+}
+
+/// en-US decimal formatting: shortest round-trip digits, rounded to
+/// max_frac, zero-padded to min_frac, integer part grouped by thousands.
+fn formatDecimal(a: std.mem.Allocator, n: f64, min_frac: usize, max_frac: usize) Error![]const u8 {
+    if (std.math.isNan(n) or std.math.isInf(n)) return error.Eval;
+    const shortest = try std.fmt.allocPrint(a, "{d}", .{@abs(n)});
+    const dot = std.mem.indexOfScalar(u8, shortest, '.');
+    var int_part = if (dot) |i| shortest[0..i] else shortest;
+    var frac: std.ArrayList(u8) = .empty;
+    if (dot) |i| try frac.appendSlice(a, shortest[i + 1 ..]);
+
+    if (frac.items.len > max_frac) {
+        // decimal-string rounding with carry into the integer part
+        const round_up = frac.items[max_frac] >= '5';
+        frac.shrinkRetainingCapacity(max_frac);
+        if (round_up) {
+            var i: usize = frac.items.len;
+            var carry = true;
+            while (carry and i > 0) {
+                i -= 1;
+                if (frac.items[i] == '9') {
+                    frac.items[i] = '0';
+                } else {
+                    frac.items[i] += 1;
+                    carry = false;
+                }
+            }
+            if (carry) {
+                // 0.99 -> 1.00: bump the integer part
+                const int_v = std.fmt.parseInt(u64, int_part, 10) catch return error.Eval;
+                int_part = try std.fmt.allocPrint(a, "{d}", .{int_v + 1});
+            }
+        }
+    }
+    while (frac.items.len > min_frac and frac.items.len > 0 and frac.items[frac.items.len - 1] == '0') {
+        frac.shrinkRetainingCapacity(frac.items.len - 1);
+    }
+    while (frac.items.len < min_frac) try frac.append(a, '0');
+
+    var out: std.ArrayList(u8) = .empty;
+    if (n < 0) try out.append(a, '-');
+    const lead = int_part.len % 3;
+    if (lead != 0) try out.appendSlice(a, int_part[0..lead]);
+    var i: usize = lead;
+    while (i < int_part.len) : (i += 3) {
+        if (i != 0) try out.append(a, ',');
+        try out.appendSlice(a, int_part[i .. i + 3]);
+    }
+    if (int_part.len == 0) try out.append(a, '0');
+    if (frac.items.len > 0) {
+        try out.append(a, '.');
+        try out.appendSlice(a, frac.items);
+    }
+    return out.items;
 }
 
 fn arrayMatches(v: Value, item: anytype, len: ?usize) bool {
@@ -325,6 +453,21 @@ fn evalOp(a: std.mem.Allocator, call: Expr.OpCall, ctx: *Context) Error!Value {
 
         .err => return error.Eval,
         .collator => return vs[0], // the options object, consumed by ==/!=
+        // Text shaping is glyph-range based here; every script the glyph
+        // pipeline carries is "supported". Hosts with a stricter shaper can
+        // gate this later.
+        .is_supported_script => return Value.true_,
+        .resolved_locale => {
+            const entries = switch (vs[0]) {
+                .object => |entries| entries,
+                else => return error.Eval,
+            };
+            for (entries) |entry| {
+                if (std.mem.eql(u8, entry.key, "locale") and entry.value == .string)
+                    return entry.value;
+            }
+            return .{ .string = "en" };
+        },
         .eq, .neq => {
             var equal: bool = undefined;
             if (vs.len == 3 and vs[0] == .string and vs[1] == .string) {
