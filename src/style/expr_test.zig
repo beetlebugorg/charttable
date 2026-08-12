@@ -168,8 +168,10 @@ test "colors: to-color, rgba, to-rgba round trip" {
         \\["at", 3, ["to-rgba", ["rgba", 255, 0, 255, 0.5]]]
     , &empty_ctx);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), rt.number, 1e-6);
-    // invalid color string errors (falls to the property default upstream)
-    try std.testing.expectError(error.Eval, run(a, "[\"to-color\", \"nope\"]", &empty_ctx));
+    // a CONSTANT invalid color string is a compile error (the reference
+    // folds the coercion at parse); a feature-driven one errors at eval
+    try std.testing.expectError(error.InvalidExpression, exprs.parseText(a, "[\"to-color\", \"nope\"]"));
+    try std.testing.expectError(error.Eval, run(a, "[\"to-color\", [\"get\", \"missing\"]]", &empty_ctx));
     // ...unless a fallback argument saves it
     const fb = try run(a, "[\"to-color\", \"nope\", \"#000\"]", &empty_ctx);
     try std.testing.expect(fb == .color);
@@ -224,9 +226,9 @@ test "filters: errors are false, not poison" {
 
 test "all/any short-circuit and empty identities" {
     var ctx = eval_mod.Context{};
-    // the second clause would error; all must not reach it
-    try expectBool("[\"all\", false, [\"<\", \"x\", 1]]", &ctx, false);
-    try expectBool("[\"any\", true, [\"<\", \"x\", 1]]", &ctx, true);
+    // the second clause would error at eval; all/any must not reach it
+    try expectBool("[\"all\", false, [\"<\", [\"get\", \"x\"], 1]]", &ctx, false);
+    try expectBool("[\"any\", true, [\"<\", [\"get\", \"x\"], 1]]", &ctx, true);
     try expectBool("[\"all\"]", &ctx, true);
     try expectBool("[\"any\"]", &ctx, false);
 }
@@ -247,4 +249,156 @@ test "geometry-type" {
     const f = TestFeature{ .keys = &.{}, .values = &.{} };
     var ctx = eval_mod.Context{ .feature = f.ref(.polygon) };
     try expectStr("[\"geometry-type\"]", &ctx, "Polygon");
+}
+
+// ---- static typechecker ----------------------------------------------------
+
+fn expectRejects(src: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.InvalidExpression, exprs.parseText(arena.allocator(), src));
+}
+
+fn expectType(src: []const u8, want: exprs.Type) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parsed = try exprs.parseText(arena.allocator(), src);
+    try std.testing.expectEqual(want, parsed.ty);
+}
+
+test "typecheck: comparisons need one comparable shared type" {
+    // provable string-vs-number mismatch (both sides concretely typed)
+    try expectRejects("[\"==\", [\"string\", [\"get\", \"x\"]], [\"number\", [\"get\", \"y\"]]]");
+    try expectRejects("[\"<\", \"x\", 1]");
+    // equality exists for null; ordering does not for null/boolean
+    try expectRejects("[\"<\", null, null]");
+    try expectRejects("[\">\", true, false]");
+    // colors, arrays, objects don't equate
+    try expectRejects("[\"==\", [\"get\", \"x\"], [\"to-color\", \"red\"]]");
+    try expectRejects("[\"==\", [\"get\", \"x\"], [\"literal\", [1]]]");
+    // one unknown side is fine — checked at eval
+    try expectType("[\"==\", 1, [\"get\", \"x\"]]", .boolean);
+    // a collator comparison is string-typed
+    try expectRejects("[\"==\", 1, 2, [\"collator\", {}]]");
+}
+
+test "typecheck: typed operators reject provably wrong arguments" {
+    try expectRejects("[\"upcase\", 1]");
+    try expectRejects("[\"length\", 0]");
+    try expectRejects("[\"slice\", true, 0]");
+    try expectRejects("[\"join\", \"1+2+3\", \"+\"]");
+    try expectRejects("[\"join\", [\"literal\", [1, 2]], \"+\"]"); // array<number>, not array<string>
+    try expectRejects("[\"image\", 123]");
+    try expectRejects("[\"in\", [\"literal\", [\"a\"]], [\"literal\", [[\"a\"]]]]"); // array needle
+    try expectRejects("[\"!\", [\"case\", true, \"a\", \"b\"]]");
+    // unknowns pass and defer to eval
+    try expectType("[\"upcase\", [\"get\", \"name\"]]", .string);
+    try expectType("[\"length\", [\"get\", \"xs\"]]", .number);
+}
+
+test "typecheck: match labels are uniform, unique, integral" {
+    try expectRejects("[\"match\", [\"get\", \"x\"], \"a\", 1, 0, 2, 3]"); // mixed label types
+    try expectRejects("[\"match\", 1, 1.5, \"a\", \"b\"]"); // non-integer label
+    try expectRejects("[\"match\", 0, 10000000000000000, \"a\", \"b\"]"); // beyond 2^53-1
+    try expectRejects("[\"match\", [\"string\", [\"get\", \"x\"]], \"0\", \"a\", \"0\", \"b\", \"c\"]"); // duplicate
+    try expectRejects("[\"match\", [\"string\", [\"get\", \"x\"]], 0, \"a\", \"b\"]"); // input/label mismatch
+    try expectRejects("[\"match\", [\"string\", [\"get\", \"x\"]], \"0\", \"a\", false]"); // outputs don't unify
+    try expectType("[\"match\", [\"get\", \"x\"], [\"a\", \"b\"], \"ab\", \"other\"]", .string);
+}
+
+test "typecheck: interpolate needs an interpolatable output" {
+    try expectRejects("[\"interpolate\", [\"linear\"], [\"zoom\"], 0, false, 1, true]");
+    try expectRejects("[\"interpolate\", [\"linear\"], [\"zoom\"], 0, null, 1, null]");
+    try expectRejects( // array<string, 1> does not interpolate
+        \\["interpolate", ["exponential", 2], ["number", ["get", "x"]], 1, ["literal", ["a"]], 3, ["literal", ["b"]]]
+    );
+    try expectRejects( // unknown-length number arrays don't either
+        \\["interpolate", ["linear"], ["zoom"], 0, ["array", "number", ["get", "a"]], 1, ["array", "number", ["get", "b"]]]
+    );
+    // interpolate-hcl outputs are colors: a non-color constant fails to fold
+    try expectRejects("[\"interpolate-hcl\", [\"linear\"], [\"zoom\"], 0, \"reddish\", 1, \"blue\"]");
+    try expectRejects("[\"interpolate-hcl\", [\"linear\"], [\"zoom\"], 0, 100, 1, 200]");
+    // bare strings stay legal WITHOUT a pinned property type: real styles
+    // interpolate color names and rely on the property coercion
+    try expectType("[\"interpolate\", [\"linear\"], [\"zoom\"], 0, \"#000\", 1, \"#fff\"]", .string);
+    // cubic-bezier takes exactly four control coordinates in [0,1]
+    try expectRejects("[\"interpolate\", [\"cubic-bezier\", 0, 0, 1, 1, 1], [\"zoom\"], 0, 0, 1, 1]");
+    try expectRejects("[\"interpolate\", [\"cubic-bezier\", 0, 1.75, 1, 1], [\"zoom\"], 0, 0, 1, 1]");
+}
+
+test "typecheck: array assertion syntax is strict" {
+    try expectRejects("[\"array\", 0, [\"literal\", []]]"); // item type must be a name
+    try expectRejects("[\"array\", \"value\", [\"literal\", []]]"); // ...one of number/string/boolean
+    try expectRejects("[\"array\", \"string\", 0.5, [\"literal\", []]]"); // length must be integral
+    try expectRejects("[\"array\", \"string\", [\"literal\", 0], [\"literal\", []]]"); // ...and literal
+    try expectType("[\"array\", \"number\", 2, [\"get\", \"x\"]]", exprs.Type.arrayOf(.number, 2));
+    try expectType("[\"array\", \"number\", null, [\"get\", \"x\"], [\"literal\", [0]]]", exprs.Type.arrayOf(.number, null));
+}
+
+test "typecheck: constant subtrees that fail to evaluate are compile errors" {
+    // a missing key in a LITERAL object folds to null; asserting it fails
+    try expectRejects("[\"number\", [\"get\", \"x\", [\"literal\", {\"y\": 0}]]]");
+    // ...but a barrier (["error"], vars) keeps the failure at runtime
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try exprs.parseText(arena.allocator(), "[\"any\", false, [\"error\"]]");
+    var ctx = eval_mod.Context{};
+    try std.testing.expectError(error.Eval, eval_mod.eval(arena.allocator(), p.root, &ctx));
+}
+
+test "typecheck: let names, within literals" {
+    try expectRejects("[\"let\", \"$a\", 1, [\"var\", \"$a\"]]");
+    try expectRejects("[\"within\", [\"get\", \"geojson\"]]"); // must be a bare GeoJSON object
+}
+
+test "typecheck: var carries its binding's type" {
+    try expectRejects("[\"let\", \"a\", \"str\", [\"+\", [\"var\", \"a\"], 1]]");
+    try expectType("[\"let\", \"a\", [\"get\", \"x\"], [\"+\", [\"var\", \"a\"], 1]]", .number);
+}
+
+test "parseWithType: property expectations flow into the expression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = (try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\["step", ["get", "x"], "black", 0, "invalid", 10, "blue"]
+    , .{}));
+    // under a color property, the constant string outputs must BE colors
+    try std.testing.expectError(error.InvalidExpression, exprs.parseWithType(a, doc, .color));
+    // with no pinned type the strings pass (the property layer coerces later)
+    _ = try exprs.parseWithType(a, doc, null);
+
+    const co = (try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\["coalesce", ["get", "a"], 5]
+    , .{}));
+    try std.testing.expectError(error.InvalidExpression, exprs.parseWithType(a, co, .string));
+    const okc = try exprs.parseWithType(a, co, .number);
+    try std.testing.expectEqual(exprs.Type.number, okc.ty);
+}
+
+test "parseWithType: zoom feeds one top-level curve only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bad = [_][]const u8{
+        "[\"+\", [\"zoom\"], 0]",
+        "[\"+\", 0.5, [\"interpolate\", [\"linear\"], [\"zoom\"], 0, 0, 1, 1]]",
+        "[\"let\", \"x\", [\"interpolate\", [\"linear\"], [\"zoom\"], 0, 0, 1, 1], [\"+\", 0.5, [\"get\", \"x\"]]]",
+        "[\"coalesce\", [\"interpolate\", [\"linear\"], [\"zoom\"], 0, 0, 1, 1], [\"interpolate\", [\"linear\"], [\"zoom\"], 0, 0, 1, 1]]",
+    };
+    for (bad) |src| {
+        const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, src, .{});
+        try std.testing.expectError(error.InvalidExpression, exprs.parseWithType(a, doc, null));
+    }
+    const good = [_][]const u8{
+        "[\"interpolate\", [\"linear\"], [\"zoom\"], 0, 0, 30, 30]",
+        "[\"coalesce\", [\"interpolate\", [\"linear\"], [\"zoom\"], 0, 0, 30, 30]]",
+        "[\"let\", \"x\", 1, [\"step\", [\"zoom\"], 0, 10, [\"var\", \"x\"]]]",
+    };
+    for (good) |src| {
+        const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, src, .{});
+        _ = try exprs.parseWithType(a, doc, null);
+    }
+    // plain parse (the style.zig path) keeps accepting bare zoom in filters
+    _ = try exprs.parseText(a, "[\"<=\", [\"coalesce\", [\"get\", \"vz\"], 0], [\"zoom\"]]");
 }

@@ -28,7 +28,10 @@ const skip_ops = [_][]const u8{};
 /// 352 (legacy property functions, Lab/HCL interpolation) -> 377 (global-
 /// state, feature-state, elevation, heatmap-density, properties) -> 400
 /// (within, tessellation-era libm rounding) -> 485 (three-level collation,
-/// distance with tile-grid quantization).
+/// distance with tile-grid quantization) -> 575 (static typechecker: all
+/// 85 lenient-compile fixtures now reject at parse — typed operator
+/// signatures, comparison/match/branch unification, interpolatability,
+/// property-type expectations, zoom-curve placement, fatal constant folds).
 ///
 /// Known-fail (2): interpolate-{hcl,lab}/linear-color — the reference
 /// applies a gamut-mapping step to out-of-gamut interpolation results that
@@ -36,7 +39,7 @@ const skip_ops = [_][]const u8{};
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
 /// from the fixtures alone). Revisit with more fixture data points; the
 /// pixel difference is below visibility.
-const PASS_FLOOR: usize = 490;
+const PASS_FLOOR: usize = 575;
 
 const Score = struct {
     total: usize = 0,
@@ -46,7 +49,41 @@ const Score = struct {
     fail_parse: usize = 0, // they compile; we don't
     fail_output: usize = 0,
     flag_mismatch: usize = 0, // constancy flags disagree (informational)
+    type_mismatch: usize = 0, // inferred type != compiled.type (informational)
 };
+
+/// The expected expression type a fixture's propertySpec pins, as the
+/// reference derives it before parsing (spec `type` plus `value`/`length`
+/// for arrays). Unknown spec types pin nothing.
+fn specExpectedType(spec: ?std.json.Value) ?exprs.Type {
+    const s = spec orelse return null;
+    if (s != .object) return null;
+    const t = s.object.get("type") orelse return null;
+    if (t != .string) return null;
+    var item: ?[]const u8 = null;
+    if (s.object.get("value")) |v| {
+        if (v == .string) item = v.string;
+    }
+    var len: ?usize = null;
+    if (s.object.get("length")) |l| {
+        if (l == .integer and l.integer >= 0) len = @intCast(l.integer);
+    }
+    return exprs.Type.fromSpecName(t.string, item, len);
+}
+
+/// The type the reference would report for the whole expression: the
+/// inferred type, except where the top-level assertion/coercion wrap the
+/// expected type injects takes over.
+fn displayedType(inferred: exprs.Type, expected: ?exprs.Type) exprs.Type {
+    const want = expected orelse return inferred;
+    if (inferred == .value or inferred == .err) return want;
+    if (std.meta.activeTag(want) != std.meta.activeTag(inferred) and want.accepts(inferred)) return want;
+    // an empty array literal is wrapped in the expected array assertion
+    if (inferred == .array and want == .array and
+        (inferred.array.len orelse 1) == 0 and inferred.array.item == .value and want.array.item != .value)
+        return want;
+    return inferred;
+}
 
 fn jsonToValue(a: std.mem.Allocator, j: std.json.Value) !Value {
     return switch (j) {
@@ -448,10 +485,11 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value, quantize
         std.mem.eql(u8, compiled.object.get("result").?.string, "success");
 
     const legacy = @import("legacy.zig");
+    const expected_ty = specExpectedType(doc.object.get("propertySpec"));
     const parsed = (if (expression == .object)
         legacy.convert(a, expression, doc.object.get("propertySpec"))
     else
-        exprs.parse(a, expression)) catch |e| switch (e) {
+        exprs.parseWithType(a, expression, expected_ty)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidExpression => {
             if (!compile_ok) {
@@ -468,6 +506,17 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value, quantize
         // in this case, so there is nothing further to check).
         score.lenient_compile += 1;
         return null;
+    }
+
+    // Inference oracle (informational): the fixture records the reference's
+    // inferred type; compare ours. Legacy conversions don't infer.
+    if (expression != .object) {
+        if (compiled.object.get("type")) |jt| {
+            if (jt == .string) {
+                const got = try displayedType(parsed.ty, expected_ty).toSpecString(a);
+                if (!std.mem.eql(u8, got, jt.string)) score.type_mismatch += 1;
+            }
+        }
     }
 
     // Constancy flags (informational: folding can make us MORE constant
@@ -643,9 +692,10 @@ test "spec expression conformance suite" {
 
     std.debug.print(
         "\nspec conformance: {d}/{d} pass ({d} skipped, {d} lenient-compile, " ++
-            "{d} parse-fail, {d} output-fail, {d} constancy-flag mismatches)\n" ++
+            "{d} parse-fail, {d} output-fail, {d} constancy-flag mismatches, " ++
+            "{d} type-inference mismatches)\n" ++
             "full failure list: {s}\n",
-        .{ score.pass, score.total, score.skipped, score.lenient_compile, score.fail_parse, score.fail_output, score.flag_mismatch, ct_build.report_path },
+        .{ score.pass, score.total, score.skipped, score.lenient_compile, score.fail_parse, score.fail_output, score.flag_mismatch, score.type_mismatch, ct_build.report_path },
     );
     // The detailed list goes to a file: hundreds of stderr lines from inside
     // a test upset the build runner's status stream, and a file diffs.
