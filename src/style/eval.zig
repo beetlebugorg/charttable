@@ -167,6 +167,12 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
             for (list, 0..) |sub, i| items[i] = try eval(a, sub, ctx);
             return .{ .array = items };
         },
+        .fallback_try => |f| {
+            return eval(a, f.attempt, ctx) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Eval => eval(a, f.otherwise, ctx),
+            };
+        },
     }
 }
 
@@ -600,15 +606,15 @@ fn cpToByte(s: []const u8, cp: usize) usize {
 fn evalInterpolate(a: std.mem.Allocator, ip: Expr.Interp, ctx: *Context) Error!Value {
     const x = (try eval(a, ip.input, ctx)).toNumber() catch return error.Eval;
     const stops = ip.stops;
-    if (x <= stops[0]) return eval(a, ip.outputs[0], ctx);
-    if (x >= stops[stops.len - 1]) return eval(a, ip.outputs[stops.len - 1], ctx);
+    if (x <= stops[0]) return coerceInterpOutput(a, try eval(a, ip.outputs[0], ctx), ip.space);
+    if (x >= stops[stops.len - 1]) return coerceInterpOutput(a, try eval(a, ip.outputs[stops.len - 1], ctx), ip.space);
     var hi: usize = 1;
     while (stops[hi] < x) hi += 1;
     const lo = hi - 1;
     const t = interpFactor(ip.kind, x, stops[lo], stops[hi]);
     const va = try eval(a, ip.outputs[lo], ctx);
     const vb = try eval(a, ip.outputs[hi], ctx);
-    return lerpValue(a, va, vb, t);
+    return lerpValueSpace(a, va, vb, t, ip.space);
 }
 
 fn interpFactor(kind: exprs.InterpKind, x: f64, x0: f64, x1: f64) f64 {
@@ -645,6 +651,153 @@ fn cubicBezierY(c: [4]f64, x: f64) f64 {
 fn bez(p1: f64, p2: f64, t: f64) f64 {
     const u = 1 - t;
     return 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t;
+}
+
+fn lerpValueSpace(a: std.mem.Allocator, va: Value, vb: Value, t: f64, space: Expr.ColorSpace) Error!Value {
+    if (space != .rgb) {
+        const ca: ?Color = switch (va) {
+            .color => |c| c,
+            .string => |s| colors.parse(s),
+            else => null,
+        };
+        const cb: ?Color = switch (vb) {
+            .color => |c| c,
+            .string => |s| colors.parse(s),
+            else => null,
+        };
+        if (ca != null and cb != null) {
+            return .{ .color = lerpColorSpace(ca.?, cb.?, @floatCast(t), space) };
+        }
+        // arrays of colors lerp elementwise in the same space
+        if (va == .array and vb == .array and va.array.len == vb.array.len) {
+            const out = try a.alloc(Value, va.array.len);
+            for (va.array, vb.array, 0..) |ia, ib, i| out[i] = try lerpValueSpace(a, ia, ib, t, space);
+            return .{ .array = out };
+        }
+    }
+    return lerpValue(a, va, vb, t);
+}
+
+/// interpolate-hcl / interpolate-lab always yield colors: a clamped
+/// endpoint's string (or array-of-string) stop coerces before returning.
+fn coerceInterpOutput(a: std.mem.Allocator, v: Value, space: Expr.ColorSpace) Error!Value {
+    if (space == .rgb) return v;
+    switch (v) {
+        .string => |s| {
+            if (colors.parse(s)) |c| return .{ .color = c };
+            return error.Eval;
+        },
+        .array => |items| {
+            var any_string = false;
+            for (items) |it| {
+                if (it == .string) any_string = true;
+            }
+            if (!any_string) return v;
+            const out = try a.alloc(Value, items.len);
+            for (items, 0..) |it, i| out[i] = try coerceInterpOutput(a, it, space);
+            return .{ .array = out };
+        },
+        else => return v,
+    }
+}
+
+// ---- CIE Lab / HCL interpolation (D65, standard colorimetry formulas) ----
+
+const Lab = struct { l: f64, a: f64, b: f64, alpha: f64 };
+
+fn srgbToLinear(c: f64) f64 {
+    return if (c <= 0.04045) c / 12.92 else std.math.pow(f64, (c + 0.055) / 1.055, 2.4);
+}
+
+fn linearToSrgb(c: f64) f64 {
+    const v = if (c <= 0.0031308) 12.92 * c else 1.055 * std.math.pow(f64, c, 1.0 / 2.4) - 0.055;
+    return std.math.clamp(v, 0, 1);
+}
+
+const XN = 0.950470;
+const ZN = 1.088830;
+const T1 = 6.0 / 29.0;
+const T2 = T1 * T1;
+const T3 = T1 * T1 * T1;
+
+fn labF(t: f64) f64 {
+    return if (t > T3) std.math.cbrt(t) else t / (3 * T2) + 4.0 / 29.0;
+}
+
+fn labFInv(t: f64) f64 {
+    return if (t > T1) t * t * t else 3 * T2 * (t - 4.0 / 29.0);
+}
+
+fn colorToLab(c: Color) Lab {
+    const r = srgbToLinear(c.r);
+    const g = srgbToLinear(c.g);
+    const b = srgbToLinear(c.b);
+    const x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+    const y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+    const z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
+    const fx = labF(x / XN);
+    const fy = labF(y);
+    const fz = labF(z / ZN);
+    return .{
+        .l = 116 * fy - 16,
+        .a = 500 * (fx - fy),
+        .b = 200 * (fy - fz),
+        .alpha = c.a,
+    };
+}
+
+fn labToColor(lab: Lab) Color {
+    const fy = (lab.l + 16) / 116;
+    const fx = fy + lab.a / 500;
+    const fz = fy - lab.b / 200;
+    const x = XN * labFInv(fx);
+    const y = labFInv(fy);
+    const z = ZN * labFInv(fz);
+    const r = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+    const g = -0.9692660 * x + 1.8760108 * y + 0.0415560 * z;
+    const b = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    return .{
+        .r = @floatCast(linearToSrgb(r)),
+        .g = @floatCast(linearToSrgb(g)),
+        .b = @floatCast(linearToSrgb(b)),
+        .a = @floatCast(std.math.clamp(lab.alpha, 0, 1)),
+    };
+}
+
+fn lerpColorSpace(ca: Color, cb: Color, t: f64, space: Expr.ColorSpace) Color {
+    const la = colorToLab(ca);
+    const lb = colorToLab(cb);
+    switch (space) {
+        .rgb => unreachable,
+        .lab => return labToColor(.{
+            .l = la.l + (lb.l - la.l) * t,
+            .a = la.a + (lb.a - la.a) * t,
+            .b = la.b + (lb.b - la.b) * t,
+            .alpha = la.alpha + (lb.alpha - la.alpha) * t,
+        }),
+        .hcl => {
+            // LCH(ab): hue takes the shortest path; an achromatic endpoint
+            // adopts the other's hue.
+            const chroma_a = std.math.hypot(la.a, la.b);
+            const chroma_b = std.math.hypot(lb.a, lb.b);
+            var hue_a = std.math.atan2(la.b, la.a);
+            var hue_b = std.math.atan2(lb.b, lb.a);
+            if (chroma_a < 1e-7) hue_a = hue_b;
+            if (chroma_b < 1e-7) hue_b = hue_a;
+            var dh = hue_b - hue_a;
+            if (dh > std.math.pi) dh -= 2 * std.math.pi;
+            if (dh < -std.math.pi) dh += 2 * std.math.pi;
+            const hue = hue_a + dh * t;
+            const chroma = chroma_a + (chroma_b - chroma_a) * t;
+            const l = la.l + (lb.l - la.l) * t;
+            return labToColor(.{
+                .l = l,
+                .a = chroma * std.math.cos(hue),
+                .b = chroma * std.math.sin(hue),
+                .alpha = la.alpha + (lb.alpha - la.alpha) * t,
+            });
+        },
+    }
 }
 
 fn lerpValue(a: std.mem.Allocator, va: Value, vb: Value, t: f64) Error!Value {
@@ -684,5 +837,6 @@ fn lerpValue(a: std.mem.Allocator, va: Value, vb: Value, t: f64) Error!Value {
 
 test {
     _ = @import("expr_test.zig");
+    _ = @import("legacy.zig");
     _ = @import("conformance_test.zig");
 }

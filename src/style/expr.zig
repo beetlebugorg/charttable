@@ -103,6 +103,13 @@ pub const Expr = union(enum) {
     /// expressions, evaluated into an array (a primitive template folds to
     /// a literal at parse).
     array_of: []const *const Expr,
+    /// Internal only (no JSON syntax): evaluate `attempt`; on ANY
+    /// evaluation error, evaluate `otherwise`. The legacy property-function
+    /// converter uses this for `default` values.
+    fallback_try: struct {
+        attempt: *const Expr,
+        otherwise: *const Expr,
+    },
 
     /// ["get", key] reads the feature; ["get", key, object] reads an object.
     pub const Prop = struct {
@@ -136,7 +143,11 @@ pub const Expr = union(enum) {
         input: *const Expr,
         stops: []const f64, // ascending literal inputs
         outputs: []const *const Expr,
+        /// Color interpolation space (interpolate-lab / interpolate-hcl /
+        /// legacy colorSpace).
+        space: ColorSpace = .rgb,
     };
+    pub const ColorSpace = enum { rgb, lab, hcl };
     pub const Step = struct {
         input: *const Expr,
         thresholds: []const f64, // ascending; outputs.len == thresholds.len + 1
@@ -319,7 +330,9 @@ const Parser = struct {
         if (std.mem.eql(u8, head, "match")) return p.parseMatch(args);
         if (std.mem.eql(u8, head, "case")) return p.parseCase(args);
         if (std.mem.eql(u8, head, "coalesce")) return p.parseCoalesce(args);
-        if (std.mem.eql(u8, head, "interpolate")) return p.parseInterpolate(args);
+        if (std.mem.eql(u8, head, "interpolate")) return p.parseInterpolate(args, .rgb);
+        if (std.mem.eql(u8, head, "interpolate-lab")) return p.parseInterpolate(args, .lab);
+        if (std.mem.eql(u8, head, "interpolate-hcl")) return p.parseInterpolate(args, .hcl);
         if (std.mem.eql(u8, head, "step")) return p.parseStep(args);
 
         const op = op_names.get(head) orelse return error.InvalidExpression;
@@ -518,7 +531,7 @@ const Parser = struct {
         return .{ .e = p.fold(e, deps), .deps = deps };
     }
 
-    fn parseInterpolate(p: *Parser, args: []const std.json.Value) ParseError!Res {
+    fn parseInterpolate(p: *Parser, args: []const std.json.Value, space: Expr.ColorSpace) ParseError!Res {
         // ["interpolate", kind, input, stop1, out1, stop2, out2, ...]
         if (args.len < 4 or args.len % 2 != 0) return error.InvalidExpression;
         const kind = try parseInterpKind(args[0]);
@@ -543,6 +556,7 @@ const Parser = struct {
             .input = p.fold(input.e, input.deps),
             .stops = stops,
             .outputs = outs,
+            .space = space,
         } });
         return .{ .e = p.fold(e, deps), .deps = deps };
     }

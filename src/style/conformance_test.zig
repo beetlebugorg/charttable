@@ -20,7 +20,6 @@ const Value = exprs.Value;
 /// Spec features not yet implemented: fixtures under these directories are
 /// counted as skipped. Shrink this list; never grow it silently.
 const skip_ops = [_][]const u8{
-    "legacy", // pre-expression property functions: separate feature, next pass
     "interpolate/global-state",
     "interpolate/projection",
     "collator",
@@ -31,8 +30,6 @@ const skip_ops = [_][]const u8{
     "global-state",
     "heatmap-density",
     "image",
-    "interpolate-hcl",
-    "interpolate-lab",
     "is-supported-script",
     "line-progress",
     "number-format",
@@ -46,8 +43,16 @@ const skip_ops = [_][]const u8{
 /// The ratchet: the harness fails if fewer fixtures fully pass. Raise this
 /// every time the number goes up; never lower it.
 /// History: 229 (first contact, 2026-08-12) → 291 (assertions, split/join,
-/// semiliteral, objects, collator-eq, strict booleans, coalesce errors).
-const PASS_FLOOR: usize = 291;
+/// semiliteral, objects, collator-eq, strict booleans, coalesce errors) →
+/// 352 (legacy property functions, Lab/HCL interpolation).
+///
+/// Known-fail (2): interpolate-{hcl,lab}/linear-color — the reference
+/// applies a gamut-mapping step to out-of-gamut interpolation results that
+/// plain channel clipping does not reproduce (confirmed: chroma reduction
+/// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
+/// from the fixtures alone). Revisit with more fixture data points; the
+/// pixel difference is below visibility.
+const PASS_FLOOR: usize = 352;
 
 const Score = struct {
     total: usize = 0,
@@ -228,10 +233,16 @@ fn evalWithSpec(
     } else if (std.mem.eql(u8, type_name, "colorArray")) {
         const colors = @import("color.zig");
         switch (v) {
-            .color => {},
+            .color => {
+                const out = try a.alloc(Value, 1);
+                out[0] = v;
+                return .{ .array = out };
+            },
             .string => |str| {
                 const c = colors.parse(str) orelse return error.Eval;
-                return .{ .color = c };
+                const out = try a.alloc(Value, 1);
+                out[0] = .{ .color = c };
+                return .{ .array = out };
             },
             .array => |items| {
                 const out = try a.alloc(Value, items.len);
@@ -248,12 +259,42 @@ fn evalWithSpec(
         }
     } else if (std.mem.eql(u8, type_name, "numberArray")) {
         switch (v) {
-            .number => {},
+            .number => {
+                const out = try a.alloc(Value, 1);
+                out[0] = v;
+                return .{ .array = out };
+            },
             .array => |items| for (items) |it| {
                 if (it != .number) return error.Eval;
             },
             else => return error.Eval,
         }
+    } else if (std.mem.eql(u8, type_name, "padding")) {
+        // CSS shorthand: [t] [t,r] [t,r,b] [t,r,b,l] -> [t,r,b,l]
+        var p4: [4]f64 = undefined;
+        switch (v) {
+            .number => |n| p4 = .{ n, n, n, n },
+            .array => |items| {
+                if (items.len < 1 or items.len > 4) return error.Eval;
+                var nums: [4]f64 = undefined;
+                for (items, 0..) |it, i| {
+                    nums[i] = switch (it) {
+                        .number => |n| n,
+                        else => return error.Eval,
+                    };
+                }
+                p4 = switch (items.len) {
+                    1 => .{ nums[0], nums[0], nums[0], nums[0] },
+                    2 => .{ nums[0], nums[1], nums[0], nums[1] },
+                    3 => .{ nums[0], nums[1], nums[2], nums[1] },
+                    else => nums,
+                };
+            },
+            else => return error.Eval,
+        }
+        const out = try a.alloc(Value, 4);
+        for (p4, 0..) |n, i| out[i] = .{ .number = n };
+        return .{ .array = out };
     } else if (std.mem.eql(u8, type_name, "array")) {
         const items = switch (v) {
             .array => |items| items,
@@ -278,16 +319,10 @@ fn evalWithSpec(
             }
         }
     } else if (std.mem.eql(u8, type_name, "enum")) {
+        // Enum membership is a VALIDATION-time check; at runtime the
+        // reference only asserts string-ness (legacy identity/enum passes
+        // values outside the enum through).
         if (v != .string) return error.Eval;
-        if (s.object.get("values")) |jvals| {
-            if (jvals == .object and jvals.object.get(v.string) == null) return error.Eval;
-            if (jvals == .array) {
-                for (jvals.array.items) |item| {
-                    if (item == .string and std.mem.eql(u8, item.string, v.string)) return v;
-                }
-                return error.Eval;
-            }
-        }
     }
     return v;
 }
@@ -304,7 +339,11 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
         compiled.object.get("result").? == .string and
         std.mem.eql(u8, compiled.object.get("result").?.string, "success");
 
-    const parsed = exprs.parse(a, expression) catch |e| switch (e) {
+    const legacy = @import("legacy.zig");
+    const parsed = (if (expression == .object)
+        legacy.convert(a, expression, doc.object.get("propertySpec"))
+    else
+        exprs.parse(a, expression)) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidExpression => {
             if (!compile_ok) {
