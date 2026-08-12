@@ -2,3 +2,4 @@ zig-out/
 .zig-cache/
 zig-cache/
 test/spec/conformance-failures.txt
+specs/
