@@ -251,6 +251,11 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
             };
             return .{ .boolean = result };
         },
+        .distance => |geoms| {
+            const geom = ctx.feature.geometry orelse return error.Eval;
+            const d = geojson.distance(geom, geoms.*) orelse return error.Eval;
+            return .{ .number = d };
+        },
         .var_ref => |i| {
             if (i >= ctx.bindings.items.len) return error.Eval;
             return ctx.bindings.items[i];
@@ -551,7 +556,29 @@ fn evalOp(a: std.mem.Allocator, call: Expr.OpCall, ctx: *Context) Error!Value {
         .all, .any, .to_number, .to_color => unreachable,
 
         .err => return error.Eval,
-        .collator => return vs[0], // the options object, consumed by ==/!=
+        .collator => {
+            // args normalized by the parser: [case-sensitive,
+            // diacritic-sensitive, locale]. The value is an options object
+            // consumed by the comparison operators and resolved-locale.
+            const cs = switch (vs[0]) {
+                .boolean => |b| b,
+                else => return error.Eval,
+            };
+            const ds = switch (vs[1]) {
+                .boolean => |b| b,
+                else => return error.Eval,
+            };
+            const locale: ?[]const u8 = switch (vs[2]) {
+                .string => |s| s,
+                .null => null,
+                else => return error.Eval,
+            };
+            const entries = try a.alloc(Value.Entry, if (locale != null) 3 else 2);
+            entries[0] = .{ .key = "case-sensitive", .value = .{ .boolean = cs } };
+            entries[1] = .{ .key = "diacritic-sensitive", .value = .{ .boolean = ds } };
+            if (locale) |loc| entries[2] = .{ .key = "locale", .value = .{ .string = loc } };
+            return .{ .object = entries };
+        },
         // Text shaping is glyph-range based here; every script the glyph
         // pipeline carries is "supported". Hosts with a stricter shaper can
         // gate this later.
@@ -570,26 +597,21 @@ fn evalOp(a: std.mem.Allocator, call: Expr.OpCall, ctx: *Context) Error!Value {
         .eq, .neq => {
             var equal: bool = undefined;
             if (vs.len == 3 and vs[0] == .string and vs[1] == .string) {
-                // collator compare (minimal: ASCII case folding)
-                var case_sensitive = true;
-                if (vs[2] == .object) {
-                    for (vs[2].object) |entry| {
-                        if (std.mem.eql(u8, entry.key, "case-sensitive") and entry.value == .boolean)
-                            case_sensitive = entry.value.boolean;
-                    }
-                }
-                equal = if (case_sensitive)
-                    std.mem.eql(u8, vs[0].string, vs[1].string)
-                else
-                    std.ascii.eqlIgnoreCase(vs[0].string, vs[1].string);
+                const flags = collatorFlagsOf(vs[2]) orelse return error.Eval;
+                equal = (try collate(a, vs[0].string, vs[1].string, flags)) == .eq;
             } else {
+                // With a collator, NON-string operands still compare by
+                // plain equality (fixture: equal/collator-value).
                 equal = vs[0].eql(vs[1]);
             }
             return .{ .boolean = if (op == .eq) equal else !equal };
         },
         .lt, .le, .gt, .ge => {
             if (vs[0] == .string and vs[1] == .string) {
-                const o = std.mem.order(u8, vs[0].string, vs[1].string);
+                const o = if (vs.len == 3) blk: {
+                    const flags = collatorFlagsOf(vs[2]) orelse return error.Eval;
+                    break :blk try collate(a, vs[0].string, vs[1].string, flags);
+                } else std.mem.order(u8, vs[0].string, vs[1].string);
                 return .{ .boolean = switch (op) {
                     .lt => o == .lt,
                     .le => o != .gt,
@@ -862,6 +884,270 @@ fn evalOp(a: std.mem.Allocator, call: Expr.OpCall, ctx: *Context) Error!Value {
             else => return .{ .string = vs[0].typeName() },
         },
     }
+}
+
+// ---- collation (["collator"] comparisons) ----------------------------------
+//
+// Three-level collation, semantics derived from the spec fixtures
+// (collator/*): primary is the base letter with diacritics folded,
+// secondary the diacritic (compared only when diacritic-sensitive),
+// tertiary the case with lowercase BEFORE uppercase (compared only when
+// case-sensitive). Locale data is a Latin-1 + Latin Extended-A fold
+// table, not ICU: German expands ä/ö/ü to ae/oe/ue (fixtures:
+// accent-equals-de, variable-gt), Swedish sorts å/ä/ö as distinct
+// letters after z (fixture: variable-gt), and any other or unknown
+// locale ("dk", ...) collates with the root fold, mirroring the
+// reference's fallback to its default locale.
+
+const CollLocale = enum { root, de, sv };
+
+const CollatorFlags = struct {
+    case_sensitive: bool = false,
+    diacritic_sensitive: bool = false,
+    locale: CollLocale = .root,
+};
+
+fn collatorFlagsOf(v: Value) ?CollatorFlags {
+    const entries = switch (v) {
+        .object => |entries| entries,
+        else => return null,
+    };
+    var flags = CollatorFlags{};
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.key, "case-sensitive")) {
+            if (entry.value == .boolean) flags.case_sensitive = entry.value.boolean;
+        } else if (std.mem.eql(u8, entry.key, "diacritic-sensitive")) {
+            if (entry.value == .boolean) flags.diacritic_sensitive = entry.value.boolean;
+        } else if (std.mem.eql(u8, entry.key, "locale")) {
+            if (entry.value == .string) flags.locale = collLocaleOf(entry.value.string);
+        }
+    }
+    return flags;
+}
+
+/// Locales with dedicated fold behaviour, keyed on the primary language
+/// subtag.
+fn collLocaleOf(s: []const u8) CollLocale {
+    const end = std.mem.indexOfScalar(u8, s, '-') orelse s.len;
+    const lang = s[0..end];
+    if (std.mem.eql(u8, lang, "de")) return .de;
+    if (std.mem.eql(u8, lang, "sv")) return .sv;
+    return .root;
+}
+
+/// Secondary weights. Relative order between distinct diacritics is not
+/// spec-determined; only none-versus-some and same-versus-same are.
+const Diac = enum(u8) {
+    none = 0,
+    grave,
+    acute,
+    circumflex,
+    tilde,
+    umlaut,
+    ring,
+    cedilla,
+    stroke,
+    macron,
+    breve,
+    ogonek,
+    dot_above,
+    caron,
+    double_acute,
+    ligature,
+    dotless,
+    middle_dot,
+    apostrophe,
+};
+
+const Fold = struct { base: []const u8, diac: Diac, upper: bool };
+
+/// Root fold for Latin-1 Supplement and Latin Extended-A letters.
+fn latinFold(cp: u21) ?Fold {
+    return switch (cp) {
+        0xC0, 0xE0 => .{ .base = "a", .diac = .grave, .upper = cp == 0xC0 },
+        0xC1, 0xE1 => .{ .base = "a", .diac = .acute, .upper = cp == 0xC1 },
+        0xC2, 0xE2 => .{ .base = "a", .diac = .circumflex, .upper = cp == 0xC2 },
+        0xC3, 0xE3 => .{ .base = "a", .diac = .tilde, .upper = cp == 0xC3 },
+        0xC4, 0xE4 => .{ .base = "a", .diac = .umlaut, .upper = cp == 0xC4 },
+        0xC5, 0xE5 => .{ .base = "a", .diac = .ring, .upper = cp == 0xC5 },
+        0xC6, 0xE6 => .{ .base = "ae", .diac = .ligature, .upper = cp == 0xC6 },
+        0xC7, 0xE7 => .{ .base = "c", .diac = .cedilla, .upper = cp == 0xC7 },
+        0xC8, 0xE8 => .{ .base = "e", .diac = .grave, .upper = cp == 0xC8 },
+        0xC9, 0xE9 => .{ .base = "e", .diac = .acute, .upper = cp == 0xC9 },
+        0xCA, 0xEA => .{ .base = "e", .diac = .circumflex, .upper = cp == 0xCA },
+        0xCB, 0xEB => .{ .base = "e", .diac = .umlaut, .upper = cp == 0xCB },
+        0xCC, 0xEC => .{ .base = "i", .diac = .grave, .upper = cp == 0xCC },
+        0xCD, 0xED => .{ .base = "i", .diac = .acute, .upper = cp == 0xCD },
+        0xCE, 0xEE => .{ .base = "i", .diac = .circumflex, .upper = cp == 0xCE },
+        0xCF, 0xEF => .{ .base = "i", .diac = .umlaut, .upper = cp == 0xCF },
+        0xD0, 0xF0 => .{ .base = "d", .diac = .stroke, .upper = cp == 0xD0 }, // eth
+        0xD1, 0xF1 => .{ .base = "n", .diac = .tilde, .upper = cp == 0xD1 },
+        0xD2, 0xF2 => .{ .base = "o", .diac = .grave, .upper = cp == 0xD2 },
+        0xD3, 0xF3 => .{ .base = "o", .diac = .acute, .upper = cp == 0xD3 },
+        0xD4, 0xF4 => .{ .base = "o", .diac = .circumflex, .upper = cp == 0xD4 },
+        0xD5, 0xF5 => .{ .base = "o", .diac = .tilde, .upper = cp == 0xD5 },
+        0xD6, 0xF6 => .{ .base = "o", .diac = .umlaut, .upper = cp == 0xD6 },
+        0xD8, 0xF8 => .{ .base = "o", .diac = .stroke, .upper = cp == 0xD8 },
+        0xD9, 0xF9 => .{ .base = "u", .diac = .grave, .upper = cp == 0xD9 },
+        0xDA, 0xFA => .{ .base = "u", .diac = .acute, .upper = cp == 0xDA },
+        0xDB, 0xFB => .{ .base = "u", .diac = .circumflex, .upper = cp == 0xDB },
+        0xDC, 0xFC => .{ .base = "u", .diac = .umlaut, .upper = cp == 0xDC },
+        0xDD, 0xFD => .{ .base = "y", .diac = .acute, .upper = cp == 0xDD },
+        0xDE, 0xFE => .{ .base = "th", .diac = .ligature, .upper = cp == 0xDE }, // thorn
+        0xDF => .{ .base = "ss", .diac = .ligature, .upper = false }, // ß
+        0xFF => .{ .base = "y", .diac = .umlaut, .upper = false },
+        0x100, 0x101 => .{ .base = "a", .diac = .macron, .upper = cp == 0x100 },
+        0x102, 0x103 => .{ .base = "a", .diac = .breve, .upper = cp == 0x102 },
+        0x104, 0x105 => .{ .base = "a", .diac = .ogonek, .upper = cp == 0x104 },
+        0x106, 0x107 => .{ .base = "c", .diac = .acute, .upper = cp == 0x106 },
+        0x108, 0x109 => .{ .base = "c", .diac = .circumflex, .upper = cp == 0x108 },
+        0x10A, 0x10B => .{ .base = "c", .diac = .dot_above, .upper = cp == 0x10A },
+        0x10C, 0x10D => .{ .base = "c", .diac = .caron, .upper = cp == 0x10C },
+        0x10E, 0x10F => .{ .base = "d", .diac = .caron, .upper = cp == 0x10E },
+        0x110, 0x111 => .{ .base = "d", .diac = .stroke, .upper = cp == 0x110 },
+        0x112, 0x113 => .{ .base = "e", .diac = .macron, .upper = cp == 0x112 },
+        0x114, 0x115 => .{ .base = "e", .diac = .breve, .upper = cp == 0x114 },
+        0x116, 0x117 => .{ .base = "e", .diac = .dot_above, .upper = cp == 0x116 },
+        0x118, 0x119 => .{ .base = "e", .diac = .ogonek, .upper = cp == 0x118 },
+        0x11A, 0x11B => .{ .base = "e", .diac = .caron, .upper = cp == 0x11A },
+        0x11C, 0x11D => .{ .base = "g", .diac = .circumflex, .upper = cp == 0x11C },
+        0x11E, 0x11F => .{ .base = "g", .diac = .breve, .upper = cp == 0x11E },
+        0x120, 0x121 => .{ .base = "g", .diac = .dot_above, .upper = cp == 0x120 },
+        0x122, 0x123 => .{ .base = "g", .diac = .cedilla, .upper = cp == 0x122 },
+        0x124, 0x125 => .{ .base = "h", .diac = .circumflex, .upper = cp == 0x124 },
+        0x126, 0x127 => .{ .base = "h", .diac = .stroke, .upper = cp == 0x126 },
+        0x128, 0x129 => .{ .base = "i", .diac = .tilde, .upper = cp == 0x128 },
+        0x12A, 0x12B => .{ .base = "i", .diac = .macron, .upper = cp == 0x12A },
+        0x12C, 0x12D => .{ .base = "i", .diac = .breve, .upper = cp == 0x12C },
+        0x12E, 0x12F => .{ .base = "i", .diac = .ogonek, .upper = cp == 0x12E },
+        0x130 => .{ .base = "i", .diac = .dot_above, .upper = true }, // İ
+        0x131 => .{ .base = "i", .diac = .dotless, .upper = false }, // ı
+        0x132, 0x133 => .{ .base = "ij", .diac = .ligature, .upper = cp == 0x132 },
+        0x134, 0x135 => .{ .base = "j", .diac = .circumflex, .upper = cp == 0x134 },
+        0x136, 0x137 => .{ .base = "k", .diac = .cedilla, .upper = cp == 0x136 },
+        0x138 => .{ .base = "k", .diac = .ligature, .upper = false }, // ĸ kra
+        0x139, 0x13A => .{ .base = "l", .diac = .acute, .upper = cp == 0x139 },
+        0x13B, 0x13C => .{ .base = "l", .diac = .cedilla, .upper = cp == 0x13B },
+        0x13D, 0x13E => .{ .base = "l", .diac = .caron, .upper = cp == 0x13D },
+        0x13F, 0x140 => .{ .base = "l", .diac = .middle_dot, .upper = cp == 0x13F },
+        0x141, 0x142 => .{ .base = "l", .diac = .stroke, .upper = cp == 0x141 },
+        0x143, 0x144 => .{ .base = "n", .diac = .acute, .upper = cp == 0x143 },
+        0x145, 0x146 => .{ .base = "n", .diac = .cedilla, .upper = cp == 0x145 },
+        0x147, 0x148 => .{ .base = "n", .diac = .caron, .upper = cp == 0x147 },
+        0x149 => .{ .base = "n", .diac = .apostrophe, .upper = false }, // ŉ
+        0x14A, 0x14B => .{ .base = "n", .diac = .ligature, .upper = cp == 0x14A }, // eng
+        0x14C, 0x14D => .{ .base = "o", .diac = .macron, .upper = cp == 0x14C },
+        0x14E, 0x14F => .{ .base = "o", .diac = .breve, .upper = cp == 0x14E },
+        0x150, 0x151 => .{ .base = "o", .diac = .double_acute, .upper = cp == 0x150 },
+        0x152, 0x153 => .{ .base = "oe", .diac = .ligature, .upper = cp == 0x152 },
+        0x154, 0x155 => .{ .base = "r", .diac = .acute, .upper = cp == 0x154 },
+        0x156, 0x157 => .{ .base = "r", .diac = .cedilla, .upper = cp == 0x156 },
+        0x158, 0x159 => .{ .base = "r", .diac = .caron, .upper = cp == 0x158 },
+        0x15A, 0x15B => .{ .base = "s", .diac = .acute, .upper = cp == 0x15A },
+        0x15C, 0x15D => .{ .base = "s", .diac = .circumflex, .upper = cp == 0x15C },
+        0x15E, 0x15F => .{ .base = "s", .diac = .cedilla, .upper = cp == 0x15E },
+        0x160, 0x161 => .{ .base = "s", .diac = .caron, .upper = cp == 0x160 },
+        0x162, 0x163 => .{ .base = "t", .diac = .cedilla, .upper = cp == 0x162 },
+        0x164, 0x165 => .{ .base = "t", .diac = .caron, .upper = cp == 0x164 },
+        0x166, 0x167 => .{ .base = "t", .diac = .stroke, .upper = cp == 0x166 },
+        0x168, 0x169 => .{ .base = "u", .diac = .tilde, .upper = cp == 0x168 },
+        0x16A, 0x16B => .{ .base = "u", .diac = .macron, .upper = cp == 0x16A },
+        0x16C, 0x16D => .{ .base = "u", .diac = .breve, .upper = cp == 0x16C },
+        0x16E, 0x16F => .{ .base = "u", .diac = .ring, .upper = cp == 0x16E },
+        0x170, 0x171 => .{ .base = "u", .diac = .double_acute, .upper = cp == 0x170 },
+        0x172, 0x173 => .{ .base = "u", .diac = .ogonek, .upper = cp == 0x172 },
+        0x174, 0x175 => .{ .base = "w", .diac = .circumflex, .upper = cp == 0x174 },
+        0x176, 0x177 => .{ .base = "y", .diac = .circumflex, .upper = cp == 0x176 },
+        0x178 => .{ .base = "y", .diac = .umlaut, .upper = true }, // Ÿ
+        0x179, 0x17A => .{ .base = "z", .diac = .acute, .upper = cp == 0x179 },
+        0x17B, 0x17C => .{ .base = "z", .diac = .dot_above, .upper = cp == 0x17B },
+        0x17D, 0x17E => .{ .base = "z", .diac = .caron, .upper = cp == 0x17D },
+        0x17F => .{ .base = "s", .diac = .ligature, .upper = false }, // ſ
+        else => null,
+    };
+}
+
+/// One collation weight string per level.
+const SortKey = struct {
+    primary: std.ArrayList(u8) = .empty,
+    secondary: std.ArrayList(u8) = .empty,
+    tertiary: std.ArrayList(u8) = .empty,
+
+    fn addElem(k: *SortKey, a: std.mem.Allocator, base: u21, diac: Diac, upper: bool) Error!void {
+        var buf: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(base, &buf) catch return error.Eval;
+        try k.primary.appendSlice(a, buf[0..n]);
+        try k.secondary.append(a, @intFromEnum(diac));
+        try k.tertiary.append(a, @intFromBool(upper));
+    }
+
+    /// A multi-letter fold ("ü" -> "ue"): the first element carries the
+    /// diacritic and case, the tail is plain.
+    fn addExpansion(k: *SortKey, a: std.mem.Allocator, base: []const u8, diac: Diac, upper: bool) Error!void {
+        try k.addElem(a, base[0], diac, upper);
+        for (base[1..]) |c| try k.addElem(a, c, .none, false);
+    }
+
+    fn addCp(k: *SortKey, a: std.mem.Allocator, cp: u21, loc: CollLocale) Error!void {
+        if (cp >= 'A' and cp <= 'Z') return k.addElem(a, cp + 32, .none, true);
+        if (cp < 0xC0) return k.addElem(a, cp, .none, false);
+        switch (loc) {
+            .de => switch (cp) {
+                // German phonebook-style umlaut expansions
+                0xC4, 0xE4 => return k.addExpansion(a, "ae", .umlaut, cp == 0xC4),
+                0xD6, 0xF6 => return k.addExpansion(a, "oe", .umlaut, cp == 0xD6),
+                0xDC, 0xFC => return k.addExpansion(a, "ue", .umlaut, cp == 0xDC),
+                else => {},
+            },
+            .sv => switch (cp) {
+                // å, ä, ö are distinct letters ordered after z
+                0xC5, 0xE5 => return k.addElem(a, 'z' + 1, .none, cp == 0xC5),
+                0xC4, 0xE4 => return k.addElem(a, 'z' + 2, .none, cp == 0xC4),
+                0xD6, 0xF6 => return k.addElem(a, 'z' + 3, .none, cp == 0xD6),
+                else => {},
+            },
+            .root => {},
+        }
+        if (latinFold(cp)) |f| {
+            if (f.base.len == 1) return k.addElem(a, f.base[0], f.diac, f.upper);
+            return k.addExpansion(a, f.base, f.diac, f.upper);
+        }
+        return k.addElem(a, cp, .none, false);
+    }
+};
+
+fn sortKey(a: std.mem.Allocator, s: []const u8, loc: CollLocale) Error!SortKey {
+    var k = SortKey{};
+    var i: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 0;
+        if (n == 0 or i + n > s.len) {
+            try k.addCp(a, s[i], loc); // not UTF-8: collate the raw byte
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(s[i .. i + n]) catch {
+            try k.addCp(a, s[i], loc);
+            i += 1;
+            continue;
+        };
+        try k.addCp(a, cp, loc);
+        i += n;
+    }
+    return k;
+}
+
+fn collate(a: std.mem.Allocator, s1: []const u8, s2: []const u8, flags: CollatorFlags) Error!std.math.Order {
+    const k1 = try sortKey(a, s1, flags.locale);
+    const k2 = try sortKey(a, s2, flags.locale);
+    const p = std.mem.order(u8, k1.primary.items, k2.primary.items);
+    if (p != .eq) return p;
+    if (flags.diacritic_sensitive) {
+        const sec = std.mem.order(u8, k1.secondary.items, k2.secondary.items);
+        if (sec != .eq) return sec;
+    }
+    if (flags.case_sensitive) return std.mem.order(u8, k1.tertiary.items, k2.tertiary.items);
+    return .eq;
 }
 
 fn colorFromArray(items: []const Value) ?Color {

@@ -21,8 +21,6 @@ const Value = exprs.Value;
 /// counted as skipped. Shrink this list; never grow it silently.
 const skip_ops = [_][]const u8{
     "interpolate/projection",
-    "collator",
-    "distance",
     "projection",
 };
 
@@ -32,7 +30,8 @@ const skip_ops = [_][]const u8{
 /// semiliteral, objects, collator-eq, strict booleans, coalesce errors) →
 /// 352 (legacy property functions, Lab/HCL interpolation) -> 377 (global-
 /// state, feature-state, elevation, heatmap-density, properties) -> 400
-/// (within, tessellation-era libm rounding).
+/// (within, tessellation-era libm rounding) -> 485 (three-level collation,
+/// distance with tile-grid quantization).
 ///
 /// Known-fail (2): interpolate-{hcl,lab}/linear-color — the reference
 /// applies a gamut-mapping step to out-of-gamut interpolation results that
@@ -40,7 +39,7 @@ const skip_ops = [_][]const u8{
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
 /// from the fixtures alone). Revisit with more fixture data points; the
 /// pixel difference is below visibility.
-const PASS_FLOOR: usize = 425;
+const PASS_FLOOR: usize = 485;
 
 const Score = struct {
     total: usize = 0,
@@ -106,12 +105,33 @@ const FixtureFeature = struct {
 
 const geojson = @import("geojson.zig");
 
-fn coordsToPoints(a: std.mem.Allocator, j: std.json.Value) ![]geojson.Point {
+/// The reference harness converts fixture lon/lat into integer tile-grid
+/// coordinates (EXTENT 8192 at the input's canonicalID zoom) before
+/// evaluating. The distance fixtures' expected meter values include that
+/// quantization noise (distance/basic: a point measured against itself is
+/// 0.00170188 m away), so the feature side quantizes for them. `within`
+/// fixtures hold under exact geometry (the reference converts BOTH sides
+/// to the same grid there, keeping boundary points on the boundary), so
+/// they stay unquantized.
+fn quantizePoint(p: geojson.Point, z: f64) geojson.Point {
+    const scale = 8192.0 * std.math.exp2(z);
+    const x = (p[0] + 180.0) / 360.0 * scale;
+    const y = (0.5 - @log(@tan(std.math.pi / 4.0 + p[1] * std.math.rad_per_deg / 2.0)) /
+        (2.0 * std.math.pi)) * scale;
+    const merc = std.math.pi * (1.0 - 2.0 * @round(y) / scale);
+    return .{
+        @round(x) / scale * 360.0 - 180.0,
+        std.math.atan(std.math.sinh(merc)) * std.math.deg_per_rad,
+    };
+}
+
+fn coordsToPoints(a: std.mem.Allocator, j: std.json.Value, quant_z: ?f64) ![]geojson.Point {
     if (j != .array) return error.Malformed;
     const pts = try a.alloc(geojson.Point, j.array.items.len);
     for (j.array.items, 0..) |it, i| {
         if (it != .array or it.array.items.len < 2) return error.Malformed;
         pts[i] = .{ try numOf(it.array.items[0]), try numOf(it.array.items[1]) };
+        if (quant_z) |z| pts[i] = quantizePoint(pts[i], z);
     }
     return pts;
 }
@@ -124,29 +144,44 @@ fn numOf(j: std.json.Value) !f64 {
     };
 }
 
-fn geomFromGeoJson(a: std.mem.Allocator, type_name: []const u8, coords_j: ?std.json.Value) !geojson.Geometry {
+fn geomFromGeoJson(a: std.mem.Allocator, type_name: []const u8, coords_j: ?std.json.Value, quant_z: ?f64) !geojson.Geometry {
     const coords = coords_j orelse return error.Malformed;
     if (std.mem.eql(u8, type_name, "Point")) {
         if (coords != .array or coords.array.items.len < 2) return error.Malformed;
         const pts = try a.alloc(geojson.Point, 1);
         pts[0] = .{ try numOf(coords.array.items[0]), try numOf(coords.array.items[1]) };
+        if (quant_z) |z| pts[0] = quantizePoint(pts[0], z);
         const parts = try a.alloc([]const geojson.Point, 1);
         parts[0] = pts;
         return .{ .kind = .point, .parts = parts };
     }
     if (std.mem.eql(u8, type_name, "MultiPoint") or std.mem.eql(u8, type_name, "LineString")) {
         const parts = try a.alloc([]const geojson.Point, 1);
-        parts[0] = try coordsToPoints(a, coords);
+        parts[0] = try coordsToPoints(a, coords, quant_z);
         return .{ .kind = if (type_name[0] == 'M') .point else .line, .parts = parts };
     }
     if (std.mem.eql(u8, type_name, "MultiLineString")) {
         if (coords != .array) return error.Malformed;
         const parts = try a.alloc([]const geojson.Point, coords.array.items.len);
-        for (coords.array.items, 0..) |it, i| parts[i] = try coordsToPoints(a, it);
+        for (coords.array.items, 0..) |it, i| parts[i] = try coordsToPoints(a, it, quant_z);
         return .{ .kind = .line, .parts = parts };
     }
-    if (std.mem.eql(u8, type_name, "Polygon") or std.mem.eql(u8, type_name, "MultiPolygon")) {
-        return .{ .kind = .polygon, .parts = &.{} };
+    if (std.mem.eql(u8, type_name, "Polygon")) {
+        if (coords != .array) return error.Malformed;
+        const parts = try a.alloc([]const geojson.Point, coords.array.items.len);
+        for (coords.array.items, 0..) |rv, i| parts[i] = try coordsToPoints(a, rv, quant_z);
+        return .{ .kind = .polygon, .parts = parts };
+    }
+    if (std.mem.eql(u8, type_name, "MultiPolygon")) {
+        // Rings flatten across polygons; even-odd containment still holds
+        // for the fixtures' disjoint polygons.
+        if (coords != .array) return error.Malformed;
+        var rings: std.ArrayList([]const geojson.Point) = .empty;
+        for (coords.array.items) |pv| {
+            if (pv != .array) return error.Malformed;
+            for (pv.array.items) |rv| try rings.append(a, try coordsToPoints(a, rv, quant_z));
+        }
+        return .{ .kind = .polygon, .parts = rings.items };
     }
     return error.Malformed;
 }
@@ -403,7 +438,7 @@ fn jsonEntries(a: std.mem.Allocator, j: std.json.Value) RunError![]Value.Entry {
     return entries;
 }
 
-fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError!?[]const u8 {
+fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value, quantize_feature: bool) RunError!?[]const u8 {
     if (doc != .object) return error.Malformed;
     const expression = doc.object.get("expression") orelse return error.Malformed;
     const expected = doc.object.get("expected") orelse return error.Malformed;
@@ -520,10 +555,18 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
             }
             if (feat_json.object.get("geometry")) |g| {
                 if (g == .object) {
+                    var quant_z: ?f64 = null;
+                    if (quantize_feature and globals == .object) {
+                        if (globals.object.get("canonicalID")) |cid| {
+                            if (cid == .object) {
+                                if (cid.object.get("z")) |zj| quant_z = numOf(zj) catch null;
+                            }
+                        }
+                    }
                     if (g.object.get("type")) |t| {
                         if (t == .string) {
                             fr.geom = geomFromString(t.string);
-                            fr.geometry = geomFromGeoJson(a, t.string, g.object.get("coordinates")) catch null;
+                            fr.geometry = geomFromGeoJson(a, t.string, g.object.get("coordinates"), quant_z) catch null;
                         }
                     }
                 }
@@ -587,7 +630,7 @@ test "spec expression conformance suite" {
             score.fail_parse += 1;
             continue;
         };
-        const detail = runFixture(arena, &score, doc) catch |e| switch (e) {
+        const detail = runFixture(arena, &score, doc, std.mem.startsWith(u8, entry.path, "distance/")) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Malformed, error.Unsupported => {
                 score.skipped += 1;

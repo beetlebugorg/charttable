@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const vals = @import("value.zig");
+const geojson = @import("geojson.zig");
 pub const Value = vals.Value;
 pub const Color = vals.Color;
 
@@ -73,9 +74,9 @@ pub const Op = enum {
     rgb,
     typeof,
     err, // ["error", ...]: compiles, always errors at evaluation
-    collator, // minimal: an options object consumed by ==/!= (tier 2: full)
+    collator, // an options object consumed by the comparison operators
     is_supported_script, // true unless the host reports a missing script
-    resolved_locale, // the collator's locale (en-US-family only for now)
+    resolved_locale, // the collator's locale as given (no host locale data)
 };
 
 pub const InterpKind = union(enum) {
@@ -99,6 +100,7 @@ pub const Expr = union(enum) {
     line_progress,
     properties, // the feature's full property object
     within: *const Expr, // GeoJSON area the feature must fall inside
+    distance: *const geojson.Geoms, // GeoJSON geometry measured against the feature
     number_format: NumberFormat,
     image_op: *const Expr, // name -> {name, available} against host images
     format_op: []const FormatSection,
@@ -409,13 +411,26 @@ const Parser = struct {
                 try p.parseJson(args[0]);
             // A literal GeoJSON argument validates at parse.
             if (r.e.* == .literal) {
-                const geojson = @import("geojson.zig");
                 var polys: std.ArrayList(geojson.Polygon) = .empty;
                 geojson.valueToPolygons(p.arena, r.e.literal, &polys) catch return error.InvalidExpression;
                 if (polys.items.len == 0) return error.InvalidExpression;
             }
             const deps = r.deps.merge(.{ .feature = true });
             return .{ .e = try p.node(.{ .within = r.e }), .deps = deps };
+        }
+        if (std.mem.eql(u8, head, "distance")) {
+            // The single argument is a bare GeoJSON OBJECT carrying at least
+            // one geometry; an expression argument does not compile
+            // (fixtures: expression-geometry, invalid-geometry).
+            if (args.len != 1 or args[0] != .object) return error.InvalidExpression;
+            const v = try p.jsonToValue(args[0]);
+            const geoms = try p.arena.create(geojson.Geoms);
+            geoms.* = geojson.valueToGeoms(p.arena, v) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Malformed => return error.InvalidExpression,
+            };
+            if (geoms.isEmpty()) return error.InvalidExpression;
+            return .{ .e = try p.node(.{ .distance = geoms }), .deps = .{ .feature = true } };
         }
         if (std.mem.eql(u8, head, "geometry-type")) {
             if (args.len != 0) return error.InvalidExpression;
@@ -455,12 +470,26 @@ const Parser = struct {
 
         const op = op_names.get(head) orelse return error.InvalidExpression;
         if (op == .collator) {
-            // its single argument is an options OBJECT, not an expression
+            // Its single argument is an options OBJECT (not an expression),
+            // but each option VALUE is an expression: normalized here to
+            // exactly [case-sensitive, diacritic-sensitive, locale] args.
             if (args.len != 1 or args[0] != .object) return error.InvalidExpression;
-            const v = try p.jsonToValue(args[0]);
-            const lit = try p.node(.{ .literal = v });
-            const call = try p.node(.{ .op = .{ .op = .collator, .args = try p.arena.dupe(*const Expr, &.{lit}) } });
-            return .{ .e = call, .deps = .{} };
+            const opts = args[0].object;
+            var deps = Deps{};
+            var slots: [3]*const Expr = undefined;
+            const names = [_][]const u8{ "case-sensitive", "diacritic-sensitive", "locale" };
+            for (names, 0..) |name, i| {
+                if (opts.get(name)) |j| {
+                    const r = try p.parseJson(j);
+                    deps = deps.merge(r.deps);
+                    slots[i] = p.fold(r.e, r.deps);
+                } else {
+                    // sensitivities default to false; the locale to none
+                    slots[i] = try p.node(.{ .literal = if (i == 2) .null else Value.false_ });
+                }
+            }
+            const call = try p.node(.{ .op = .{ .op = .collator, .args = try p.arena.dupe(*const Expr, &slots) } });
+            return .{ .e = p.fold(call, deps), .deps = deps };
         }
         var deps = Deps{};
         const list = try p.arena.alloc(*const Expr, args.len);
@@ -470,6 +499,18 @@ const Parser = struct {
             list[i] = p.fold(r.e, r.deps);
         }
         try checkArity(op, list.len);
+        switch (op) {
+            .eq, .neq, .lt, .le, .gt, .ge => if (list.len == 3) {
+                // A collator comparison is string-typed: an operand STATICALLY
+                // known to be non-string does not compile (fixtures:
+                // comparison-number-error, equals-non-string-error).
+                for (list[0..2]) |operand| {
+                    if (operand.* == .literal and operand.literal != .string)
+                        return error.InvalidExpression;
+                }
+            },
+            else => {},
+        }
         const call = try p.node(.{ .op = .{ .op = op, .args = list } });
         return .{ .e = p.fold(call, deps), .deps = deps };
     }
@@ -814,8 +855,7 @@ fn parseInterpKind(j: std.json.Value) ParseError!InterpKind {
 
 fn checkArity(op: Op, n: usize) ParseError!void {
     const bad = switch (op) {
-        .eq, .neq => n != 2 and n != 3, // optional collator argument
-        .lt, .le, .gt, .ge => n != 2, // collator arg: tier 2
+        .eq, .neq, .lt, .le, .gt, .ge => n != 2 and n != 3, // optional collator argument
         .not, .length, .upcase, .downcase, .sqrt, .abs, .round, .floor, .ceil, .ln, .log10, .log2, .sin, .cos, .tan, .asin, .acos, .atan, .to_boolean, .to_rgba, .typeof => n != 1,
         .in, .at, .index_of => n != 2 and (op != .index_of or n != 3),
         .slice => n != 2 and n != 3,
@@ -827,7 +867,8 @@ fn checkArity(op: Op, n: usize) ParseError!void {
         .rgba, .rgb => n != 4 and n != 3,
         .e_const, .pi_const, .ln2_const => n != 0,
         .err => false,
-        .collator, .is_supported_script, .resolved_locale => n != 1,
+        .collator => n != 3, // normalized by the parser
+        .is_supported_script, .resolved_locale => n != 1,
     };
     if (bad) return error.InvalidExpression;
 }
