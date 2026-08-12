@@ -550,6 +550,38 @@ test "icon quads: centered, scaled, rotated, map-aligned" {
     try std.testing.expectApproxEqAbs(quads.items[0].x, rq.items[0].x, 1e-6);
 }
 
+test "wrapLines: hard breaks, greedy wrap, and an unsplittable word" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var atlas = try glyphs.GlyphAtlas.init(std.testing.allocator, glyphs.default_width);
+    defer atlas.deinit();
+    // Nothing is in the atlas, so every codepoint advances half an em: at
+    // scale 1 that is 12 px a character.
+    var out: [max_lines][]const u8 = undefined;
+
+    // 60 px = five characters to a line.
+    var n = wrapLines("aa bb cc dd", &atlas, 1.0, 60, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("aa bb", out[0]);
+    try std.testing.expectEqualStrings("cc dd", out[1]);
+
+    // A hard break always breaks, wrap limit or not.
+    n = wrapLines("aa\nbb", &atlas, 1.0, 0, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("aa", out[0]);
+    try std.testing.expectEqualStrings("bb", out[1]);
+
+    // A word wider than the limit keeps its own line rather than splitting.
+    n = wrapLines("aaaaaaaa bb", &atlas, 1.0, 60, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("aaaaaaaa", out[0]);
+    try std.testing.expectEqualStrings("bb", out[1]);
+
+    // max_width 0 never wraps.
+    n = wrapLines("aa bb cc dd", &atlas, 1.0, 0, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+}
+
 test "tangentQ round-trips an angle into /256 turns" {
     try std.testing.expectEqual(@as(u8, 0), tangentQ(0));
     try std.testing.expectEqual(@as(u8, 64), tangentQ(std.math.pi * 0.5));

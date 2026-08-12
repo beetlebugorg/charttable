@@ -1147,6 +1147,217 @@ test "real chart: Annapolis first light" {
     };
     try std.testing.expect(water > total / 20); // >5% shallow-water blue
     try std.testing.expect(land > total / 50); // >2% land tan
+
+    // ---- the missing-image round trip ------------------------------------
+    // What a host does with Built.missing_images: rasterize each name (the
+    // real answer for a sounding run is tile57's composer, which needs
+    // lookout's link — out of scope here, so every name gets the same stub
+    // marker), hand it to Sprite.addImage, and rebuild. The names must then
+    // resolve, the scene must grow the quads they were missing from, and the
+    // sprite's generation must have moved so the host knows to re-upload.
+    if (sprite_store) |*sp| {
+        const gen0 = sp.generation;
+        const marker = [_]u8{ 255, 0, 255, 255 } ** (16 * 16);
+        var added: usize = 0;
+        for (built.missing_images) |name| {
+            sp.addImage(name, &marker, 16, 16, 1.0) catch continue;
+            added += 1;
+        }
+        try std.testing.expect(added > 0);
+        try std.testing.expect(sp.generation != gen0);
+
+        const rebuilt = try buildScene(a, &style, tiles.items, .{ .zoom = z, .origin = origin }, assets);
+        std.debug.print(
+            "  add_image round trip: {d} names baked, missing {d} -> {d}, quads {d} -> {d}\n",
+            .{ added, built.missing_images.len, rebuilt.missing_images.len, built.quads.len, rebuilt.quads.len },
+        );
+        try std.testing.expectEqual(@as(usize, 0), rebuilt.missing_images.len);
+        try std.testing.expect(rebuilt.quads.len > built.quads.len);
+
+        // And it renders: the grown atlas re-uploads, the scene rebuilds, and
+        // the markers land where the unresolvable names used to draw nothing.
+        try g.uploadSpriteAtlas(sp.rgba, sp.width, sp.height);
+        try g.uploadScene(a, .{
+            .vertices = rebuilt.vertices,
+            .paint = rebuilt.paint,
+            .indices = rebuilt.indices,
+            .quads = rebuilt.quads,
+            .quad_paint = rebuilt.quad_paint,
+            .ranges = rebuilt.ranges,
+            .patterns = rebuilt.patterns,
+        });
+        const rgba2 = try g.renderOffscreen(a, u);
+        var markers: usize = 0;
+        var mi: usize = 0;
+        while (mi < rgba2.len) : (mi += 4) {
+            if (rgba2[mi] == 255 and rgba2[mi + 1] == 0 and rgba2[mi + 2] == 255) markers += 1;
+        }
+        try std.testing.expect(markers > 0);
+        g.savePng(a, try std.fmt.allocPrint(a, "{s}/annapolis-addimage.png", .{ct_build.out_dir}), u) catch {};
+    }
+}
+
+test "buildScene: a pattern fill splits into one range per cell" {
+    const png = @import("util/png.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // An 8x4 sheet holding two pattern cells: "pat:water" is the left 4x4 at
+    // ratio 1 (a 4x4 on-screen period), "pat:land" the 2x2 at (4,0) at ratio
+    // 2 (a 1x1 period after the rescale to screen px).
+    const sheet_px = try a.alloc(u8, 8 * 4 * 4);
+    @memset(sheet_px, 0);
+    for (0..4) |y| for (0..4) |x| {
+        sheet_px[(y * 8 + x) * 4 ..][0..4].* = .{ 255, 0, 0, 255 };
+    };
+    for (0..2) |y| for (4..6) |x| {
+        sheet_px[(y * 8 + x) * 4 ..][0..4].* = .{ 0, 0, 255, 255 };
+    };
+    const sheet = try png.encode(a, sheet_px, 8, 4);
+    const index =
+        \\{"pat:water": {"x": 0, "y": 0, "width": 4, "height": 4, "pixelRatio": 1},
+        \\ "pat:land":  {"x": 4, "y": 0, "width": 2, "height": 2, "pixelRatio": 2}}
+    ;
+    var sprite = try sprites.Sprite.load(std.testing.allocator, index, sheet);
+    defer sprite.deinit();
+
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "hatch", "type": "fill", "source": "chart",
+        \\   "source-layer": "areas",
+        \\   "paint": {"fill-pattern": ["concat", "pat:", ["get", "kind"]]}}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+    // Two exterior rings (clockwise in y-down), one per pattern name.
+    const left = try a.dupe(mvt.Point, &.{
+        .{ .x = 0, .y = 0 }, .{ .x = 2048, .y = 0 }, .{ .x = 2048, .y = 4096 }, .{ .x = 0, .y = 4096 },
+    });
+    const right = try a.dupe(mvt.Point, &.{
+        .{ .x = 2048, .y = 0 }, .{ .x = 4096, .y = 0 }, .{ .x = 4096, .y = 4096 }, .{ .x = 2048, .y = 4096 },
+    });
+    const tile = mvt.Tile{ .layers = try a.dupe(mvt.Layer, &.{.{
+        .name = "areas",
+        .keys = try a.dupe([]const u8, &.{"kind"}),
+        .values = try a.dupe(mvt.Value, &.{ .{ .string = "water" }, .{ .string = "land" } }),
+        .features = try a.dupe(mvt.Feature, &.{
+            .{ .geom_type = .polygon, .parts = try a.dupe([]const mvt.Point, &.{left}), .tags = try a.dupe(u32, &.{ 0, 0 }) },
+            .{ .geom_type = .polygon, .parts = try a.dupe([]const mvt.Point, &.{right}), .tags = try a.dupe(u32, &.{ 0, 1 }) },
+        }),
+    }}) };
+    const id = coord.TileId{ .z = 3, .x = 4, .y = 2 };
+    const rect = id.worldRect();
+    const built = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 3,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{ .sprite = &sprite });
+
+    // The two polygons name different cells, so the layer's triangles cannot
+    // share a draw: one range each, in feature order.
+    try std.testing.expectEqual(@as(usize, 2), built.patterns.len);
+    try std.testing.expectEqual(@as(usize, 2), built.ranges.len);
+    for (built.ranges) |r| {
+        try std.testing.expectEqual(types.Kind.pattern, r.kind);
+        try std.testing.expect(r.pattern != types.NO_PATTERN);
+        // Mostly-transparent cells must blend, never join the opaque pre-pass.
+        try std.testing.expectEqual(@as(u8, 0), r.flags & types.Range.FLAG_OPAQUE);
+    }
+    try std.testing.expectEqual(@as(u32, 0), built.ranges[0].pattern);
+    try std.testing.expectEqual(@as(u32, 1), built.ranges[1].pattern);
+    // A cell's w/h ARE its on-screen period: the ratio-2 cell halves.
+    try std.testing.expectEqual(@as(u32, 4), built.patterns[0].w);
+    try std.testing.expectEqual(@as(u32, 1), built.patterns[1].w);
+    try std.testing.expectEqual(@as(usize, 4 * 4 * 4), built.patterns[0].rgba.len);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, built.patterns[0].rgba[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, built.patterns[1].rgba[0..4]);
+
+    // An unresolvable name draws NOTHING rather than a flat polygon over the
+    // fills the hatch was meant to decorate; the name surfaces for the host.
+    const json_missing =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "hatch", "type": "fill", "source": "chart",
+        \\   "source-layer": "areas", "paint": {"fill-pattern": "pat:absent"}}]}
+    ;
+    var style2 = try styles.parse(std.testing.allocator, json_missing);
+    defer style2.deinit();
+    const b2 = try buildScene(a, &style2, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 3,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{ .sprite = &sprite });
+    try std.testing.expectEqual(@as(usize, 0), b2.ranges.len);
+    try std.testing.expectEqual(@as(usize, 1), b2.missing_images.len);
+    try std.testing.expectEqualStrings("pat:absent", b2.missing_images[0]);
+}
+
+test "buildScene: line-placed symbols follow the line, point layers do not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A 4x4 sheet with one 2x2 icon, so layoutIcon has something to resolve.
+    const png = @import("util/png.zig");
+    const sheet_px = try a.alloc(u8, 4 * 4 * 4);
+    @memset(sheet_px, 255);
+    const sheet = try png.encode(a, sheet_px, 4, 4);
+    var sprite = try sprites.Sprite.load(
+        std.testing.allocator,
+        "{\"tick\": {\"x\": 0, \"y\": 0, \"width\": 2, \"height\": 2, \"pixelRatio\": 1}}",
+        sheet,
+    );
+    defer sprite.deinit();
+
+    // The tile's line runs corner to corner: 4096 units diagonally, which at
+    // z10 is far more than one 64 px spacing, so the walk places many.
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "deco", "type": "symbol", "source": "chart",
+        \\   "source-layer": "lines",
+        \\   "layout": {"symbol-placement": "line", "symbol-spacing": 64,
+        \\              "icon-image": "tick", "icon-allow-overlap": true,
+        \\              "icon-ignore-placement": true}}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+    const tile = try testTile(a);
+    const id = coord.TileId{ .z = 10, .x = 0, .y = 0 };
+    const rect = id.worldRect();
+    const built = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 10,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{ .sprite = &sprite });
+
+    try std.testing.expectEqual(@as(usize, 1), built.ranges.len);
+    try std.testing.expectEqual(types.Kind.symbol, built.ranges[0].kind);
+    const n_icons = built.quads.len / 6;
+    try std.testing.expect(n_icons > 4);
+    // Every icon is map-aligned (rotation-alignment "auto" on a line
+    // placement means "map") and turned onto the 45-degree diagonal: a
+    // corner offset that was (±1, ±1) unrotated has |ox| ~ 0 or ~ 1.414.
+    for (built.quads) |q| {
+        try std.testing.expect(q.flags & types.Flags.map_align != 0);
+        try std.testing.expect(@abs(q.ox) < 1e-3 or @abs(@abs(q.ox) - std.math.sqrt2) < 1e-3);
+    }
+    // Anchors march along the diagonal, x == y in tile-local units.
+    for (built.quads) |q| try std.testing.expectApproxEqAbs(q.x, q.y, 1e-4);
+
+    // The same layer with point placement finds no point features here.
+    const json_point =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "deco", "type": "symbol", "source": "chart",
+        \\   "source-layer": "lines", "layout": {"icon-image": "tick"}}]}
+    ;
+    var style2 = try styles.parse(std.testing.allocator, json_point);
+    defer style2.deinit();
+    const b2 = try buildScene(a, &style2, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 10,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{ .sprite = &sprite });
+    try std.testing.expectEqual(@as(usize, 0), b2.quads.len);
 }
 
 test "buildScene: layer zoom bounds gate at fractional zoom" {

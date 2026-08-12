@@ -631,3 +631,85 @@ test "metal offscreen smoke: paint stream draws, zoom gate culls" {
     // Outside everything: the clear colour.
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, P.at(px, 5, 5));
 }
+
+// The other half of the offset contract: map_align. A rotated view turns a
+// map-aligned symbol's offsets by (rot_sin, rot_cos) and leaves a
+// viewport-aligned one alone — the paired layers tile57 emits (point_symbols
+// viewport-aligned, point_symbols-north map-aligned) rely on exactly this.
+test "metal offscreen: a rotated view turns map-aligned offsets only" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var g = try Gpu.init(.{ .width = 256, .height = 256 });
+    defer g.deinit();
+    g.clear = .{ .r = 0, .g = 0, .b = 0, .a = 1 };
+    // A 1x1 opaque atlas: the sprite pipeline paints whatever it samples, so
+    // every mark is white and only its POSITION carries the answer.
+    try g.uploadSpriteAtlas(&.{ 255, 255, 255, 255 }, 1, 1);
+
+    // Two marks, each 12 px square sitting 40 px to the right of its anchor:
+    // A anchored at clip x -0.5 and map-aligned, B at the origin and not.
+    const Q = struct {
+        fn mark(anchor_x: f32, map_align: bool, out: *[6]scene.Quad) void {
+            const corners = [4][2]f32{ .{ 34, -6 }, .{ 46, -6 }, .{ 46, 6 }, .{ 34, 6 } };
+            const order = [6]u8{ 0, 1, 2, 0, 2, 3 };
+            for (order, 0..) |ci, i| out[i] = .{
+                .x = anchor_x,
+                .y = 0,
+                .ox = corners[ci][0],
+                .oy = corners[ci][1],
+                .u = 0.5,
+                .v = 0.5,
+                .weight = 0,
+                .zmin = scene.ZMIN_ALL,
+                .zmax = scene.ZMAX_ALL,
+                .flags = if (map_align) scene.Flags.map_align else 0,
+                .flip = 0,
+                .tangent_q = 0,
+                .depth = 0.5,
+            };
+        }
+    };
+    var quads: [12]scene.Quad = undefined;
+    Q.mark(-0.5, true, quads[0..6]);
+    Q.mark(0.0, false, quads[6..12]);
+    const paint: [12]scene.PaintVertex = @splat(.{ .color = .{ 255, 255, 255, 255 } });
+    const ranges = [_]scene.Range{
+        .{ .first = 0, .count = 12, .paint_key = 0, .kind = .symbol, .prim = .quads, .atlas = .sprite },
+    };
+    try g.uploadScene(alloc, .{ .quads = &quads, .quad_paint = &paint, .ranges = &ranges });
+
+    var u = std.mem.zeroes(Uniforms);
+    u.mvp[0] = 1;
+    u.mvp[5] = 1;
+    u.mvp[15] = 1;
+    u.px_to_clip = .{ 2.0 / 256.0, -2.0 / 256.0 };
+    u.size_scale = 1;
+    u.rot_cos = 1; // unrotated
+
+    const P = struct {
+        fn at(buf: []const u8, x: usize, y: usize) [4]u8 {
+            const i = (y * 256 + x) * 4;
+            return .{ buf[i], buf[i + 1], buf[i + 2], buf[i + 3] };
+        }
+    };
+    const white = [4]u8{ 255, 255, 255, 255 };
+    const black = [4]u8{ 0, 0, 0, 255 };
+
+    // Anchors project to (64, 128) and (128, 128); both marks sit 40 px right.
+    const flat = try g.renderOffscreen(alloc, u);
+    defer alloc.free(flat);
+    try std.testing.expectEqual(white, P.at(flat, 104, 128));
+    try std.testing.expectEqual(white, P.at(flat, 168, 128));
+    try std.testing.expectEqual(black, P.at(flat, 64, 168));
+
+    // Turn the view a quarter turn: the map-aligned offset (40, 0) becomes
+    // (0, 40) — straight down the screen — while the viewport one holds.
+    u.rot_sin = 1;
+    u.rot_cos = 0;
+    const turned = try g.renderOffscreen(alloc, u);
+    defer alloc.free(turned);
+    try std.testing.expectEqual(white, P.at(turned, 64, 168));
+    try std.testing.expectEqual(white, P.at(turned, 168, 128));
+    try std.testing.expectEqual(black, P.at(turned, 104, 128));
+}

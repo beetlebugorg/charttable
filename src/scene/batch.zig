@@ -151,6 +151,27 @@ test "overflow returns the true count and draws nothing from a short buffer" {
     try expectEqual(@as(usize, 3), batch(&ranges, .{ .atlas_have = all_atlases, .halo = halo }, &out1));
 }
 
+test "a range's own halo colour wins over the scene background" {
+    var styled = quad(0, 6, .glyph);
+    styled.flags = t.Range.FLAG_HALO;
+    styled.halo = .{ 255, 128, 0, 255 };
+    const ranges = [_]t.Range{ quad(6, 6, .glyph), styled };
+    var out: [2]t.Draw = undefined;
+    // Different halos, so the two contiguous text ranges must NOT merge.
+    const n = batch(&ranges, .{ .atlas_have = all_atlases, .halo = halo }, &out);
+    try expectEqual(@as(usize, 2), n);
+    try expectEqual(halo, out[0].color);
+    try expectEqual(@as(f32, 1.0), out[1].color[0]);
+    try expectEqual(@as(f32, 128.0 / 255.0), out[1].color[1]);
+    try expectEqual(@as(f32, 0.0), out[1].color[2]);
+    // A halo colour never reaches a non-SDF draw.
+    var tris = tri(0, 3, false);
+    tris.flags = t.Range.FLAG_HALO;
+    tris.halo = .{ 255, 128, 0, 255 };
+    try expectEqual(@as(usize, 1), batch(&.{tris}, .{ .atlas_have = all_atlases, .halo = halo }, &out));
+    try expectEqual([4]f32{ 0, 0, 0, 0 }, out[0].color);
+}
+
 test "pattern ranges classify to the pattern pipeline and split on cell change" {
     var a = tri(0, 12, false);
     a.pattern = 0;
