@@ -1,0 +1,8 @@
+.{
+    .name = .charttable,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xf9efa2121e26fedc,
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "shaders", "include", "LICENSE", "THIRD-PARTY-NOTICES.md" },
+}

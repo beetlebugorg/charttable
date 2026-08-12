@@ -1,0 +1,62 @@
+{
+  "expression": [
+    "<",
+    [
+      "string",
+      [
+        "get",
+        "x"
+      ]
+    ],
+    [
+      "get",
+      "y"
+    ]
+  ],
+  "inputs": [
+    [
+      {},
+      {
+        "properties": {
+          "x": "1",
+          "y": "2"
+        }
+      }
+    ],
+    [
+      {},
+      {
+        "properties": {
+          "x": "1",
+          "y": 2
+        }
+      }
+    ],
+    [
+      {},
+      {
+        "properties": {
+          "x": 1,
+          "y": "2"
+        }
+      }
+    ]
+  ],
+  "expected": {
+    "compiled": {
+      "result": "success",
+      "isFeatureConstant": false,
+      "isZoomConstant": true,
+      "type": "boolean"
+    },
+    "outputs": [
+      true,
+      {
+        "error": "layers[0].paint.some-property: Expected value to be of type string, but found number instead."
+      },
+      {
+        "error": "layers[0].paint.some-property[1]: Expected value to be of type string, but found number instead."
+      }
+    ]
+  }
+}
