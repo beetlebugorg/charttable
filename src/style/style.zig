@@ -27,6 +27,7 @@
 const std = @import("std");
 const exprs = @import("expr.zig");
 const properties = @import("properties.zig");
+const compile = @import("compile.zig");
 const vals = @import("value.zig");
 
 pub const Value = vals.Value;
@@ -91,6 +92,11 @@ pub const LayerProp = struct {
     /// data-driven allowance.
     prop: *const properties.Prop,
     value: PropValue,
+    /// What this value varies with, from the expression's parse-time deps.
+    /// Decided once here so no later stage re-walks the tree to ask: it says
+    /// whether a change re-lays-out, refills the paint stream, or moves a
+    /// uniform (style/compile.zig Class).
+    class: compile.Class = .constant,
 };
 
 pub const Layer = struct {
@@ -340,7 +346,14 @@ fn parseSection(p: *P, list: *std.ArrayList(LayerProp), kind: LayerType, layer_i
             continue;
         }
         if (try parsePropValue(p, prop, layer_id, e.value_ptr.*)) |pv| {
-            try list.append(p.a, .{ .prop = prop, .value = pv });
+            try list.append(p.a, .{
+                .prop = prop,
+                .value = pv,
+                .class = switch (pv) {
+                    .constant => .constant,
+                    .expression => |parsed| compile.Class.of(parsed.deps),
+                },
+            });
         }
     }
 }

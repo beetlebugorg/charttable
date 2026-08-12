@@ -1208,7 +1208,7 @@ fn evalInterpolate(a: std.mem.Allocator, ip: Expr.Interp, ctx: *Context) Error!V
     return lerpValueSpace(a, va, vb, t, ip.space);
 }
 
-fn interpFactor(kind: exprs.InterpKind, x: f64, x0: f64, x1: f64) f64 {
+pub fn interpFactor(kind: exprs.InterpKind, x: f64, x0: f64, x1: f64) f64 {
     const range = x1 - x0;
     const linear_t = (x - x0) / range;
     return switch (kind) {
@@ -1244,7 +1244,7 @@ fn bez(p1: f64, p2: f64, t: f64) f64 {
     return 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t;
 }
 
-fn lerpValueSpace(a: std.mem.Allocator, va: Value, vb: Value, t: f64, space: Expr.ColorSpace) Error!Value {
+pub fn lerpValueSpace(a: std.mem.Allocator, va: Value, vb: Value, t: f64, space: Expr.ColorSpace) Error!Value {
     if (space != .rgb) {
         const ca: ?Color = switch (va) {
             .color => |c| c,
@@ -1271,7 +1271,7 @@ fn lerpValueSpace(a: std.mem.Allocator, va: Value, vb: Value, t: f64, space: Exp
 
 /// interpolate-hcl / interpolate-lab always yield colors: a clamped
 /// endpoint's string (or array-of-string) stop coerces before returning.
-fn coerceInterpOutput(a: std.mem.Allocator, v: Value, space: Expr.ColorSpace) Error!Value {
+pub fn coerceInterpOutput(a: std.mem.Allocator, v: Value, space: Expr.ColorSpace) Error!Value {
     if (space == .rgb) return v;
     switch (v) {
         .string => |s| {

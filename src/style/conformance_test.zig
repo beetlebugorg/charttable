@@ -50,6 +50,13 @@ const Score = struct {
     fail_output: usize = 0,
     flag_mismatch: usize = 0, // constancy flags disagree (informational)
     type_mismatch: usize = 0, // inferred type != compiled.type (informational)
+    /// Fixture inputs where style/compile.zig claimed the expression and
+    /// agreed with the interpreter.
+    compiled_ok: usize = 0,
+    /// Where it claimed the expression and DISAGREED. This is the compiled
+    /// tier's whole correctness standard, so it must stay 0: the compiler is
+    /// a performance tier over the interpreter, identical output or wrong.
+    compiled_mismatch: usize = 0,
 };
 
 /// The expected expression type a fixture's propertySpec pins, as the
@@ -135,7 +142,96 @@ const FixtureFeature = struct {
         }
         return false;
     }
+
+    // ---- the compiled tier's view of the same feature ----
+    // Slots resolve to indices into `keys` ONCE per program; the program
+    // then reads by integer, which is the point of compiling at all.
+
+    fn resolve(ctx: ?*const anyopaque, key: []const u8) u32 {
+        const self: *const FixtureFeature = @ptrCast(@alignCast(ctx.?));
+        for (self.keys, 0..) |k, i| {
+            if (std.mem.eql(u8, k, key)) return @intCast(i);
+        }
+        return compile_mod.NO_HANDLE;
+    }
+
+    fn slot(ptr: ?*const anyopaque, handle: u32) Value {
+        const self: *const FixtureFeature = @ptrCast(@alignCast(ptr.?));
+        if (handle >= self.values.len) return .null;
+        return self.values[handle];
+    }
+
+    fn slotHas(ptr: ?*const anyopaque, handle: u32) bool {
+        const self: *const FixtureFeature = @ptrCast(@alignCast(ptr.?));
+        return handle < self.keys.len;
+    }
 };
+
+const compile_mod = @import("compile.zig");
+
+/// Run the compiled tier beside the interpreter on one fixture input and
+/// score whether they agree. Expressions the compiler declines are not
+/// counted either way — declining is always correct.
+/// Flip to trace which expressions the compiled tier disagrees on. Off by
+/// default: the counter below is the gate, the print is the debugger.
+const dbg_mismatch = false;
+var dbg_expr: std.json.Value = .null;
+
+fn checkCompiled(
+    a: std.mem.Allocator,
+    score: *Score,
+    root: *const exprs.Expr,
+    feature: *const FixtureFeature,
+    fr: eval_mod.Feature,
+    ctx: *eval_mod.Context,
+) void {
+    // The oracle is eval() itself, NOT the harness's spec-wrapped
+    // evalWithSpec: a propertySpec injects an assertion the compiled tier
+    // never sees, and comparing against it would score the wrapper.
+    const want: ?Value = eval_mod.eval(a, root, ctx) catch null;
+    const zoom = ctx.zoom;
+    const prog = compile_mod.compile(a, root) catch return;
+    const handles = a.alloc(u32, prog.keyCount()) catch return;
+    prog.bind(FixtureFeature.resolve, feature, handles);
+    const regs = a.alloc(Value, @max(1, prog.regCount())) catch return;
+    var st = compile_mod.Run{
+        .zoom = zoom,
+        .fields = .{
+            .ptr = feature,
+            .get = FixtureFeature.slot,
+            .has = FixtureFeature.slotHas,
+            .geom = fr.geom,
+            .id = fr.id,
+        },
+        .handles = handles,
+        .regs = regs,
+    };
+    const got = compile_mod.run(a, &prog, &st);
+    if (dbg_mismatch) {
+        const shown = struct {
+            var n: usize = 0;
+        };
+        const agree = blk: {
+            const w = want orelse break :blk (if (got) |_| false else |_| true);
+            const v = got catch break :blk false;
+            break :blk v.eql(w);
+        };
+        if (!agree and shown.n < 25) {
+            shown.n += 1;
+            std.debug.print("  MISMATCH {f}\n", .{std.json.fmt(dbg_expr, .{})});
+        }
+    }
+    const expected = want orelse {
+        // The interpreter errored, so the program must too.
+        if (got) |_| score.compiled_mismatch += 1 else |_| score.compiled_ok += 1;
+        return;
+    };
+    const v = got catch {
+        score.compiled_mismatch += 1;
+        return;
+    };
+    if (v.eql(expected)) score.compiled_ok += 1 else score.compiled_mismatch += 1;
+}
 
 const geojson = @import("geojson.zig");
 
@@ -628,6 +724,10 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value, quantize
 
         const want_error = want == .object and want.object.get("error") != null;
         const got = evalWithSpec(a, parsed.root, &ctx, doc.object.get("propertySpec"));
+        // The compiled tier runs the SAME expression against the SAME input
+        // and must land on the same Value.
+        dbg_expr = expression;
+        checkCompiled(a, score, parsed.root, &feature, fr, &ctx);
         if (want_error) {
             if (got) |_| {
                 score.fail_output += 1;
@@ -693,9 +793,10 @@ test "spec expression conformance suite" {
     std.debug.print(
         "\nspec conformance: {d}/{d} pass ({d} skipped, {d} lenient-compile, " ++
             "{d} parse-fail, {d} output-fail, {d} constancy-flag mismatches, " ++
-            "{d} type-inference mismatches)\n" ++
+            "{d} type-inference mismatches, {d} compiled ok, " ++
+            "{d} compiled mismatches)\n" ++
             "full failure list: {s}\n",
-        .{ score.pass, score.total, score.skipped, score.lenient_compile, score.fail_parse, score.fail_output, score.flag_mismatch, score.type_mismatch, ct_build.report_path },
+        .{ score.pass, score.total, score.skipped, score.lenient_compile, score.fail_parse, score.fail_output, score.flag_mismatch, score.type_mismatch, score.compiled_ok, score.compiled_mismatch, ct_build.report_path },
     );
     // The detailed list goes to a file: hundreds of stderr lines from inside
     // a test upset the build runner's status stream, and a file diffs.
@@ -707,4 +808,9 @@ test "spec expression conformance suite" {
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ct_build.report_path, .data = report.items }) catch {};
 
     try std.testing.expect(score.pass >= PASS_FLOOR);
+    // The compiled tier's whole correctness standard. It is allowed to
+    // DECLINE an expression (the interpreter then runs it), but never to
+    // answer differently from the interpreter on one it claimed.
+    try std.testing.expectEqual(@as(usize, 0), score.compiled_mismatch);
+    try std.testing.expect(score.compiled_ok > 300);
 }

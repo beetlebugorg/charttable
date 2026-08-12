@@ -19,6 +19,7 @@ pub const expr = @import("style/expr.zig");
 pub const eval = @import("style/eval.zig");
 pub const properties = @import("style/properties.zig");
 pub const style = @import("style/style.zig");
+pub const compile = @import("style/compile.zig");
 pub const coord = @import("source/coord.zig");
 pub const mvt = @import("source/mvt.zig");
 pub const mlt = @import("source/mlt.zig");
@@ -54,6 +55,7 @@ test {
     _ = eval;
     _ = properties;
     _ = style;
+    _ = compile;
     _ = coord;
     _ = mvt;
     _ = mlt;
