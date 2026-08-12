@@ -1804,6 +1804,181 @@ test "buildScene: a pattern fill splits into one range per cell" {
     try std.testing.expectEqualStrings("pat:absent", b2.missing_images[0]);
 }
 
+// The overscale hatch, AP(OVERSC01), on charttable's side of the line.
+//
+// A real archive cannot exercise this: tile57's baker emits the OVERSC01
+// coverage only where a strictly finer cell rides the same tile
+// (scene/bake_enc.zig), and a merged multi-cell archive is not something it
+// produces — a bundle is per-cell PMTiles plus a partition served by a
+// runtime compositor. WHEN the feature appears is tile57's decision and is
+// tested there; what charttable owns is that a feature carrying it draws as
+// a pattern over the fills. So the feature is synthesized here and the
+// style clause is the real one from tile57's generated style.
+test "buildScene: the overscale hatch draws over the fills, not instead of them" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const png = @import("util/png.zig");
+    // A 4x4 cell that is mostly transparent, like a real hatch.
+    const sheet_px = try a.alloc(u8, 4 * 4 * 4);
+    @memset(sheet_px, 0);
+    sheet_px[0..4].* = .{ 255, 0, 255, 255 };
+    const sheet = try png.encode(a, sheet_px, 4, 4);
+    var sprite = try sprites.Sprite.load(
+        std.testing.allocator,
+        "{\"pat:OVERSC01\": {\"x\": 0, \"y\": 0, \"width\": 4, \"height\": 4, \"pixelRatio\": 1}}",
+        sheet,
+    );
+    defer sprite.deinit();
+
+    const square = try a.dupe(mvt.Point, &.{
+        .{ .x = 0, .y = 0 }, .{ .x = 4096, .y = 0 }, .{ .x = 4096, .y = 4096 }, .{ .x = 0, .y = 4096 },
+    });
+    const tile = mvt.Tile{ .layers = try a.dupe(mvt.Layer, &.{
+        .{
+            .name = "areas",
+            .features = try a.dupe(mvt.Feature, &.{
+                .{ .geom_type = .polygon, .parts = try a.dupe([]const mvt.Point, &.{square}) },
+            }),
+        },
+        .{
+            .name = "area_patterns",
+            .keys = try a.dupe([]const u8, &.{ "pattern_name", "oz" }),
+            .values = try a.dupe(mvt.Value, &.{ .{ .string = "OVERSC01" }, .{ .double = 15.23 } }),
+            .features = try a.dupe(mvt.Feature, &.{
+                .{
+                    .geom_type = .polygon,
+                    .parts = try a.dupe([]const mvt.Point, &.{square}),
+                    .tags = try a.dupe(u32, &.{ 0, 0, 1, 1 }),
+                },
+            }),
+        },
+    }) };
+
+    // The water fill under the hatch, then the overscale layer with the
+    // filter tile57 generates: pattern_name == OVERSC01 AND zoom > oz.
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [
+        \\   {"id": "fill-areas", "type": "fill", "source": "chart",
+        \\    "source-layer": "areas", "paint": {"fill-color": "#82caff"}},
+        \\   {"id": "overscale", "type": "fill", "source": "chart",
+        \\    "source-layer": "area_patterns",
+        \\    "filter": ["all", ["==", ["get", "pattern_name"], "OVERSC01"],
+        \\               [">", ["zoom"], ["coalesce", ["get", "oz"], 99]]],
+        \\    "paint": {"fill-pattern": "pat:OVERSC01"}}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+    const id = coord.TileId{ .z = 16, .x = 0, .y = 0 };
+    const rect = id.worldRect();
+    const origin = cameras.Vec2{ .x = rect.x0, .y = rect.y0 };
+
+    // Below the cell's own oz: the hatch stays off and only the fill draws.
+    const under = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 15,
+        .origin = origin,
+    }, .{ .sprite = &sprite });
+    try std.testing.expectEqual(@as(usize, 1), under.ranges.len);
+    try std.testing.expectEqual(types.Kind.area, under.ranges[0].kind);
+
+    // Past it: the hatch draws OVER the fill, and the fill is still there.
+    const over = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 16,
+        .origin = origin,
+    }, .{ .sprite = &sprite });
+    try std.testing.expectEqual(@as(usize, 2), over.ranges.len);
+    try std.testing.expectEqual(types.Kind.area, over.ranges[0].kind);
+    try std.testing.expectEqual(types.Kind.pattern, over.ranges[1].kind);
+    // Later paint key, so it draws after the fill...
+    try std.testing.expect(over.ranges[1].paint_key > over.ranges[0].paint_key);
+    // ...and it must blend rather than join the opaque pre-pass, or a
+    // mostly-transparent cell would bury what it decorates.
+    try std.testing.expectEqual(@as(u8, 0), over.ranges[1].flags & types.Range.FLAG_OPAQUE);
+    try std.testing.expect(over.ranges[0].flags & types.Range.FLAG_OPAQUE != 0);
+    try std.testing.expectEqual(@as(usize, 1), over.patterns.len);
+}
+
+// A point symbol's anchor must land exactly on the feature's world
+// position, with the sprite cell centered on it (the spec's default
+// icon-anchor). Checked numerically rather than against tile57's `png`
+// output: that tool renders tile57's OWN S-52 portrayal and takes no
+// --style, so it is an oracle for fill colours (same palette, same
+// expressions) and never was one for symbol geometry.
+test "buildScene: a point symbol anchors exactly on its feature" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const png = @import("util/png.zig");
+    const sheet_px = try a.alloc(u8, 8 * 8 * 4);
+    @memset(sheet_px, 255);
+    const sheet = try png.encode(a, sheet_px, 8, 8);
+    var sprite = try sprites.Sprite.load(
+        std.testing.allocator,
+        "{\"dot\": {\"x\": 0, \"y\": 0, \"width\": 8, \"height\": 8, \"pixelRatio\": 2}}",
+        sheet,
+    );
+    defer sprite.deinit();
+
+    // One point at a quarter across the tile, three quarters down.
+    const pt = try a.dupe(mvt.Point, &.{.{ .x = 1024, .y = 3072 }});
+    const tile = mvt.Tile{ .layers = try a.dupe(mvt.Layer, &.{.{
+        .name = "marks",
+        .features = try a.dupe(mvt.Feature, &.{
+            .{ .geom_type = .point, .parts = try a.dupe([]const mvt.Point, &.{pt}) },
+        }),
+    }}) };
+
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "marks", "type": "symbol", "source": "chart",
+        \\   "source-layer": "marks",
+        \\   "layout": {"icon-image": "dot", "icon-allow-overlap": true}}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+
+    const id = coord.TileId{ .z = 10, .x = 300, .y = 400 };
+    const rect = id.worldRect();
+    const span = rect.x1 - rect.x0;
+    // Build against the tile's own corner so the expected anchor is exact.
+    const built = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 10,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{ .sprite = &sprite });
+
+    try std.testing.expectEqual(@as(usize, 6), built.quads.len);
+    const want_x: f32 = @floatCast(1024.0 / 4096.0 * span);
+    const want_y: f32 = @floatCast(3072.0 / 4096.0 * span);
+    for (built.quads) |q| {
+        // Every corner shares the anchor; only the offsets differ.
+        try std.testing.expectApproxEqAbs(want_x, q.x, 1e-9);
+        try std.testing.expectApproxEqAbs(want_y, q.y, 1e-9);
+    }
+    // 8 px at pixelRatio 2 is 4 logical px, centered: offsets span -2..+2.
+    var min_ox: f32 = std.math.floatMax(f32);
+    var max_ox: f32 = -std.math.floatMax(f32);
+    var min_oy: f32 = std.math.floatMax(f32);
+    var max_oy: f32 = -std.math.floatMax(f32);
+    for (built.quads) |q| {
+        min_ox = @min(min_ox, q.ox);
+        max_ox = @max(max_ox, q.ox);
+        min_oy = @min(min_oy, q.oy);
+        max_oy = @max(max_oy, q.oy);
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, -2), min_ox, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), max_ox, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, -2), min_oy, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), max_oy, 1e-5);
+    // A point placement is viewport-aligned by default (rotation-alignment
+    // "auto"), so a turning view must NOT turn it.
+    for (built.quads) |q| try std.testing.expectEqual(@as(u8, 0), q.flags & types.Flags.map_align);
+}
+
 test "buildScene: line-placed symbols follow the line, point layers do not" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
