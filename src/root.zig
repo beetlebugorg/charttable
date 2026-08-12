@@ -25,6 +25,7 @@ pub const mvt = @import("source/mvt.zig");
 pub const mlt = @import("source/mlt.zig");
 pub const pmtiles = @import("source/pmtiles.zig");
 pub const cache = @import("source/cache.zig");
+pub const provider = @import("source/provider.zig");
 pub const fill = @import("layout/fill.zig");
 pub const line = @import("layout/line.zig");
 pub const sprite = @import("symbol/sprite.zig");
@@ -61,6 +62,7 @@ test {
     _ = mlt;
     _ = pmtiles;
     _ = cache;
+    _ = provider;
     _ = fill;
     _ = line;
     _ = sprite;

@@ -29,6 +29,7 @@ const Allocator = std.mem.Allocator;
 const styles = @import("style/style.zig");
 const map = @import("map.zig");
 const caches = @import("source/cache.zig");
+const providers = @import("source/provider.zig");
 const coord = @import("source/coord.zig");
 const cameras = @import("camera.zig");
 const types = @import("scene/types.zig");
@@ -299,6 +300,26 @@ pub const Map = struct {
             if (std.mem.eql(u8, l.id, layer_id)) return @intCast(i);
         }
         return null;
+    }
+
+    /// Bind a style source name to a host-supplied resource provider. The
+    /// provider must outlive the Map; its tiles arrive asynchronously and
+    /// park until they do.
+    pub fn bindProvider(self: *Map, name: []const u8, p: *providers.Provider) !usize {
+        if (self.style) |*s| {
+            if (s.sources.get(name)) |src| switch (src) {
+                .vector => |v| {
+                    p.encoding = caches.Encoding.parse(v.encoding);
+                    p.kind = .vector;
+                    p.maxzoom = @intFromFloat(std.math.clamp(v.maxzoom, 0, 22));
+                },
+                .raster => |r| {
+                    p.kind = .raster;
+                    p.maxzoom = @intFromFloat(std.math.clamp(r.maxzoom, 0, 22));
+                },
+            };
+        }
+        return self.bindSource(name, p.source());
     }
 
     /// Symbol assets. Changing them re-lays-out (an icon that was missing may

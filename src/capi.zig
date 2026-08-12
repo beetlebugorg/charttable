@@ -25,6 +25,7 @@ const builtin = @import("builtin");
 const map_object = @import("map_object.zig");
 const caches = @import("source/cache.zig");
 const pmtiles = @import("source/pmtiles.zig");
+const providers = @import("source/provider.zig");
 const sprites = @import("symbol/sprite.zig");
 const glyphs = @import("symbol/glyphs.zig");
 const cameras = @import("camera.zig");
@@ -69,6 +70,20 @@ pub const View = extern struct {
 /// recursive-safe here because the callback runs OUTSIDE the lock).
 pub const MissingImageFn = *const fn (name: [*:0]const u8, user: ?*anyopaque) callconv(.c) void;
 
+/// Called when charttable needs tile bytes it cannot get itself. Answer with
+/// charttable_resource_respond, at any time and from any thread — the
+/// request PARKS until you do, and a slow answer never becomes a permanently
+/// missing tile. Answering from inside the callback is supported (it runs
+/// outside the handle's lock).
+pub const ResourceFn = *const fn (
+    req_id: u64,
+    source: [*:0]const u8,
+    z: u32,
+    x: u32,
+    y: u32,
+    user: ?*anyopaque,
+) callconv(.c) void;
+
 const Handle = struct {
     gpa: std.mem.Allocator,
     mu: Lock = .{},
@@ -79,6 +94,13 @@ const Handle = struct {
 
     /// Archives the handle opened and therefore owns.
     archives: std.ArrayListUnmanaged(*Archive) = .empty,
+    /// Host-backed sources, likewise owned. The name travels with each one
+    /// so a request can tell the host WHICH source it is for.
+    provided: std.ArrayListUnmanaged(*Provided) = .empty,
+    on_resource: ?ResourceFn = null,
+    resource_user: ?*anyopaque = null,
+    /// Scratch for draining asks, so a tick allocates nothing new.
+    asks: std.ArrayListUnmanaged(providers.Request) = .empty,
 
     sprite: ?sprites.Sprite = null,
     glyph_atlas: ?glyphs.GlyphAtlas = null,
@@ -98,6 +120,11 @@ const Handle = struct {
     const Archive = struct {
         reader: pmtiles.Reader,
         src: caches.PmtilesSource,
+    };
+
+    const Provided = struct {
+        provider: providers.Provider,
+        name: [:0]u8,
     };
 };
 
@@ -141,6 +168,13 @@ export fn charttable_close(h: ?*anyopaque) callconv(.c) void {
         self.gpa.destroy(ar);
     }
     self.archives.deinit(self.gpa);
+    for (self.provided.items) |pr| {
+        pr.provider.deinit();
+        self.gpa.free(pr.name);
+        self.gpa.destroy(pr);
+    }
+    self.provided.deinit(self.gpa);
+    self.asks.deinit(self.gpa);
     if (self.sprite) |*s| s.deinit();
     if (self.glyph_atlas) |*a| a.deinit();
     var it = self.reported.keyIterator();
@@ -337,6 +371,73 @@ fn setErr(e: anyerror) c_int {
     };
 }
 
+/// Route a style source name through the host. Every tile of that source
+/// becomes a callback, answered by charttable_resource_respond.
+export fn charttable_add_source_provided(h: ?*anyopaque, name: [*:0]const u8) callconv(.c) c_int {
+    const self = locked(h) orelse return ERR_HANDLE;
+    defer self.mu.unlock();
+    const pr = self.gpa.create(Handle.Provided) catch return ERR_MEMORY;
+    errdefer self.gpa.destroy(pr);
+    pr.name = self.gpa.dupeZ(u8, std.mem.span(name)) catch return ERR_MEMORY;
+    pr.provider = providers.Provider.init(self.gpa);
+    self.provided.append(self.gpa, pr) catch {
+        self.gpa.free(pr.name);
+        return ERR_MEMORY;
+    };
+    _ = self.m.bindProvider(std.mem.span(name), &pr.provider) catch return ERR_MEMORY;
+    return OK;
+}
+
+export fn charttable_set_resource_provider(
+    h: ?*anyopaque,
+    cb: ?ResourceFn,
+    user: ?*anyopaque,
+) callconv(.c) void {
+    const self = locked(h) orelse return;
+    defer self.mu.unlock();
+    self.on_resource = cb;
+    self.resource_user = user;
+}
+
+/// Answer one request. `status` is 0 for bytes, 1 for "no tile there", 2 for
+/// "I tried and failed". Only 0 reads `bytes`, which is copied before this
+/// returns. An unknown or already-answered id is ignored.
+export fn charttable_resource_respond(
+    h: ?*anyopaque,
+    req_id: u64,
+    bytes: ?[*]const u8,
+    len: usize,
+    status: c_int,
+) callconv(.c) void {
+    const self = locked(h) orelse return;
+    defer self.mu.unlock();
+    const st: providers.Status = switch (status) {
+        0 => .ok,
+        1 => .empty,
+        else => .failed,
+    };
+    const slice: []const u8 = if (st == .ok and bytes != null) bytes.?[0..len] else &.{};
+    for (self.provided.items) |pr| pr.provider.respond(req_id, slice, st);
+}
+
+/// Hand the host every ask raised since the last call. Runs OUTSIDE the
+/// lock so the callback may answer immediately.
+fn pumpResources(self: *Handle) void {
+    const cb = self.on_resource orelse return;
+    const user = self.resource_user;
+    for (self.provided.items) |pr| {
+        self.asks.clearRetainingCapacity();
+        pr.provider.drain(&self.asks, self.gpa);
+        if (self.asks.items.len == 0) continue;
+        const batch = self.asks.toOwnedSlice(self.gpa) catch continue;
+        defer self.gpa.free(batch);
+        const name = pr.name;
+        self.mu.unlock();
+        for (batch) |r| cb(r.id, name.ptr, r.z, r.x, r.y, user);
+        self.mu.lock();
+    }
+}
+
 // ---- images ----------------------------------------------------------------
 
 export fn charttable_set_missing_image_callback(
@@ -495,6 +596,7 @@ export fn charttable_tick(h: ?*anyopaque, dt_ms: f64) callconv(.c) c_int {
     if (dt_ms > 0) self.m.cam.tick(dt_ms / 1000.0);
     _ = self.m.update() catch return ERR_MEMORY;
     collectMissing(self);
+    pumpResources(self);
     return OK;
 }
 
@@ -641,6 +743,76 @@ test "capi: every entry point is null-safe" {
     charttable_close(null);
     charttable_pan(null, 1, 1);
     charttable_set_view(null, null);
+}
+
+// The host-provided source, end to end through the ABI: the map asks, the
+// host answers late, and the tile lands. A slow answer must never become a
+// permanently missing tile.
+const ResourceProbe = struct {
+    var map_handle: ?*anyopaque = null;
+    var seen: usize = 0;
+    var last_source: [64]u8 = @splat(0);
+    var tile_bytes: []const u8 = &.{};
+
+    fn onResource(req_id: u64, source: [*:0]const u8, z: u32, x: u32, y: u32, user: ?*anyopaque) callconv(.c) void {
+        _ = user;
+        _ = z;
+        _ = x;
+        _ = y;
+        seen += 1;
+        const name = std.mem.span(source);
+        @memcpy(last_source[0..@min(name.len, last_source.len)], name[0..@min(name.len, last_source.len)]);
+        // Answering from inside the callback is supported: the handle's lock
+        // is released around it.
+        charttable_resource_respond(map_handle, req_id, tile_bytes.ptr, tile_bytes.len, 0);
+    }
+};
+
+test "capi: a provided source parks, then lands when the host answers" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // The smallest MVT that decodes: one layer, no features.
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    try buf.appendSlice(a, &.{ 3 << 3 | 2, 12 });
+    try buf.appendSlice(a, &.{ 15 << 3 | 0, 2 });
+    try buf.appendSlice(a, &.{ 1 << 3 | 2, 5 });
+    try buf.appendSlice(a, "areas");
+    try buf.appendSlice(a, &.{ 5 << 3 | 0, 0x80, 0x20 });
+
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"remote": {"type": "vector", "tiles": ["https://x/{z}/{x}/{y}"], "maxzoom": 14}},
+        \\ "layers": [{"id": "bg", "type": "background",
+        \\   "paint": {"background-color": "#000000"}}]}
+    ;
+    const h = charttable_open(&.{ .workers = 2 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+    ResourceProbe.map_handle = h;
+    ResourceProbe.seen = 0;
+    ResourceProbe.tile_bytes = buf.items;
+
+    try testing.expectEqual(OK, charttable_set_style_json(h, style.ptr, style.len));
+    charttable_set_resource_provider(h, ResourceProbe.onResource, null);
+    try testing.expectEqual(OK, charttable_add_source_provided(h, "remote"));
+    try testing.expectEqual(OK, charttable_resize(h, 512, 512));
+    var v = View{ .lon = -76.4767, .lat = 38.9763, .zoom = 14 };
+    charttable_set_view(h, &v);
+
+    var spins: usize = 0;
+    while (spins < 3000 and charttable_idle(h) == 0) : (spins += 1) {
+        _ = charttable_tick(h, 16);
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try testing.expectEqual(@as(c_int, 1), charttable_idle(h));
+    try testing.expect(ResourceProbe.seen > 0);
+    try testing.expectEqualStrings("remote", std.mem.sliceTo(&ResourceProbe.last_source, 0));
+    try testing.expectEqual(@as(u32, 0), charttable_pending_tiles(h));
+
+    // A stray response is ignored rather than fatal.
+    charttable_resource_respond(h, 999999, null, 0, 1);
+    try testing.expectEqual(OK, charttable_tick(h, 16));
 }
 
 test "capi: a bad style is refused and the old one stands" {

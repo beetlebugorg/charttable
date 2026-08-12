@@ -115,6 +115,33 @@ int charttable_set_filter(charttable *, const char *layer,
 
 int charttable_set_layer_visibility(charttable *, const char *layer, int on);
 
+/* ---- host-supplied resources -------------------------------------------- */
+
+/* Called when charttable needs tile bytes it cannot fetch itself. Answer with
+ * charttable_resource_respond, at any time and from any thread: the request
+ * PARKS until you do, and a slow answer never becomes a permanently missing
+ * tile. Answering from inside this callback is supported. */
+typedef void (*charttable_resource_fn)(uint64_t req_id, const char *source,
+                                       uint32_t z, uint32_t x, uint32_t y,
+                                       void *user);
+
+void charttable_set_resource_provider(charttable *, charttable_resource_fn cb,
+                                      void *user);
+
+/* Route a style source name through the host: every tile of that source
+ * becomes a callback. */
+int charttable_add_source_provided(charttable *, const char *name);
+
+/* Answer one request. status 0 = bytes attached, 1 = no tile there, 2 = tried
+ * and failed. Only status 0 reads `bytes`, which is copied before this
+ * returns. Statuses 1 and 2 are remembered; a DELAY never is. An unknown or
+ * already-answered id is ignored. */
+#define CHARTTABLE_RESOURCE_OK 0
+#define CHARTTABLE_RESOURCE_EMPTY 1
+#define CHARTTABLE_RESOURCE_FAILED 2
+void charttable_resource_respond(charttable *, uint64_t req_id,
+                                 const uint8_t *bytes, size_t len, int status);
+
 /* ---- images ------------------------------------------------------------- */
 
 /* The style's sprite sheet: MapLibre sprite index JSON + its PNG. Replaces
