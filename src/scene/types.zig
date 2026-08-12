@@ -231,6 +231,37 @@ pub fn abiLayout() u32 {
         (@as(u32, @sizeOf(Range)) << 16) | (@as(u32, @sizeOf(Uniforms)) << 24);
 }
 
+// The GLSL in shaders/vk declares these offsets by hand (there is no vertex
+// descriptor generated from this file), and so does every backend that binds
+// the streams. A silent drift here shades wrong rather than failing, so pin
+// them: shaders/vk/README.md carries the same table.
+test "vertex attribute offsets match what the shaders declare" {
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Vertex, "x"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(Vertex, "ox"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Vertex, "zmin"));
+    try std.testing.expectEqual(@as(usize, 18), @offsetOf(Vertex, "zmax"));
+    try std.testing.expectEqual(@as(usize, 20), @offsetOf(Vertex, "flags"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(Vertex, "depth"));
+
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Quad, "x"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(Quad, "ox"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(Quad, "u"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(Quad, "weight"));
+    try std.testing.expectEqual(@as(usize, 28), @offsetOf(Quad, "zmin"));
+    try std.testing.expectEqual(@as(usize, 30), @offsetOf(Quad, "zmax"));
+    // The shaders read one R32_UINT here and unpack it: flags in byte 0,
+    // flip in byte 1, tangent_q in byte 2.
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(Quad, "flags"));
+    try std.testing.expectEqual(@as(usize, 33), @offsetOf(Quad, "flip"));
+    try std.testing.expectEqual(@as(usize, 34), @offsetOf(Quad, "tangent_q"));
+    try std.testing.expectEqual(@as(usize, 36), @offsetOf(Quad, "depth"));
+
+    // And the zoom window really is one 32-bit word: zmin low, zmax high.
+    const v = Vertex{ .x = 0, .y = 0, .ox = 0, .oy = 0, .zmin = 0x1234, .zmax = 0x5678, .flags = 1, .depth = 0 };
+    const word = std.mem.bytesAsValue(u32, std.mem.asBytes(&v)[16..20]).*;
+    try std.testing.expectEqual(@as(u32, 0x5678_1234), word);
+}
+
 test "zq quantizes and saturates" {
     try std.testing.expectEqual(@as(u16, 0), zq(-1.0));
     try std.testing.expectEqual(@as(u16, 0), zq(0.0));
