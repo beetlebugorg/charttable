@@ -43,6 +43,8 @@ pub const Built = struct {
     quads: []const types.Quad = &.{},
     quad_paint: []const types.PaintVertex = &.{},
     ranges: []const types.Range = &.{},
+    /// Area-fill pattern cells, indexed by Range.pattern.
+    patterns: []const types.PatternCell = &.{},
     background: Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     /// icon-image names the sprite could not resolve, deduplicated — the
     /// missing-image hook: the host renders them (tile57_render_symbol_run
@@ -145,6 +147,84 @@ fn asNum(v: Value, fallback: f64) f64 {
     };
 }
 
+fn strProp(sl: *const styles.Layer, name: []const u8, arena: std.mem.Allocator, ctx: *eval_mod.Context, errors: *usize) ?[]const u8 {
+    const v = evalProp(arena, resolveProp(sl, name) orelse return null, ctx, .null, errors);
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Spec symbol-placement.
+const Placement = enum {
+    point,
+    line,
+    line_center,
+
+    fn parse(s: []const u8) Placement {
+        if (std.mem.eql(u8, s, "line")) return .line;
+        if (std.mem.eql(u8, s, "line-center")) return .line_center;
+        return .point;
+    }
+
+    fn isLine(self: Placement) bool {
+        return self != .point;
+    }
+};
+
+/// Spec icon/text-rotation-alignment, with "auto" resolved: "When
+/// symbol-placement is set to point, this is equivalent to viewport. When
+/// set to line or line-center, this is equivalent to map."
+fn mapAligned(sl: *const styles.Layer, name: []const u8, placement: Placement, arena: std.mem.Allocator, ctx: *eval_mod.Context, errors: *usize) bool {
+    const s = strProp(sl, name, arena, ctx, errors) orelse "auto";
+    if (std.mem.eql(u8, s, "map")) return true;
+    if (std.mem.eql(u8, s, "viewport")) return false;
+    return placement.isLine();
+}
+
+/// Copy one sprite cell out of the sheet as an area-fill pattern cell,
+/// rescaled from atlas px to its ON-SCREEN period (scene.PatternCell: w and
+/// h ARE that period). Chart pattern cells are baked at ~2.8x, so the
+/// downscale is a box filter over the source footprint — a nearest-neighbour
+/// pick drops whole hatch strokes at that ratio.
+fn patternCell(arena: std.mem.Allocator, sp: *const sprites.Sprite, name: []const u8) ?types.PatternCell {
+    const rect = sp.cell(name) orelse return null;
+    if (rect.w == 0 or rect.h == 0 or !(rect.pixel_ratio > 0)) return null;
+    const ratio: f64 = rect.pixel_ratio;
+    const dw: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(rect.w)) / ratio))));
+    const dh: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(rect.h)) / ratio))));
+    const out = arena.alloc(u8, @as(usize, dw) * dh * 4) catch return null;
+
+    for (0..dh) |dy| {
+        // Source rows this destination row averages over.
+        const sy0: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(dy)) * @as(f64, @floatFromInt(rect.h)) / @as(f64, @floatFromInt(dh))));
+        const sy1: u32 = @max(sy0 + 1, @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(dy + 1)) * @as(f64, @floatFromInt(rect.h)) / @as(f64, @floatFromInt(dh))))));
+        for (0..dw) |dx| {
+            const sx0: u32 = @intFromFloat(@floor(@as(f64, @floatFromInt(dx)) * @as(f64, @floatFromInt(rect.w)) / @as(f64, @floatFromInt(dw))));
+            const sx1: u32 = @max(sx0 + 1, @as(u32, @intFromFloat(@floor(@as(f64, @floatFromInt(dx + 1)) * @as(f64, @floatFromInt(rect.w)) / @as(f64, @floatFromInt(dw))))));
+            var acc: [4]u32 = .{ 0, 0, 0, 0 };
+            var n: u32 = 0;
+            var sy = sy0;
+            while (sy < @min(sy1, rect.h)) : (sy += 1) {
+                var sx = sx0;
+                while (sx < @min(sx1, rect.w)) : (sx += 1) {
+                    const off = (@as(usize, rect.y + sy) * sp.width + rect.x + sx) * 4;
+                    if (off + 4 > sp.rgba.len) continue;
+                    inline for (0..4) |c| acc[c] += sp.rgba[off + c];
+                    n += 1;
+                }
+            }
+            const dst = (@as(usize, dy) * dw + dx) * 4;
+            if (n == 0) {
+                out[dst..][0..4].* = .{ 0, 0, 0, 0 };
+            } else {
+                inline for (0..4) |c| out[dst + c] = @intCast(acc[c] / n);
+            }
+        }
+    }
+    return .{ .w = dw, .h = dh, .rgba = out };
+}
+
 /// Paint-order depth for style layer `i` of `n`: later paint = smaller,
 /// never 0 (0 always passes the depth test regardless of order).
 fn layerDepth(i: usize, n: usize) f32 {
@@ -173,6 +253,10 @@ pub fn buildScene(
     var quads: std.ArrayList(types.Quad) = .empty;
     var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
     var ranges: std.ArrayList(types.Range) = .empty;
+    var patterns: std.ArrayList(types.PatternCell) = .empty;
+    // Pattern image name -> index into `patterns`; a name that resolved to no
+    // cell is remembered as NO_PATTERN so the sheet is walked once per name.
+    var pattern_ids: std.StringHashMapUnmanaged(u32) = .empty;
     var missing: std.StringArrayHashMapUnmanaged(void) = .empty;
     var collider = symbol.Collider.init(arena);
     // Projection of a world anchor to reference px for collision boxes; the
@@ -205,7 +289,38 @@ pub fn buildScene(
         const source_layer = sl.source_layer orelse continue;
         const depth = layerDepth(layer_i, n_layers);
         const band = 1.0 / @as(f32, @floatFromInt(n_layers + 1));
-        const sort_prop = resolveProp(sl, if (sl.kind == .fill) "fill-sort-key" else "line-sort-key");
+        const sort_prop = resolveProp(sl, switch (sl.kind) {
+            .fill => "fill-sort-key",
+            .line => "line-sort-key",
+            else => "symbol-sort-key",
+        });
+
+        // Layer-wide symbol settings: none of these are data-driven, so they
+        // resolve once per layer instead of once per feature.
+        var placement: Placement = .point;
+        var sym: SymbolLayer = undefined;
+        if (sl.kind == .symbol) {
+            if (strProp(sl, "symbol-placement", arena, &ctx, &out.eval_errors)) |p| placement = Placement.parse(p);
+            sym = .{
+                .placement = placement,
+                .spacing_px = asNum(evalProp(arena, resolveProp(sl, "symbol-spacing").?, &ctx, .{ .number = 250 }, &out.eval_errors), 250),
+                .max_angle_deg = @floatCast(asNum(evalProp(arena, resolveProp(sl, "text-max-angle").?, &ctx, .{ .number = 45 }, &out.eval_errors), 45)),
+                .icon_map_align = mapAligned(sl, "icon-rotation-alignment", placement, arena, &ctx, &out.eval_errors),
+                .text_map_align = mapAligned(sl, "text-rotation-alignment", placement, arena, &ctx, &out.eval_errors),
+                .allow_overlap = boolProp(sl, "icon-allow-overlap", arena, &ctx, &out.eval_errors) or
+                    boolProp(sl, "text-allow-overlap", arena, &ctx, &out.eval_errors),
+                .ignore_placement = boolProp(sl, "icon-ignore-placement", arena, &ctx, &out.eval_errors),
+                .text_allow_overlap = boolProp(sl, "text-allow-overlap", arena, &ctx, &out.eval_errors),
+                .halo = null,
+            };
+            if (sl.get("text-halo-color") != null) {
+                if (asColor(evalProp(arena, resolveProp(sl, "text-halo-color").?, &ctx, .null, &out.eval_errors))) |c| sym.halo = c;
+            }
+        }
+        // A pattern fill resolves its cell per feature (fill-pattern is
+        // data-driven: tile57 concats "pat:" onto a feature property), so the
+        // layer's triangles split into one range per distinct cell.
+        const is_pattern = sl.kind == .fill and sl.get("fill-pattern") != null;
 
         for (tiles) |st| {
             const tl = st.tile.layer(source_layer) orelse continue;
@@ -220,8 +335,11 @@ pub fn buildScene(
             const px_per_unit = 512.0 * std.math.pow(f64, 2.0, view.zoom);
 
             const first_index: u32 = @intCast(indices.items.len);
-            const first_vert: u32 = @intCast(verts.items.len);
             var all_opaque = true;
+            // Pattern-fill run state: the layer's triangles split into one
+            // range per distinct cell (a draw binds exactly one cell texture).
+            var run_first: u32 = first_index;
+            var run_pattern: u32 = types.NO_PATTERN;
 
             // Admit features (filter + geometry), evaluating the layer's
             // sort key; draw order within the layer is ascending key, and
@@ -233,8 +351,9 @@ pub fn buildScene(
                 switch (sl.kind) {
                     .fill => if (f.geom_type != .polygon) continue,
                     .line => if (f.geom_type != .linestring and f.geom_type != .polygon) continue,
-                    // point placement; symbol-placement line decoration is later work
-                    .symbol => if (f.geom_type != .point) continue,
+                    .symbol => if (placement.isLine()) {
+                        if (f.geom_type != .linestring and f.geom_type != .polygon) continue;
+                    } else if (f.geom_type != .point) continue,
                     else => unreachable,
                 }
                 var mf = MvtFeature{ .layer = tl, .feature = f };
@@ -273,22 +392,43 @@ pub fn buildScene(
                             .dx = dx,
                             .dy = dy,
                             .tile_extent = tl.extent,
+                            .tile_span = tile_span,
                             .world_to_px = world_to_px,
-                            .view = view,
+                            .px_per_unit = px_per_unit,
+                            .sym = sym,
                             .depth = feat_depth,
                         }, &quads, &quad_paint, &text_scratch, &text_paint_scratch, &collider, &missing, &out.eval_errors);
                         continue;
                     },
                     .fill => {
-                        // A pattern fill draws its cell texture, not a flat
-                        // color; until the pattern pipeline is wired into
-                        // the build, emitting it as flat color would bury
-                        // the layers beneath. Skip.
-                        if (sl.get("fill-pattern") != null) continue;
-                        const cv = evalProp(arena, resolveProp(sl, "fill-color").?, &ctx, .null, &out.eval_errors);
-                        color = asColor(cv) orelse continue;
-                        const ov = evalProp(arena, resolveProp(sl, "fill-opacity").?, &ctx, .{ .number = 1 }, &out.eval_errors);
-                        color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
+                        if (is_pattern) {
+                            // The cell this feature names, resolved once per
+                            // name. An unresolvable name draws NOTHING: a
+                            // flat polygon would bury the fills the hatch was
+                            // meant to overlay (the bug the old skip hid).
+                            const want = patternFor(arena, sl, &ctx, assets, &patterns, &pattern_ids, &missing, &out.eval_errors);
+                            if (want == types.NO_PATTERN) continue;
+                            if (want != run_pattern and indices.items.len > run_first) {
+                                try ranges.append(arena, .{
+                                    .first = run_first,
+                                    .count = @intCast(indices.items.len - run_first),
+                                    .paint_key = @intCast(layer_i),
+                                    .pattern = run_pattern,
+                                    .kind = .pattern,
+                                    .prim = .triangles,
+                                });
+                                run_first = @intCast(indices.items.len);
+                            }
+                            run_pattern = want;
+                            // Stream B rides along to keep the two streams
+                            // parallel; the pattern pipeline ignores it.
+                            color = .{ .r = 1, .g = 1, .b = 1, .a = 1 };
+                        } else {
+                            const cv = evalProp(arena, resolveProp(sl, "fill-color").?, &ctx, .null, &out.eval_errors);
+                            color = asColor(cv) orelse continue;
+                            const ov = evalProp(arena, resolveProp(sl, "fill-opacity").?, &ctx, .{ .number = 1 }, &out.eval_errors);
+                            color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
+                        }
                         try fill.layoutPolygon(arena, f.parts, tl.extent, tile_span, .{
                             .depth = feat_depth,
                         }, &verts, &indices);
@@ -348,20 +488,24 @@ pub fn buildScene(
                         .kind = .text,
                         .prim = .quads,
                         .atlas = .glyph,
+                        .flags = if (sym.halo != null) types.Range.FLAG_HALO else 0,
+                        .halo = if (sym.halo) |h| h.rgba8() else .{ 0, 0, 0, 0 },
                     });
                 }
                 continue;
             }
-            const count: u32 = @intCast(indices.items.len - first_index);
-            _ = first_vert;
+            const count: u32 = @intCast(indices.items.len - run_first);
             if (count == 0) continue;
             try ranges.append(arena, .{
-                .first = first_index,
+                .first = run_first,
                 .count = count,
                 .paint_key = @intCast(layer_i),
-                .kind = if (sl.kind == .fill) .area else .line,
+                .pattern = run_pattern,
+                .kind = if (is_pattern) .pattern else if (sl.kind == .fill) .area else .line,
                 .prim = .triangles,
-                .flags = if (sl.kind == .fill and all_opaque) types.Range.FLAG_OPAQUE else 0,
+                // A pattern cell is mostly transparent: it must blend over
+                // what it decorates, never join the opaque pre-pass.
+                .flags = if (sl.kind == .fill and !is_pattern and all_opaque) types.Range.FLAG_OPAQUE else 0,
             });
         }
     }
@@ -372,17 +516,66 @@ pub fn buildScene(
     out.quads = quads.items;
     out.quad_paint = quad_paint.items;
     out.ranges = ranges.items;
+    out.patterns = patterns.items;
     out.missing_images = missing.keys();
     return out;
 }
+
+/// Resolve a pattern-fill layer's cell for the current feature, interning it
+/// in the scene's pattern list. Returns NO_PATTERN when the name is empty or
+/// the sprite has no such cell (the name goes to `missing` so the host's
+/// missing-image hook can bake it and rebuild).
+fn patternFor(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    ctx: *eval_mod.Context,
+    assets: Assets,
+    patterns: *std.ArrayList(types.PatternCell),
+    ids: *std.StringHashMapUnmanaged(u32),
+    missing: *std.StringArrayHashMapUnmanaged(void),
+    errors: *usize,
+) u32 {
+    const sp = assets.sprite orelse return types.NO_PATTERN;
+    const name = strProp(sl, "fill-pattern", arena, ctx, errors) orelse return types.NO_PATTERN;
+    if (name.len == 0) return types.NO_PATTERN;
+    if (ids.get(name)) |id| return id;
+
+    const owned = arena.dupe(u8, name) catch return types.NO_PATTERN;
+    const cell = patternCell(arena, sp, name) orelse {
+        missing.put(arena, owned, {}) catch {};
+        ids.put(arena, owned, types.NO_PATTERN) catch {};
+        return types.NO_PATTERN;
+    };
+    const id: u32 = @intCast(patterns.items.len);
+    patterns.append(arena, cell) catch return types.NO_PATTERN;
+    ids.put(arena, owned, id) catch {};
+    return id;
+}
+
+/// The layer-wide symbol settings, resolved once per layer (none of these
+/// are data-driven per the spec).
+const SymbolLayer = struct {
+    placement: Placement,
+    spacing_px: f64,
+    max_angle_deg: f32,
+    icon_map_align: bool,
+    text_map_align: bool,
+    allow_overlap: bool,
+    ignore_placement: bool,
+    text_allow_overlap: bool,
+    /// The style's text-halo-color, or null to keep the scene background.
+    halo: ?Color,
+};
 
 const SymbolCtx = struct {
     rect: coord.WorldRect,
     dx: f32,
     dy: f32,
     tile_extent: u32,
+    tile_span: f64,
     world_to_px: f64,
-    view: View,
+    px_per_unit: f64,
+    sym: SymbolLayer,
     depth: f32,
 };
 
@@ -408,18 +601,38 @@ fn layoutSymbolFeature(
     if (f.parts.len == 0 or f.parts[0].len == 0) return;
     const ext: f32 = @floatFromInt(sc.tile_extent);
     const span: f32 = @floatCast(sc.rect.x1 - sc.rect.x0);
+    const allow_overlap = sc.sym.allow_overlap;
+    const ignore_placement = sc.sym.ignore_placement;
 
-    const allow_overlap = boolProp(sl, "icon-allow-overlap", arena, ctx, errors) or
-        boolProp(sl, "text-allow-overlap", arena, ctx, errors);
-    const ignore_placement = boolProp(sl, "icon-ignore-placement", arena, ctx, errors);
+    // Where this feature puts its symbols, in tile-local world units plus the
+    // local tangent: one per geometry point for "point" placement, an
+    // arc-length walk for "line" / "line-center".
+    var anchors: std.ArrayList(symbol.Placement) = .empty;
+    if (sc.sym.placement.isLine()) {
+        try symbol.placeAlongLine(arena, f.parts, sc.tile_extent, sc.tile_span, .{
+            .spacing_px = sc.sym.spacing_px,
+            .px_per_unit = sc.px_per_unit,
+            .center = sc.sym.placement == .line_center,
+            .max_angle_deg = sc.sym.max_angle_deg,
+            .tile_span = sc.tile_span,
+        }, &anchors);
+    } else {
+        try anchors.ensureUnusedCapacity(arena, f.parts[0].len);
+        for (f.parts[0]) |pt| anchors.appendAssumeCapacity(.{
+            .x = @as(f64, @floatFromInt(pt.x)) / ext * span,
+            .y = @as(f64, @floatFromInt(pt.y)) / ext * span,
+            .angle = 0,
+        });
+    }
 
-    for (f.parts[0]) |pt| {
+    for (anchors.items) |anchor| {
         // Tile-local anchor, rebased to the scene origin.
-        const ax = @as(f32, @floatFromInt(pt.x)) / ext * span + sc.dx;
-        const ay = @as(f32, @floatFromInt(pt.y)) / ext * span + sc.dy;
+        const ax: f32 = @as(f32, @floatCast(anchor.x)) + sc.dx;
+        const ay: f32 = @as(f32, @floatCast(anchor.y)) + sc.dy;
         // Projected px for collision (view.origin is the screen center).
         const px: f32 = @floatCast(@as(f64, ax) * sc.world_to_px);
         const py: f32 = @floatCast(@as(f64, ay) * sc.world_to_px);
+        const tangent_deg: f32 = anchor.angle * 180.0 / std.math.pi;
 
         var common = symbol.Common{ .x = ax, .y = ay, .depth = sc.depth };
 
@@ -436,11 +649,11 @@ fn layoutSymbolFeature(
                 break :icon;
             };
             const size: f32 = @floatCast(asNum(evalProp(arena, resolveProp(sl, "icon-size").?, ctx, .{ .number = 1 }, errors), 1));
-            common.rotate_deg = @floatCast(asNum(evalProp(arena, resolveProp(sl, "icon-rotate").?, ctx, .{ .number = 0 }, errors), 0));
-            if (resolveProp(sl, "icon-rotation-alignment")) |rap| {
-                const rav = evalProp(arena, rap, ctx, .null, errors);
-                common.map_align = rav == .string and std.mem.eql(u8, rav.string, "map");
-            }
+            // A line-placed icon turns with its segment; icon-rotate is the
+            // spec's extra turn on top of that.
+            common.rotate_deg = tangent_deg +
+                @as(f32, @floatCast(asNum(evalProp(arena, resolveProp(sl, "icon-rotate").?, ctx, .{ .number = 0 }, errors), 0)));
+            common.map_align = sc.sym.icon_map_align;
             const box = try symbol.layoutIcon(arena, icon, size, common, quads);
             const placed = try collider.place(.{
                 .x0 = px + box.x0,
@@ -466,6 +679,15 @@ fn layoutSymbolFeature(
             if (text.len == 0) break :text;
             const size: f32 = @floatCast(asNum(evalProp(arena, resolveProp(sl, "text-size").?, ctx, .{ .number = 16 }, errors), 16));
             var topts = symbol.TextOpts{ .size_px = size };
+            topts.max_width_em = @floatCast(asNum(evalProp(arena, resolveProp(sl, "text-max-width").?, ctx, .{ .number = 10 }, errors), 10));
+            // text-halo-width is px; the SDF field measures distance in em-24
+            // px at 1/8 per px (fontnik's radius-8, cutoff-0.25 encoding), so
+            // one halo px is 24/(size*8) of the field. Clamped short of the
+            // 0.5 that would flood the whole glyph cell.
+            const halo_px = asNum(evalProp(arena, resolveProp(sl, "text-halo-width").?, ctx, .{ .number = 0 }, errors), 0);
+            if (halo_px > 0 and size > 0) {
+                topts.weight = @floatCast(@min(0.45, halo_px * 3.0 / @as(f64, size)));
+            }
             if (resolveProp(sl, "text-anchor")) |apv| {
                 const av = evalProp(arena, apv, ctx, .null, errors);
                 if (av == .string) {
@@ -483,11 +705,19 @@ fn layoutSymbolFeature(
                 if (asColor(evalProp(arena, cpv, ctx, .null, errors))) |c| tcolor = c;
             }
             var tcommon = common;
-            tcommon.rotate_deg = 0;
-            tcommon.map_align = false;
+            tcommon.map_align = sc.sym.text_map_align;
+            if (sc.sym.placement.isLine()) {
+                // Line-following text rides its tangent, and the shader keeps
+                // it upright through view rotation (the Quad.flip contract).
+                tcommon.rotate_deg = tangent_deg;
+                tcommon.flip = true;
+                tcommon.tangent_q = symbol.tangentQ(anchor.angle);
+            } else {
+                tcommon.rotate_deg = 0;
+            }
             const scratch_before = text_scratch.items.len;
             const box = (try symbol.layoutText(arena, text, ga, topts, tcommon, text_scratch)) orelse break :text;
-            const text_allow = boolProp(sl, "text-allow-overlap", arena, ctx, errors);
+            const text_allow = sc.sym.text_allow_overlap;
             const placed = try collider.place(.{
                 .x0 = px + box.x0,
                 .y0 = py + box.y0,
@@ -833,6 +1063,7 @@ test "real chart: Annapolis first light" {
         .quads = built.quads,
         .quad_paint = built.quad_paint,
         .ranges = built.ranges,
+        .patterns = built.patterns,
     });
     var cam = cameras.Camera{
         .origin = origin,
@@ -842,6 +1073,9 @@ test "real chart: Annapolis first light" {
         .vh = 512,
     };
     _ = &cam;
+    // Pattern phase: the scene origin's own screen position, so a cell tiles
+    // from a fixed WORLD point and rides the map under a pan.
+    const anchor = cam.worldToScreen(origin);
     const u = types.Uniforms{
         .mvp = cam.mvpOrigin(origin),
         .px_to_clip = cam.pxToClip(),
@@ -852,7 +1086,7 @@ test "real chart: Annapolis first light" {
         .rot_sin = 0,
         .rot_cos = 1,
         .color = .{ 0, 0, 0, 0 },
-        .anchor_px = .{ 0, 0 },
+        .anchor_px = .{ @floatCast(anchor.x), @floatCast(anchor.y) },
         .cell_px = .{ 1, 1 },
     };
     const rgba = try g.renderOffscreen(a, u);
@@ -870,8 +1104,8 @@ test "real chart: Annapolis first light" {
     }
     const total: usize = 512 * 512;
     std.debug.print(
-        "\nannapolis first light: {d} tiles, {d} ranges, {d} quad verts, {d} missing images, land {d}/{d} px, water {d}/{d} px\n",
-        .{ tiles.items.len, built.ranges.len, built.quads.len, built.missing_images.len, land, total, water, total },
+        "\nannapolis first light: {d} tiles, {d} ranges, {d} quad verts, {d} patterns, {d} missing images, land {d}/{d} px, water {d}/{d} px\n",
+        .{ tiles.items.len, built.ranges.len, built.quads.len, built.patterns.len, built.missing_images.len, land, total, water, total },
     );
     if (assets.sprite != null) {
         // Symbols drew, and the sounding digit runs surfaced through the

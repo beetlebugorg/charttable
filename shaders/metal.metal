@@ -215,17 +215,25 @@ fragment float4 sprite_frag(QuadOut in [[stage_in]],
 // SDF text: sample the signed-distance field (.r), antialias with the
 // screen-space derivative, tint by the PAINT stream. `weight` is the halo /
 // embolden width in SDF field units (0 = none); the halo renders in the
-// frame's effective background colour (u.color, set per SDF draw by the host)
-// so night text is not trapped inside a glaring light outline.
+// colour the host stamped on the draw (u.color) — the style's
+// text-halo-color, or the frame's effective background — so night text is not
+// trapped inside a glaring light outline.
+//
+// SDF_EDGE is where fontnik puts the glyph outline: byte 191 of 255 (cutoff
+// 0.25), with distance running 255/8 per px of a 24-px em. Thresholding at
+// 0.5 instead would dilate every glyph by 2 em-px on each side — legible, but
+// visibly bolder than the reference render.
+constant float SDF_EDGE = 191.0 / 255.0;
+
 fragment float4 sdf_frag(QuadOut in [[stage_in]],
                          constant U &u [[buffer(1)]],
                          texture2d<float> atlas [[texture(0)]],
                          sampler smp [[sampler(0)]]) {
     float d = atlas.sample(smp, in.uv).r;
     float w = fwidth(d);
-    float a = smoothstep(0.5 - w, 0.5 + w, d);
+    float a = smoothstep(SDF_EDGE - w, SDF_EDGE + w, d);
     if (in.weight > 0.0) {
-        float halo_a = smoothstep(0.5 - in.weight - w, 0.5 - in.weight + w, d);
+        float halo_a = smoothstep(SDF_EDGE - in.weight - w, SDF_EDGE - in.weight + w, d);
         float cov = max(a, halo_a);
         if (cov <= 0.0) discard_fragment();
         float3 col = mix(u.color.rgb, in.color.rgb, a);

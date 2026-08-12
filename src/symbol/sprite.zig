@@ -147,6 +147,23 @@ pub const Sprite = struct {
         };
     }
 
+    /// A cell's rect in ATLAS PIXELS. `lookup` answers the quad tessellator
+    /// (UVs); this answers whoever needs the pixels themselves — the area-fill
+    /// pattern path copies its cell out of the sheet and rescales it by
+    /// `pixel_ratio` to the on-screen tiling period.
+    pub const Rect = struct {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        pixel_ratio: f32,
+    };
+
+    pub fn cell(self: *const Sprite, name: []const u8) ?Rect {
+        const c = self.entries.get(name) orelse return null;
+        return .{ .x = c.x, .y = c.y, .w = c.w, .h = c.h, .pixel_ratio = c.pixel_ratio };
+    }
+
     pub fn count(self: *const Sprite) usize {
         return self.entries.count();
     }
@@ -191,13 +208,13 @@ pub const Sprite = struct {
         if (self.entries.fetchRemove(name)) |kv| self.alloc.free(kv.key);
     }
 
-    fn putEntry(self: *Sprite, name: []const u8, cell: Cell) Error!void {
+    fn putEntry(self: *Sprite, name: []const u8, entry: Cell) Error!void {
         const gop = try self.entries.getOrPut(self.alloc, name);
         if (!gop.found_existing) {
             errdefer _ = self.entries.remove(name);
             gop.key_ptr.* = try self.alloc.dupe(u8, name);
         }
-        gop.value_ptr.* = cell;
+        gop.value_ptr.* = entry;
     }
 
     // Extend the plane downward; old pixels keep their coordinates, the new

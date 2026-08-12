@@ -156,6 +156,10 @@ pub const symbol_props = [_]Prop{
     .{ .name = "icon-ignore-placement", .scope = .layout, .value_type = .boolean, .default = .{ .boolean = false }, .data_driven = false },
     // "Defaults to \"auto\"". Not data-driven.
     .{ .name = "icon-rotation-alignment", .scope = .layout, .value_type = .{ .enumeration = &alignment_variants }, .default = .{ .string = "auto" }, .data_driven = false },
+    // "Defaults to \"auto\"". Not data-driven.
+    .{ .name = "text-rotation-alignment", .scope = .layout, .value_type = .{ .enumeration = &alignment_variants }, .default = .{ .string = "auto" }, .data_driven = false },
+    // "Defaults to 10", ems, range [0, ∞); data-driven (0.40.0).
+    .{ .name = "text-max-width", .scope = .layout, .value_type = .number, .default = .{ .number = 10 }, .data_driven = true },
     // formatted; "Defaults to \"\""; data-driven (0.33.0).
     .{ .name = "text-field", .scope = .layout, .value_type = .string, .default = .{ .string = "" }, .data_driven = true },
     // "Defaults to ["Open Sans Regular","Arial Unicode MS Regular"]";

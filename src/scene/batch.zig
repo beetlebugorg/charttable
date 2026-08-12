@@ -47,7 +47,14 @@ pub fn batch(ranges: []const t.Range, opts: t.BatchOpts, out: []t.Draw) usize {
             (r.flags & t.Range.FLAG_OPAQUE) != 0) continue;
         const atlas = resolveAtlas(r, opts.atlas_have) orelse continue;
         const pipe = classify(r);
-        const color: [4]f32 = if (pipe == .sdf) opts.halo else .{ 0, 0, 0, 0 };
+        // An SDF draw carries the halo colour: the range's own when the style
+        // set text-halo-color, else the scene's effective background.
+        const color: [4]f32 = if (pipe != .sdf) .{ 0, 0, 0, 0 } else if ((r.flags & t.Range.FLAG_HALO) != 0) .{
+            @as(f32, @floatFromInt(r.halo[0])) / 255.0,
+            @as(f32, @floatFromInt(r.halo[1])) / 255.0,
+            @as(f32, @floatFromInt(r.halo[2])) / 255.0,
+            @as(f32, @floatFromInt(r.halo[3])) / 255.0,
+        } else opts.halo;
 
         if (last) |d| {
             if (d.prim == r.prim and d.pipeline == pipe and d.atlas == atlas and

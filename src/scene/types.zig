@@ -156,9 +156,15 @@ pub const Range = extern struct {
     kind: Kind,
     prim: Prim,
     atlas: Atlas = .none,
-    flags: u8 = 0, // bit 0: OPAQUE — eligible for the front-to-back pre-pass
+    flags: u8 = 0, // FLAG_*
+    /// The SDF halo colour for a text range, straight-alpha RGBA, valid only
+    /// with FLAG_HALO. Without the flag the halo is the scene's effective
+    /// background — right for a chart (S-52 halos ARE the background) and the
+    /// only sane default for a style that sets no text-halo-color.
+    halo: [4]u8 = .{ 0, 0, 0, 0 },
 
     pub const FLAG_OPAQUE: u8 = 1 << 0;
+    pub const FLAG_HALO: u8 = 1 << 1;
 };
 
 /// Per-frame host state the batch classification depends on. Zero-init is
@@ -209,7 +215,7 @@ comptime {
     std.debug.assert(@sizeOf(Vertex) == 28);
     std.debug.assert(@sizeOf(Quad) == 40);
     std.debug.assert(@sizeOf(PaintVertex) == 4);
-    std.debug.assert(@sizeOf(Range) == 20);
+    std.debug.assert(@sizeOf(Range) == 24);
     std.debug.assert(@sizeOf(Uniforms) == 128);
     std.debug.assert(@offsetOf(Uniforms, "color") == 96);
     std.debug.assert(@offsetOf(Uniforms, "anchor_px") == 112);
