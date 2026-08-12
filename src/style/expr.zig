@@ -90,6 +90,12 @@ pub const Expr = union(enum) {
     geometry_type,
     id,
     var_ref: u32, // index into the runtime binding stack
+    global_state: []const u8, // map-level state, set by the host
+    feature_state: *const Expr, // key expression; per-feature host state
+    elevation,
+    heatmap_density,
+    line_progress,
+    properties, // the feature's full property object
     let_bind: Let,
     op: OpCall,
     match_op: Match,
@@ -175,16 +181,20 @@ pub const Deps = struct {
     feature: bool = false,
     zoom: bool = false,
     binding: bool = false,
+    /// Host-set state (global-state, feature-state, elevation, ...): not
+    /// zoom- or feature-dependence, but still never foldable.
+    global: bool = false,
 
     pub fn merge(a: Deps, b: Deps) Deps {
         return .{
             .feature = a.feature or b.feature,
             .zoom = a.zoom or b.zoom,
             .binding = a.binding or b.binding,
+            .global = a.global or b.global,
         };
     }
     pub fn any(d: Deps) bool {
-        return d.feature or d.zoom or d.binding;
+        return d.feature or d.zoom or d.binding or d.global;
     }
 };
 
@@ -298,6 +308,34 @@ const Parser = struct {
         if (std.mem.eql(u8, head, "zoom")) {
             if (args.len != 0) return error.InvalidExpression;
             return .{ .e = try p.node(.zoom), .deps = .{ .zoom = true } };
+        }
+        if (std.mem.eql(u8, head, "global-state")) {
+            if (args.len != 1 or args[0] != .string) return error.InvalidExpression;
+            // Map-level state: never foldable, re-read per frame.
+            return .{ .e = try p.node(.{ .global_state = try p.arena.dupe(u8, args[0].string) }), .deps = .{ .global = true } };
+        }
+        if (std.mem.eql(u8, head, "feature-state")) {
+            // The key may be an expression (["feature-state", ["at", ...]]).
+            if (args.len != 1) return error.InvalidExpression;
+            const r = try p.parseJson(args[0]);
+            const deps = r.deps.merge(.{ .feature = true });
+            return .{ .e = try p.node(.{ .feature_state = p.fold(r.e, r.deps) }), .deps = deps };
+        }
+        if (std.mem.eql(u8, head, "elevation")) {
+            if (args.len != 0) return error.InvalidExpression;
+            return .{ .e = try p.node(.elevation), .deps = .{ .global = true } };
+        }
+        if (std.mem.eql(u8, head, "heatmap-density")) {
+            if (args.len != 0) return error.InvalidExpression;
+            return .{ .e = try p.node(.heatmap_density), .deps = .{ .global = true } };
+        }
+        if (std.mem.eql(u8, head, "line-progress")) {
+            if (args.len != 0) return error.InvalidExpression;
+            return .{ .e = try p.node(.line_progress), .deps = .{ .global = true } };
+        }
+        if (std.mem.eql(u8, head, "properties")) {
+            if (args.len != 0) return error.InvalidExpression;
+            return .{ .e = try p.node(.properties), .deps = .{ .feature = true } };
         }
         if (std.mem.eql(u8, head, "geometry-type")) {
             if (args.len != 0) return error.InvalidExpression;

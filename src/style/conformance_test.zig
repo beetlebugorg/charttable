@@ -20,21 +20,14 @@ const Value = exprs.Value;
 /// Spec features not yet implemented: fixtures under these directories are
 /// counted as skipped. Shrink this list; never grow it silently.
 const skip_ops = [_][]const u8{
-    "interpolate/global-state",
     "interpolate/projection",
     "collator",
     "distance",
-    "elevation",
-    "feature-state",
     "format",
-    "global-state",
-    "heatmap-density",
     "image",
     "is-supported-script",
-    "line-progress",
     "number-format",
     "object",
-    "properties",
     "resolved-locale",
     "within",
     "projection",
@@ -44,7 +37,8 @@ const skip_ops = [_][]const u8{
 /// every time the number goes up; never lower it.
 /// History: 229 (first contact, 2026-08-12) → 291 (assertions, split/join,
 /// semiliteral, objects, collator-eq, strict booleans, coalesce errors) →
-/// 352 (legacy property functions, Lab/HCL interpolation).
+/// 352 (legacy property functions, Lab/HCL interpolation) -> 377 (global-
+/// state, feature-state, elevation, heatmap-density, properties).
 ///
 /// Known-fail (2): interpolate-{hcl,lab}/linear-color — the reference
 /// applies a gamut-mapping step to out-of-gamut interpolation results that
@@ -52,7 +46,7 @@ const skip_ops = [_][]const u8{
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
 /// from the fixtures alone). Revisit with more fixture data points; the
 /// pixel difference is below visibility.
-const PASS_FLOOR: usize = 352;
+const PASS_FLOOR: usize = 377;
 
 const Score = struct {
     total: usize = 0,
@@ -92,6 +86,7 @@ fn jsonToValue(a: std.mem.Allocator, j: std.json.Value) !Value {
 const FixtureFeature = struct {
     keys: [][]const u8,
     values: []Value,
+    entries: []Value.Entry = &.{},
 
     fn get(ptr: ?*const anyopaque, key: []const u8) Value {
         const self: *const FixtureFeature = @ptrCast(@alignCast(ptr.?));
@@ -99,6 +94,11 @@ const FixtureFeature = struct {
             if (std.mem.eql(u8, k, key)) return v;
         }
         return .null;
+    }
+
+    fn props(ptr: ?*const anyopaque) Value {
+        const self: *const FixtureFeature = @ptrCast(@alignCast(ptr.?));
+        return .{ .object = self.entries };
     }
 
     fn hasKey(ptr: ?*const anyopaque, key: []const u8) bool {
@@ -318,6 +318,13 @@ fn evalWithSpec(
                 }
             }
         }
+    } else if (std.mem.eql(u8, type_name, "projectionDefinition")) {
+        // a projection is a name string or a [from, to, t] transition array
+        switch (v) {
+            .string => {},
+            .array => |items| if (items.len != 3) return error.Eval,
+            else => return error.Eval,
+        }
     } else if (std.mem.eql(u8, type_name, "enum")) {
         // Enum membership is a VALIDATION-time check; at runtime the
         // reference only asserts string-ness (legacy identity/enum passes
@@ -329,6 +336,17 @@ fn evalWithSpec(
 
 /// Run one fixture; updates the score. Returns the failure detail (arena-
 /// allocated) when the fixture fails, for the report.
+fn jsonEntries(a: std.mem.Allocator, j: std.json.Value) RunError![]Value.Entry {
+    if (j != .object) return &.{};
+    const entries = try a.alloc(Value.Entry, j.object.count());
+    var it = j.object.iterator();
+    var i: usize = 0;
+    while (it.next()) |kv| : (i += 1) {
+        entries[i] = .{ .key = kv.key_ptr.*, .value = jsonToValue(a, kv.value_ptr.*) catch .null };
+    }
+    return entries;
+}
+
 fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError!?[]const u8 {
     if (doc != .object) return error.Malformed;
     const expression = doc.object.get("expression") orelse return error.Malformed;
@@ -382,6 +400,7 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
         const feat_json = input.array.items[1];
 
         var ctx = eval_mod.Context{};
+        if (doc.object.get("globalState")) |gs| ctx.global_state = try jsonEntries(a, gs);
         if (globals == .object) {
             if (globals.object.get("zoom")) |z| {
                 ctx.zoom = switch (z) {
@@ -390,10 +409,26 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
                     else => 0,
                 };
             }
+            if (globals.object.get("globalState")) |gs| ctx.global_state = try jsonEntries(a, gs);
+            if (globals.object.get("elevation")) |e| ctx.elevation = switch (e) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| f,
+                else => 0,
+            };
+            if (globals.object.get("heatmapDensity")) |e| ctx.heatmap_density = switch (e) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| f,
+                else => 0,
+            };
+            if (globals.object.get("lineProgress")) |e| ctx.line_progress = switch (e) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| f,
+                else => 0,
+            };
         }
 
         var feature = FixtureFeature{ .keys = &.{}, .values = &.{} };
-        var fr = eval_mod.Feature{ .ptr = &feature, .get_fn = FixtureFeature.get, .has_fn = FixtureFeature.hasKey };
+        var fr = eval_mod.Feature{ .ptr = &feature, .get_fn = FixtureFeature.get, .has_fn = FixtureFeature.hasKey, .props_fn = FixtureFeature.props };
         if (feat_json == .object) {
             if (feat_json.object.get("properties")) |props| {
                 if (props == .object) {
@@ -409,6 +444,9 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
                             return null; // object-valued property: tier 2
                         };
                     }
+                    const fentries = try a.alloc(Value.Entry, n);
+                    for (feature.keys, feature.values, 0..) |k, v, j| fentries[j] = .{ .key = k, .value = v };
+                    feature.entries = fentries;
                 }
             }
             if (feat_json.object.get("geometry")) |g| {
@@ -421,6 +459,7 @@ fn runFixture(a: std.mem.Allocator, score: *Score, doc: std.json.Value) RunError
             if (feat_json.object.get("id")) |idv| {
                 fr.id = jsonToValue(a, idv) catch .null;
             }
+            if (feat_json.object.get("featureState")) |fs| ctx.feature_state = try jsonEntries(a, fs);
         }
         ctx.feature = fr;
 

@@ -28,6 +28,9 @@ pub const Feature = struct {
     /// Distinguishes present-with-null from absent (`has` is true for a
     /// property that exists with a null value). Defaults to get != null.
     has_fn: ?*const fn (?*const anyopaque, key: []const u8) bool = null,
+    /// The full property object, for ["properties"]. Optional: decoders
+    /// that cannot enumerate return null and the operator errors.
+    props_fn: ?*const fn (?*const anyopaque) Value = null,
     geom: GeomType = .unknown,
     id: Value = .null,
 
@@ -46,6 +49,13 @@ pub const Feature = struct {
 pub const Context = struct {
     zoom: f64 = 0,
     feature: Feature = .{},
+    /// Map-level state the host sets (["global-state", key]).
+    global_state: []const Value.Entry = &.{},
+    /// Host state for the CURRENT feature (["feature-state", key]).
+    feature_state: []const Value.Entry = &.{},
+    elevation: f64 = 0,
+    heatmap_density: f64 = 0,
+    line_progress: f64 = 0,
     /// Runtime `let` bindings; managed by eval (push on let entry, pop on
     /// exit). Parse-time indices line up with this stack by construction.
     bindings: std.ArrayList(Value) = .empty,
@@ -92,6 +102,29 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
             .unknown => return error.Eval,
         } },
         .id => return ctx.feature.id,
+        .global_state => |key| {
+            for (ctx.global_state) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) return entry.value;
+            }
+            return .null;
+        },
+        .feature_state => |key_e| {
+            const key = switch (try eval(a, key_e, ctx)) {
+                .string => |s| s,
+                else => return error.Eval,
+            };
+            for (ctx.feature_state) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) return entry.value;
+            }
+            return .null;
+        },
+        .elevation => return .{ .number = ctx.elevation },
+        .heatmap_density => return .{ .number = ctx.heatmap_density },
+        .line_progress => return .{ .number = ctx.line_progress },
+        .properties => {
+            const f = ctx.feature.props_fn orelse return error.Eval;
+            return f(ctx.feature.ptr);
+        },
         .var_ref => |i| {
             if (i >= ctx.bindings.items.len) return error.Eval;
             return ctx.bindings.items[i];
