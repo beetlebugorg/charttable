@@ -37,8 +37,12 @@ const skip_ops = [_][]const u8{};
 /// applies a gamut-mapping step to out-of-gamut interpolation results that
 /// plain channel clipping does not reproduce (confirmed: chroma reduction
 /// in LCH(ab) gets within 0.003; the exact stopping rule is undetermined
-/// from the fixtures alone). Revisit with more fixture data points; the
-/// pixel difference is below visibility.
+/// from the fixtures alone). Checked upstream on 2026-08-12: the
+/// maplibre-style-spec repo still carries exactly three cases under each of
+/// interpolate-hcl and interpolate-lab (linear-color, linear-color-array,
+/// uninterpolable-output), so there are still only two independent data
+/// points and the rule stays underdetermined. Revisit if fixtures are
+/// added; the pixel difference is below visibility.
 const PASS_FLOOR: usize = 575;
 
 const Score = struct {
