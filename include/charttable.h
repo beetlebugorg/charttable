@@ -74,6 +74,13 @@ void charttable_detach_surface(charttable *);
 int charttable_resize(charttable *, uint32_t w_pt, uint32_t h_pt);
 void charttable_set_pixel_density(charttable *, float density);
 
+/* The physical size multiplier for symbols, text and line widths. S-52
+ * specifies symbol sizes in millimeters and the sprite is rasterized at the
+ * catalogue's own px-per-mm, so a host that wants those physical sizes on ITS
+ * display passes the ratio here. 1.0 (default) draws sprite cells at their
+ * logical size. Uniform-only: no relayout, no re-upload. */
+void charttable_set_size_scale(charttable *, float scale);
+
 /* The scene contract's struct-layout guard. Compare against the value your
  * build expects: a mismatch means header and library disagree about the
  * vertex/uniform layout, which shades wrong rather than failing. */
@@ -168,6 +175,16 @@ void charttable_set_view(charttable *, const charttable_view *);
 void charttable_get_view(charttable *, charttable_view *);
 void charttable_pan(charttable *, float dx_pt, float dy_pt);
 void charttable_zoom_at(charttable *, double dzoom, float x_pt, float y_pt);
+
+/* Zoom about a screen point, EASED over the next frames, with the world point
+ * under the cursor held fixed the whole way. What a wheel, pinch or zoom
+ * button should call; _zoom_at is the instant form. */
+void charttable_zoom_toward(charttable *, double dzoom, float x_pt, float y_pt);
+
+/* Start a fling at vx, vy LOGICAL POINTS PER SECOND; (0,0) stops one. It
+ * decays inside charttable_tick and keeps needs_redraw true until it
+ * settles. */
+void charttable_fling(charttable *, double vx, double vy);
 void charttable_screen_to_geo(charttable *, float x_pt, float y_pt,
                               double *lon, double *lat);
 void charttable_geo_to_screen(charttable *, double lon, double lat,
@@ -178,11 +195,16 @@ void charttable_geo_to_screen(charttable *, double lon, double lat,
 /* Advance animation and tile loading. `dt_ms` is the host's elapsed time. */
 int charttable_tick(charttable *, double dt_ms);
 
-/* Is there anything left to do — animation, loading, or a pending rebuild? */
+/* Is there a FRAME TO DRAW? Anything pending -- loading, an animation, a
+ * rebuild owed -- plus a camera that has moved since the last frame reached
+ * the screen. Panning or zooming inside the built coverage rebuilds nothing
+ * and is still damage, because the matrix changed. */
 int charttable_needs_redraw(charttable *);
 
 /* Honest completeness: every tile this view asked for has an answer, the
- * scene covers the view, and nothing is animating. Not "the style loaded". */
+ * scene covers the view, and nothing is animating. Not "the style loaded",
+ * and deliberately NOT the negation of needs_redraw: a camera that moved but
+ * whose tiles are all resident is COMPLETE, it just owes a frame. */
 int charttable_idle(charttable *);
 
 /* Tiles this view is still waiting on, for a progress readout. */

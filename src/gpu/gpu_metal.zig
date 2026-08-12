@@ -396,10 +396,27 @@ pub const Gpu = struct {
         last.* = u.*;
     }
 
+    /// The pattern shader tiles in FRAMEBUFFER pixels (it reads the fragment
+    /// position), but the scene states its cell period and phase anchor in
+    /// LOGICAL points -- a PatternCell's w/h are the on-screen period at the
+    /// scene's own density, and the host's anchor comes from a point-space
+    /// camera. Convert here, where the density actually lives.
+    ///
+    /// Skip it and a Retina display tiles every pattern twice as densely as
+    /// the chart intends, with its phase off by half: the seabed-quality
+    /// hatch stops being a texture and becomes a wall.
+    fn patternUniforms(self: *const Gpu, u: Uniforms, pt: PatternTex) Uniforms {
+        const d = self.pixel_density;
+        var uu = u;
+        uu.cell_px = .{ pt.w * d, pt.h * d };
+        uu.anchor_px = .{ u.anchor_px[0] * d, u.anchor_px[1] * d };
+        return uu;
+    }
+
     // One merged front-to-back run of the opaque pre-pass.
     const OpaqueRun = struct { first: u32, count: u32, pattern: u32 };
 
-    fn flushOpaque(f: *mc.ctm_frame, s: *const Scene, run: OpaqueRun, last_u: *?Uniforms, u: *const Uniforms) void {
+    fn flushOpaque(self: *const Gpu, f: *mc.ctm_frame, s: *const Scene, run: OpaqueRun, last_u: *?Uniforms, u: *const Uniforms) void {
         if (run.pattern == scene.NO_PATTERN) {
             mc.ctm_set_pipeline(f, mc.CTM_PIPE_FILL);
             mc.ctm_bind_vbuf(f, s.vbuf.?);
@@ -417,8 +434,7 @@ pub const Gpu = struct {
             mc.ctm_set_pipeline(f, mc.CTM_PIPE_PATTERN);
             mc.ctm_bind_vbuf(f, s.vbuf.?);
             mc.ctm_bind_texture(f, tex);
-            var uu = u.*;
-            uu.cell_px = .{ pt.w, pt.h };
+            const uu = self.patternUniforms(u.*, pt);
             sendUniforms(f, last_u, &uu);
         }
         mc.ctm_draw_indexed(f, s.ibuf.?, run.first, run.count);
@@ -457,11 +473,11 @@ pub const Gpu = struct {
                         a.count += r.count;
                         continue;
                     }
-                    flushOpaque(f, s, a.*, &last_u, &u);
+                    self.flushOpaque(f, s, a.*, &last_u, &u);
                 }
                 run = .{ .first = r.first, .count = r.count, .pattern = r.pattern };
             }
-            if (run) |a| flushOpaque(f, s, a, &last_u, &u);
+            if (run) |a| self.flushOpaque(f, s, a, &last_u, &u);
         }
 
         mc.ctm_set_depth_mode(f, 0);
@@ -483,7 +499,7 @@ pub const Gpu = struct {
                         if (d.pattern >= s.patterns.len) continue;
                         const pt = s.patterns[d.pattern];
                         const tex = pt.tex orelse continue;
-                        uu.cell_px = .{ pt.w, pt.h };
+                        uu = self.patternUniforms(uu, pt);
                         mc.ctm_set_pipeline(f, mc.CTM_PIPE_PATTERN);
                         mc.ctm_bind_vbuf(f, s.vbuf.?);
                         mc.ctm_bind_texture(f, tex);
@@ -622,7 +638,7 @@ test "metal offscreen smoke: paint stream draws, zoom gate culls" {
     };
     // A: opaque red, visible (zmin == u.zoom proves the gate is inclusive).
     // B: green, gate-culled (zmax 1000 < u.zoom 2560); same triangle as A and
-    //    nearer in depth, so if the gate broke it WOULD win the centre pixel.
+    //    nearer in depth, so if the gate broke it WOULD win the center pixel.
     // C: blue, blended phase-B triangle to A's right, over bare background.
     const verts = [_]scene.Vertex{
         V.at(-0.4, -0.4, Z, scene.ZMAX_ALL, 0.75), V.at(0.4, -0.4, Z, scene.ZMAX_ALL, 0.75),  V.at(0.0, 0.4, Z, scene.ZMAX_ALL, 0.75),
@@ -665,7 +681,7 @@ test "metal offscreen smoke: paint stream draws, zoom gate culls" {
             return .{ buf[i], buf[i + 1], buf[i + 2], buf[i + 3] };
         }
     };
-    // Centre: the opaque triangle's PAINT color — and NOT green, which is
+    // Center: the opaque triangle's PAINT color — and NOT green, which is
     // the zoom gate holding (B passes the depth test if it draws at all).
     try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, P.at(px, 128, 128));
     // Inside C only: the blended phase-B triangle over the clear color.

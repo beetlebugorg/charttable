@@ -136,6 +136,240 @@ pub const PmtilesSource = struct {
     }
 };
 
+/// Many pmtiles archives behind ONE source: a whole chart library, which is
+/// what a plotter actually opens. `Key.source` is three bits, so a library
+/// cannot be one source per archive — and should not be anyway, since the
+/// style names a single source and every layer draws from it.
+///
+/// Two things make this cheap over thousands of archives:
+///   * the reader memory-maps and decodes its directories lazily, so an
+///     untouched archive costs address space and nothing else;
+///   * every probe is culled by the archive's own header bounds and zoom
+///     band first, so a tile asks the handful of cells that could hold it.
+///
+/// Ordering is FINEST FIRST (deepest max_zoom, then narrowest bounds), and
+/// the first archive with the tile wins. That is a crude stand-in for real
+/// multi-cell compositing: tile57 solves overlap with a baked ownership
+/// partition, and without one two cells covering the same water will show
+/// a seam wherever the finer one stops. Good enough to fly a library
+/// around; not the answer for a chart plotter.
+pub const PmtilesLibrary = struct {
+    gpa: Allocator,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    kind: Kind = .vector,
+    encoding: ?Encoding = null,
+
+    pub const Entry = struct {
+        reader: *pmtiles.Reader,
+        min_lon_e7: i32,
+        min_lat_e7: i32,
+        max_lon_e7: i32,
+        max_lat_e7: i32,
+        min_zoom: u8,
+        max_zoom: u8,
+    };
+
+    pub fn init(gpa: Allocator) PmtilesLibrary {
+        return .{ .gpa = gpa };
+    }
+
+    /// The library does NOT own the readers; the caller opened them and must
+    /// keep them alive and close them.
+    pub fn deinit(self: *PmtilesLibrary) void {
+        self.entries.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    pub fn add(self: *PmtilesLibrary, reader: *pmtiles.Reader) Allocator.Error!void {
+        const h = reader.header;
+        try self.entries.append(self.gpa, .{
+            .reader = reader,
+            .min_lon_e7 = h.min_lon_e7,
+            .min_lat_e7 = h.min_lat_e7,
+            .max_lon_e7 = h.max_lon_e7,
+            .max_lat_e7 = h.max_lat_e7,
+            .min_zoom = h.min_zoom,
+            .max_zoom = h.max_zoom,
+        });
+        // Finest first: the deepest archive that covers a tile answers it.
+        std.mem.sort(Entry, self.entries.items, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                if (a.max_zoom != b.max_zoom) return a.max_zoom > b.max_zoom;
+                return area(a) < area(b); // a tighter cell is the larger scale
+            }
+            fn area(e: Entry) i64 {
+                const w: i64 = @as(i64, e.max_lon_e7) - e.min_lon_e7;
+                const h2: i64 = @as(i64, e.max_lat_e7) - e.min_lat_e7;
+                return @max(0, w) * @max(0, h2);
+            }
+        }.lt);
+    }
+
+    pub fn count(self: *const PmtilesLibrary) usize {
+        return self.entries.items.len;
+    }
+
+    /// The decoder every archive agrees on, from their headers. Mixed
+    /// libraries fall back to mvt, which is the spec default.
+    pub fn headerEncoding(self: *const PmtilesLibrary) ?Encoding {
+        var seen: ?Encoding = null;
+        for (self.entries.items) |e| {
+            const enc: Encoding = switch (e.reader.header.tile_type) {
+                .mlt => .mlt,
+                .mvt => .mvt,
+                else => continue,
+            };
+            if (seen) |s| {
+                if (s != enc) return null;
+            } else seen = enc;
+        }
+        return seen;
+    }
+
+    pub fn deepestZoom(self: *const PmtilesLibrary) u8 {
+        var z: u8 = 0;
+        for (self.entries.items) |e| z = @max(z, e.max_zoom);
+        return z;
+    }
+
+    /// Does the archive's box overlap the tile's at all?
+    fn overlaps(e: Entry, id: coord.TileId) bool {
+        if (id.z < e.min_zoom or id.z > e.max_zoom) return false;
+        const rect = id.worldRect();
+        const nw = coord.worldToLonLat(.{ rect.x0, rect.y0 });
+        const se = coord.worldToLonLat(.{ rect.x1, rect.y1 });
+        const t_min_lon: i32 = @intFromFloat(@floor(nw[0] * 1e7));
+        const t_max_lon: i32 = @intFromFloat(@ceil(se[0] * 1e7));
+        // worldToLonLat is y-down, so the NW corner is the HIGHER latitude.
+        const t_max_lat: i32 = @intFromFloat(@ceil(nw[1] * 1e7));
+        const t_min_lat: i32 = @intFromFloat(@floor(se[1] * 1e7));
+        return t_min_lon <= e.max_lon_e7 and t_max_lon >= e.min_lon_e7 and
+            t_min_lat <= e.max_lat_e7 and t_max_lat >= e.min_lat_e7;
+    }
+
+    const Box = struct { min_lon: i32, min_lat: i32, max_lon: i32, max_lat: i32 };
+
+    fn tileBox(id: coord.TileId) Box {
+        const rect = id.worldRect();
+        const nw = coord.worldToLonLat(.{ rect.x0, rect.y0 });
+        const se = coord.worldToLonLat(.{ rect.x1, rect.y1 });
+        // worldToLonLat is y-down, so the NW corner is the HIGHER latitude.
+        return .{
+            .min_lon = @intFromFloat(@floor(nw[0] * 1e7)),
+            .max_lon = @intFromFloat(@ceil(se[0] * 1e7)),
+            .min_lat = @intFromFloat(@floor(se[1] * 1e7)),
+            .max_lat = @intFromFloat(@ceil(nw[1] * 1e7)),
+        };
+    }
+
+    /// Can this archive FILL the tile — is the whole tile inside its bounds?
+    /// This is the test that makes quilting work. A harbor cell holds z8
+    /// tiles too, but each covers only that harbor, so letting it answer a
+    /// zoomed-out tile paints one small rectangle of chart in an ocean of
+    /// nothing. Only a cell that spans the tile can serve it; scale then
+    /// falls out on its own, because at a coarse zoom the cells that span a
+    /// tile ARE the overview charts.
+    fn containsTile(e: Entry, id: coord.TileId) bool {
+        if (id.z < e.min_zoom or id.z > e.max_zoom) return false;
+        const t = tileBox(id);
+        return t.min_lon >= e.min_lon_e7 and t.max_lon <= e.max_lon_e7 and
+            t.min_lat >= e.min_lat_e7 and t.max_lat <= e.max_lat_e7;
+    }
+
+    /// Does it hold the tile's CENTER? The fallback for a tile that straddles
+    /// a cell boundary and so fits inside none of them.
+    fn holdsCenter(e: Entry, id: coord.TileId) bool {
+        if (id.z < e.min_zoom or id.z > e.max_zoom) return false;
+        const rect = id.worldRect();
+        const c = coord.worldToLonLat(.{ (rect.x0 + rect.x1) * 0.5, (rect.y0 + rect.y1) * 0.5 });
+        const lon: i32 = @intFromFloat(c[0] * 1e7);
+        const lat: i32 = @intFromFloat(c[1] * 1e7);
+        return lon >= e.min_lon_e7 and lon <= e.max_lon_e7 and
+            lat >= e.min_lat_e7 and lat <= e.max_lat_e7;
+    }
+
+    const Pass = enum { fills, center, touches };
+
+    fn admits(e: Entry, id: coord.TileId, pass: Pass) bool {
+        return switch (pass) {
+            .fills => containsTile(e, id),
+            .center => holdsCenter(e, id) and !containsTile(e, id),
+            .touches => overlaps(e, id) and !holdsCenter(e, id),
+        };
+    }
+
+    /// Candidates a single tile may draw from. Far more than a real tile
+    /// ever needs after the bounds filter; a library that somehow exceeds it
+    /// just tries the first this many.
+    const MAX_CANDIDATES = 64;
+
+    /// How well an archive's COMPILATION SCALE suits this zoom. A cell's
+    /// max_zoom is its scale: tile57 bakes native scale only, so an overview
+    /// (US1) tops out around z7 and a harbor cell (US5) around z16.
+    ///
+    /// The right chart for a zoom is the one COMPILED for it — the smallest
+    /// max_zoom that still reaches this zoom. Taking the finest available
+    /// instead is what broke the zoomed-out view: a harbor cell answered a
+    /// z8 tile and painted one small rectangle of chart into an empty ocean,
+    /// because its data covers a fifteenth of a degree and the tile spans
+    /// one and a half.
+    fn scaleFit(e: Entry, z: u8) u32 {
+        return @as(u32, e.max_zoom) - @as(u32, z); // admits() already gated z <= max_zoom
+    }
+
+    fn fetch(ptr: ?*anyopaque, gpa: Allocator, id: coord.TileId) Fetch {
+        const self: *PmtilesLibrary = @ptrCast(@alignCast(ptr.?));
+        // Cells that can FILL the tile first, then the one holding its
+        // center, then anything that merely reaches it. Within a pass, the
+        // chart compiled closest to this zoom wins, ties going to the
+        // tighter cell.
+        for ([3]Pass{ .fills, .center, .touches }) |pass| {
+            var cand: [MAX_CANDIDATES]Entry = undefined;
+            var n: usize = 0;
+            for (self.entries.items) |e| {
+                if (!admits(e, id, pass)) continue;
+                cand[n] = e;
+                n += 1;
+                if (n == cand.len) break;
+            }
+            const list = cand[0..n];
+            std.mem.sort(Entry, list, id.z, struct {
+                fn lt(z: u8, a: Entry, b: Entry) bool {
+                    const fa = scaleFit(a, z);
+                    const fb = scaleFit(b, z);
+                    if (fa != fb) return fa < fb;
+                    return boxArea(a) < boxArea(b);
+                }
+            }.lt);
+            for (list) |e| {
+                const bytes = e.reader.getTile(gpa, id.z, id.x, id.y) catch continue;
+                if (bytes) |b| {
+                    if (b.len > 0) return .{ .bytes = b };
+                    gpa.free(b);
+                }
+            }
+        }
+        return .empty;
+    }
+
+    fn boxArea(e: Entry) i64 {
+        const w: i64 = @as(i64, e.max_lon_e7) - e.min_lon_e7;
+        const h: i64 = @as(i64, e.max_lat_e7) - e.min_lat_e7;
+        return @max(0, w) * @max(0, h);
+    }
+
+    pub fn source(self: *PmtilesLibrary) Source {
+        return .{
+            .ptr = self,
+            .fetch = fetch,
+            .kind = self.kind,
+            .encoding = self.headerEncoding() orelse .mvt,
+            .minzoom = 0,
+            .maxzoom = self.deepestZoom(),
+        };
+    }
+};
+
 /// One cached tile, addressed by source index and tile id. 64 bits so the
 /// slot table keys on a scalar.
 pub const Key = packed struct(u64) {

@@ -97,6 +97,7 @@ const Handle = struct {
     /// Host-backed sources, likewise owned. The name travels with each one
     /// so a request can tell the host WHICH source it is for.
     provided: std.ArrayListUnmanaged(*Provided) = .empty,
+    libraries: std.ArrayListUnmanaged(*Library) = .empty,
     on_resource: ?ResourceFn = null,
     resource_user: ?*anyopaque = null,
     /// Scratch for draining asks, so a tick allocates nothing new.
@@ -104,6 +105,12 @@ const Handle = struct {
 
     sprite: ?sprites.Sprite = null,
     glyph_atlas: ?glyphs.GlyphAtlas = null,
+    /// Atlas pixels the SURFACE currently holds. The Map's assets and the
+    /// GPU's textures are two different things: loading a sprite tells the
+    /// layout what an icon looks like, uploading it is what lets the batcher
+    /// draw the range at all.
+    sprite_uploaded: u32 = 0,
+    glyphs_dirty: bool = false,
 
     on_missing: ?MissingImageFn = null,
     missing_user: ?*anyopaque = null,
@@ -126,11 +133,37 @@ const Handle = struct {
         provider: providers.Provider,
         name: [:0]u8,
     };
+
+    /// A style source name backed by a LIBRARY of archives. Calling
+    /// charttable_add_source_pmtiles again with the same name adds to it.
+    const Library = struct {
+        lib: caches.PmtilesLibrary,
+        name: [:0]u8,
+    };
 };
 
 const State = struct {
     var gpa_impl: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
 };
+
+/// The allocator every handle and its map run on.
+///
+/// DebugAllocator earns its keep in a safety build -- it catches the leaks
+/// and double-frees a C host would otherwise blame on charttable -- but leak
+/// tracking is a development tool, and a shipped library should not impose it
+/// on every host. An optimized build takes the fast general-purpose allocator,
+/// which is thread-safe as the tile workers require.
+///
+/// Measured, so the claim is not overstated: over 6 paced-pinch runs the
+/// medians were 257 ms (smp) against 268 ms (debug) of total frame time --
+/// inside the run-to-run noise. Allocation is not this renderer's bottleneck;
+/// this change is for correctness of packaging, not speed.
+fn generalAllocator() std.mem.Allocator {
+    return switch (@import("builtin").mode) {
+        .Debug, .ReleaseSafe => State.gpa_impl.allocator(),
+        .ReleaseFast, .ReleaseSmall => std.heap.smp_allocator,
+    };
+}
 
 fn handle(h: ?*anyopaque) ?*Handle {
     return @ptrCast(@alignCast(h orelse return null));
@@ -147,7 +180,7 @@ fn locked(h: ?*anyopaque) ?*Handle {
 // ---- lifecycle -------------------------------------------------------------
 
 export fn charttable_open(opts: ?*const Options) callconv(.c) ?*anyopaque {
-    const gpa = State.gpa_impl.allocator();
+    const gpa = generalAllocator();
     const self = gpa.create(Handle) catch return null;
     var copts = map_object.Options{};
     if (opts) |o| {
@@ -174,6 +207,12 @@ export fn charttable_close(h: ?*anyopaque) callconv(.c) void {
         self.gpa.destroy(pr);
     }
     self.provided.deinit(self.gpa);
+    for (self.libraries.items) |lb| {
+        lb.lib.deinit();
+        self.gpa.free(lb.name);
+        self.gpa.destroy(lb);
+    }
+    self.libraries.deinit(self.gpa);
     self.asks.deinit(self.gpa);
     if (self.sprite) |*s| s.deinit();
     if (self.glyph_atlas) |*a| a.deinit();
@@ -209,6 +248,9 @@ export fn charttable_attach_surface(
         return ERR_SURFACE;
     };
     self.uploaded = .{};
+    // A fresh surface holds no textures.
+    self.sprite_uploaded = 0;
+    self.glyphs_dirty = self.glyph_atlas != null;
     self.m.setViewport(@floatFromInt(w_px), @floatFromInt(h_px));
     return OK;
 }
@@ -228,6 +270,17 @@ export fn charttable_resize(h: ?*anyopaque, w_pt: u32, h_pt: u32) callconv(.c) c
     if (self.g) |*g| g.resize(w_pt, h_pt);
     self.m.setViewport(@floatFromInt(w_pt), @floatFromInt(h_pt));
     return OK;
+}
+
+/// The physical size multiplier for symbols, text and line widths. S-52
+/// specifies symbol sizes in millimeters; the sprite is rasterized at the
+/// catalogue's own px-per-mm, so a host that wants those physical sizes on
+/// ITS display passes the ratio here. 1.0 (the default) draws sprite cells
+/// at their logical size. Uniform-only: no relayout, no re-upload.
+export fn charttable_set_size_scale(h: ?*anyopaque, scale: f32) callconv(.c) void {
+    const self = locked(h) orelse return;
+    defer self.mu.unlock();
+    self.m.setSizeScale(scale);
 }
 
 export fn charttable_set_pixel_density(h: ?*anyopaque, d: f32) callconv(.c) void {
@@ -282,6 +335,8 @@ export fn charttable_add_source_pmtiles(
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
     const io = std.Io.Threaded.global_single_threaded.io();
+    const want = std.mem.span(name);
+
     const ar = self.gpa.create(Handle.Archive) catch return ERR_MEMORY;
     errdefer self.gpa.destroy(ar);
     ar.reader = pmtiles.Reader.open(self.gpa, io, std.mem.span(path)) catch return ERR_SOURCE;
@@ -290,8 +345,37 @@ export fn charttable_add_source_pmtiles(
         ar.reader.deinit();
         return ERR_MEMORY;
     };
-    _ = self.m.bindPmtiles(std.mem.span(name), &ar.src) catch return ERR_MEMORY;
+
+    // Repeat calls for one source name build a LIBRARY: many archives, one
+    // source, finest cell first. That is how a chart plotter opens a folder.
+    for (self.libraries.items) |lb| {
+        if (!std.mem.eql(u8, lb.name, want)) continue;
+        lb.lib.add(&ar.reader) catch return ERR_MEMORY;
+        _ = self.m.bindPmtilesLibrary(want, &lb.lib) catch return ERR_MEMORY;
+        return OK;
+    }
+    const lb = self.gpa.create(Handle.Library) catch return ERR_MEMORY;
+    lb.name = self.gpa.dupeZ(u8, want) catch {
+        self.gpa.destroy(lb);
+        return ERR_MEMORY;
+    };
+    lb.lib = caches.PmtilesLibrary.init(self.gpa);
+    lb.lib.add(&ar.reader) catch return ERR_MEMORY;
+    self.libraries.append(self.gpa, lb) catch return ERR_MEMORY;
+    _ = self.m.bindPmtilesLibrary(want, &lb.lib) catch return ERR_MEMORY;
     return OK;
+}
+
+/// How many archives a source name currently has, for a host that wants to
+/// report "opened N charts".
+export fn charttable_source_archive_count(h: ?*anyopaque, name: [*:0]const u8) callconv(.c) u32 {
+    const self = locked(h) orelse return 0;
+    defer self.mu.unlock();
+    const want = std.mem.span(name);
+    for (self.libraries.items) |lb| {
+        if (std.mem.eql(u8, lb.name, want)) return @intCast(lb.lib.count());
+    }
+    return 0;
 }
 
 /// Set one paint property from a JSON fragment (`"#ff0000"`, `0.5`, or a
@@ -513,6 +597,7 @@ export fn charttable_add_glyphs(h: ?*anyopaque, pbf: [*]const u8, len: usize) ca
             return ERR_MEMORY;
     }
     _ = self.glyph_atlas.?.addRange(pbf[0..len]) catch return ERR_ARG;
+    self.glyphs_dirty = true;
     self.m.setAssets(.{
         .sprite = if (self.sprite) |*s| s else null,
         .glyph_atlas = &self.glyph_atlas.?,
@@ -547,13 +632,30 @@ export fn charttable_get_view(h: ?*anyopaque, v: ?*View) callconv(.c) void {
 export fn charttable_pan(h: ?*anyopaque, dx_pt: f32, dy_pt: f32) callconv(.c) void {
     const self = locked(h) orelse return;
     defer self.mu.unlock();
-    self.m.cam.panPx(dx_pt, dy_pt);
+    self.m.pan(dx_pt, dy_pt);
 }
 
 export fn charttable_zoom_at(h: ?*anyopaque, dzoom: f64, x_pt: f32, y_pt: f32) callconv(.c) void {
     const self = locked(h) orelse return;
     defer self.mu.unlock();
-    self.m.cam.zoomAbout(dzoom, x_pt, y_pt);
+    self.m.zoomAt(dzoom, x_pt, y_pt);
+}
+
+/// Zoom about a screen point, EASED over the next frames (the cursor's world
+/// point stays put). This is what a wheel, a pinch or a zoom button should
+/// call; charttable_zoom_at is the instant form.
+export fn charttable_zoom_toward(h: ?*anyopaque, dzoom: f64, x_pt: f32, y_pt: f32) callconv(.c) void {
+    const self = locked(h) orelse return;
+    defer self.mu.unlock();
+    self.m.zoomToward(dzoom, x_pt, y_pt);
+}
+
+/// Start a fling at `vx`, `vy` LOGICAL POINTS PER SECOND; (0, 0) stops one.
+/// It decays in charttable_tick and keeps needs_redraw true until it settles.
+export fn charttable_fling(h: ?*anyopaque, vx: f64, vy: f64) callconv(.c) void {
+    const self = locked(h) orelse return;
+    defer self.mu.unlock();
+    self.m.fling(vx, vy);
 }
 
 export fn charttable_screen_to_geo(
@@ -593,7 +695,7 @@ export fn charttable_geo_to_screen(
 export fn charttable_tick(h: ?*anyopaque, dt_ms: f64) callconv(.c) c_int {
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
-    if (dt_ms > 0) self.m.cam.tick(dt_ms / 1000.0);
+    self.m.advance(dt_ms / 1000.0);
     _ = self.m.update() catch return ERR_MEMORY;
     collectMissing(self);
     pumpResources(self);
@@ -622,8 +724,12 @@ export fn charttable_render(h: ?*anyopaque) callconv(.c) c_int {
     const g = if (self.g) |*g| g else return ERR_SURFACE;
     _ = self.m.update() catch return ERR_MEMORY;
     collectMissing(self);
+    pumpResources(self);
+    syncAtlases(self);
     _ = self.m.uploadIfChanged(g, &self.uploaded) catch return ERR_MEMORY;
-    return if (g.renderWindow(self.m.uniforms())) 1 else 0;
+    const drew = g.renderWindow(self.m.uniforms());
+    if (drew) self.m.markDrawn();
+    return if (drew) 1 else 0;
 }
 
 /// Render offscreen and copy RGBA8 (top-down, w*h*4) into `dst`.
@@ -635,9 +741,11 @@ export fn charttable_snapshot_rgba(h: ?*anyopaque, dst: [*]u8, len: usize) callc
     if (len < need) return ERR_ARG;
     _ = self.m.update() catch return ERR_MEMORY;
     collectMissing(self);
+    syncAtlases(self);
     _ = self.m.uploadIfChanged(g, &self.uploaded) catch return ERR_MEMORY;
     const px = g.renderOffscreen(self.gpa, self.m.uniforms()) catch return ERR_SURFACE;
     defer self.gpa.free(px);
+    self.m.markDrawn();
     @memcpy(dst[0..need], px[0..need]);
     return OK;
 }
@@ -648,6 +756,30 @@ export fn charttable_pending_tiles(h: ?*anyopaque) callconv(.c) u32 {
     const self = locked(h) orelse return 0;
     defer self.mu.unlock();
     return @intCast(self.m.pendingWanted());
+}
+
+/// Push atlas pixels to the surface when they have changed. Sprite growth
+/// bumps Sprite.generation (the host's re-upload signal), glyph ranges set a
+/// dirty flag, and a re-attached surface starts empty.
+///
+/// Without this the batcher sees no atlases and DROPS every quads range: the
+/// map draws its fills and patterns and silently loses every icon and label.
+fn syncAtlases(self: *Handle) void {
+    const g = if (self.g) |*gg| gg else return;
+    if (self.sprite) |*sp| {
+        if (self.sprite_uploaded != sp.generation) {
+            g.uploadSpriteAtlas(sp.rgba, sp.width, sp.height) catch return;
+            self.sprite_uploaded = sp.generation;
+        }
+    }
+    if (self.glyph_atlas) |*ga| {
+        if (self.glyphs_dirty) {
+            const rgba = ga.toRgba(self.gpa) catch return;
+            defer self.gpa.free(rgba);
+            g.uploadGlyphAtlas(rgba, ga.width, ga.height) catch return;
+            self.glyphs_dirty = false;
+        }
+    }
 }
 
 /// Names the scene could not resolve are reported ONCE each, and the
@@ -815,6 +947,84 @@ test "capi: a provided source parks, then lands when the host answers" {
     try testing.expectEqual(OK, charttable_tick(h, 16));
 }
 
+// Symbols through the ABI. The library can hold a sprite the SURFACE has
+// never seen: loading one tells the layout what an icon looks like, uploading
+// it is what lets the batcher draw the range at all. Miss the upload and the
+// map renders its fills and patterns and silently loses every icon and label
+// — which is exactly what the example app showed.
+test "capi: a loaded sprite and glyph atlas actually reach the surface" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const ct_build = @import("ct_build");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const chart_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;
+    const sprite_env = std.c.getenv("CHARTTABLE_TEST_SPRITE_DIR") orelse return error.SkipZigTest;
+    const glyph_env = std.c.getenv("CHARTTABLE_TEST_GLYPHS_DIR") orelse return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sdir = std.mem.span(sprite_env);
+    const gdir = std.mem.span(glyph_env);
+
+    const style_json = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        try std.fmt.allocPrint(a, "{s}/chart-day-style-symbols.json", .{ct_build.assets_dir}),
+        a,
+        .limited(8 * 1024 * 1024),
+    );
+    const sprite_json = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/sprite-mln.json", .{sdir}), a, .limited(64 << 20)) catch return error.SkipZigTest;
+    const sprite_png = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/sprite-mln.png", .{sdir}), a, .limited(256 << 20)) catch return error.SkipZigTest;
+
+    const h = charttable_open(&.{ .workers = 3 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+
+    try testing.expectEqual(OK, charttable_set_sprite(h, sprite_json.ptr, sprite_json.len, sprite_png.ptr, sprite_png.len));
+    for ([_][]const u8{ "0-255", "256-511" }) |range| {
+        const pbf = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/Noto Sans Regular/{s}.pbf", .{ gdir, range }), a, .limited(16 << 20)) catch continue;
+        _ = charttable_add_glyphs(h, pbf.ptr, pbf.len);
+    }
+    try testing.expectEqual(OK, charttable_set_style_json(h, style_json.ptr, style_json.len));
+    const path = try a.dupeZ(u8, std.mem.span(chart_env));
+    try testing.expectEqual(OK, charttable_add_source_pmtiles(h, "chart", path.ptr));
+    try testing.expectEqual(OK, charttable_attach_surface(h, 0, null, 512, 512));
+    try testing.expectEqual(OK, charttable_resize(h, 512, 512));
+    var v = View{ .lon = -76.4767, .lat = 38.9763, .zoom = 14 };
+    charttable_set_view(h, &v);
+
+    var spins: usize = 0;
+    while (spins < 3000 and charttable_idle(h) == 0) : (spins += 1) {
+        _ = charttable_tick(h, 16);
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try testing.expectEqual(@as(c_int, 1), charttable_idle(h));
+
+    const n = 512 * 512 * 4;
+    const dst = try a.alloc(u8, n);
+    try testing.expectEqual(OK, charttable_snapshot_rgba(h, dst.ptr, n));
+
+    // The scene has symbol quads to draw...
+    const scene = @import("map_object.zig");
+    _ = scene;
+    const built = handle(h).?.m.scene() orelse return error.NoScene;
+    var quad_ranges: usize = 0;
+    for (built.ranges) |r| {
+        if (r.prim == .quads) quad_ranges += 1;
+    }
+    std.debug.print("\ncapi symbols: {d} quad ranges, {d} quad verts\n", .{ quad_ranges, built.quads.len });
+    try testing.expect(quad_ranges > 0);
+    try testing.expect(built.quads.len > 600);
+
+    // ...and they reached the frame. Chart labels and symbol ink are dark
+    // against the S-52 day palette, which has no near-black fill.
+    var dark: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 4) {
+        if (dst[i] < 60 and dst[i + 1] < 60 and dst[i + 2] < 60) dark += 1;
+    }
+    std.debug.print("  dark pixels (symbol + label ink): {d}\n", .{dark});
+    try testing.expect(dark > 500);
+}
+
 test "capi: a bad style is refused and the old one stands" {
     const h = charttable_open(null) orelse return error.OpenFailed;
     defer charttable_close(h);
@@ -860,8 +1070,10 @@ test "capi: an archive binds by name and the map loads through it" {
         @import("util/lock.zig").sleepMs(1);
     }
     try testing.expectEqual(@as(c_int, 1), charttable_idle(h));
-    try testing.expectEqual(@as(c_int, 0), charttable_needs_redraw(h));
     try testing.expectEqual(@as(u32, 0), charttable_pending_tiles(h));
+    // Complete, but a frame is still OWED: nothing has drawn this camera
+    // yet. The two questions are deliberately different.
+    try testing.expectEqual(@as(c_int, 1), charttable_needs_redraw(h));
 
     // Offscreen render through the ABI: a snapshot with the chart's own
     // shallow-water blue in it.
@@ -871,6 +1083,13 @@ test "capi: an archive binds by name and the map loads through it" {
     try testing.expectEqual(OK, charttable_attach_surface(h, 0, null, 512, 512));
     try testing.expectEqual(ERR_ARG, charttable_snapshot_rgba(h, dst.ptr, 4));
     try testing.expectEqual(OK, charttable_snapshot_rgba(h, dst.ptr, n));
+    // Drawn: now there is nothing to do at all.
+    try testing.expectEqual(@as(c_int, 0), charttable_needs_redraw(h));
+    // ...until the camera moves, which is damage even though the tiles and
+    // the scene are untouched.
+    charttable_pan(h, 3, 0);
+    try testing.expectEqual(@as(c_int, 1), charttable_needs_redraw(h));
+    try testing.expectEqual(@as(c_int, 1), charttable_idle(h));
     var water: usize = 0;
     var i: usize = 0;
     while (i < n) : (i += 4) {
