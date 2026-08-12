@@ -8,6 +8,7 @@
 
 pub const camera = @import("camera.zig");
 pub const map = @import("map.zig");
+pub const map_object = @import("map_object.zig");
 pub const symbol_layout = @import("layout/symbol.zig");
 pub const scene = @import("scene/types.zig");
 pub const batch = @import("scene/batch.zig");
@@ -34,6 +35,7 @@ pub const clock = @import("util/clock.zig");
 test {
     _ = camera;
     _ = map;
+    _ = map_object;
     _ = symbol_layout;
     _ = scene;
     _ = batch;

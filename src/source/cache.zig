@@ -110,7 +110,7 @@ pub const Key = packed struct(u64) {
         return .{ .z = self.z, .x = self.x, .y = self.y };
     }
 
-    fn pack(self: Key) u64 {
+    pub fn pack(self: Key) u64 {
         return @bitCast(self);
     }
 };
