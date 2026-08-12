@@ -22,6 +22,8 @@ pub const mlt = @import("source/mlt.zig");
 pub const pmtiles = @import("source/pmtiles.zig");
 pub const fill = @import("layout/fill.zig");
 pub const line = @import("layout/line.zig");
+pub const sprite = @import("symbol/sprite.zig");
+pub const glyphs = @import("symbol/glyphs.zig");
 pub const gpu = @import("gpu/gpu.zig");
 pub const png = @import("util/png.zig");
 pub const lock = @import("util/lock.zig");
@@ -44,6 +46,8 @@ test {
     _ = pmtiles;
     _ = fill;
     _ = line;
+    _ = sprite;
+    _ = glyphs;
     _ = gpu;
     _ = png;
     _ = lock;
