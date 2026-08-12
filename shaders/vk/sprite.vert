@@ -15,7 +15,8 @@ layout(location = 3) in float a_weight; // SDF halo width, 0 for a sprite
 layout(location = 4) in uint  a_zwin;   // zmin | zmax<<16
 layout(location = 5) in uint  a_pack;   // flags | flip<<8 | tangent_q<<16
 layout(location = 6) in float a_depth;
-layout(location = 7) in vec4  a_color;  // stream B
+layout(location = 7) in vec4  a_color;    // stream B
+layout(location = 8) in vec4  a_color_hi; // the zoom pair's upper half
 
 layout(set = 1, binding = 0) uniform U {
     mat4  mvp;
@@ -62,6 +63,6 @@ void main() {
     bool vis = zmin <= u.zoom && u.zoom <= zmax;
     gl_Position = vis ? clip : vec4(0.0, 0.0, 2.0, 1.0);
     v_uv = a_uv;
-    v_color = a_color;
+    v_color = mix(a_color, a_color_hi, u.zoom_t);
     v_weight = a_weight;
 }

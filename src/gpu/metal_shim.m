@@ -78,6 +78,7 @@ struct ctm_frame {
     int cur_pipe;                  // -1 = none bound yet
     ctm_buf *cur_vbuf;
     ctm_buf *cur_pbuf;
+    ctm_buf *cur_pbuf_hi;
     ctm_tex *cur_tex;
 };
 
@@ -445,6 +446,15 @@ void ctm_bind_paint(ctm_frame *f, ctm_buf *b) {
     if (!f || !b || f->cur_pbuf == b) return;
     f->cur_pbuf = b;
     [f->enc setVertexBuffer:b->buf offset:0 atIndex:1];
+}
+
+/* The upper half of a zoom-interpolated paint pair. A scene with no such
+ * property binds its ordinary paint buffer here as well, and the shader's
+ * mix collapses to a no-op. */
+void ctm_bind_paint_hi(ctm_frame *f, ctm_buf *b) {
+    if (!f || !b || f->cur_pbuf_hi == b) return;
+    f->cur_pbuf_hi = b;
+    [f->enc setVertexBuffer:b->buf offset:0 atIndex:3];
 }
 
 void ctm_bind_texture(ctm_frame *f, ctm_tex *t) {

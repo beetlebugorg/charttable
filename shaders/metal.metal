@@ -108,10 +108,21 @@ struct FillOut {
     float4 color;
 };
 
+// The zoom-interpolated pair: buffer(3) is the same property one integer
+// zoom up. When no layer needs one the host binds buffer(1) here too, so the
+// mix collapses to a no-op and costs a scene with no such property nothing.
+static inline float4 paint_of(const device Paint *lo, const device Paint *hi,
+                              uint vid, constant U &u) {
+    float4 a = float4(lo[vid].color) / 255.0;
+    float4 b = float4(hi[vid].color) / 255.0;
+    return mix(a, b, u.zoom_t);
+}
+
 vertex FillOut fill_vert(uint vid [[vertex_id]],
                          const device Vertex *verts [[buffer(0)]],
                          const device Paint *paint [[buffer(1)]],
-                         constant U &u [[buffer(2)]]) {
+                         constant U &u [[buffer(2)]],
+                         const device Paint *paint_hi [[buffer(3)]]) {
     Vertex v = verts[vid];
     float4 clip = project(u, v.pos);
     float2 off = screen_offset(u, v.off, v.flags);
@@ -119,7 +130,7 @@ vertex FillOut fill_vert(uint vid [[vertex_id]],
     clip.z = v.depth * clip.w; // paint-order depth (ortho: w = 1)
     FillOut out;
     out.pos = gate(u, v.zmin, v.zmax) ? clip : float4(0.0, 0.0, 2.0, 1.0); // z=2 -> clipped
-    out.color = float4(paint[vid].color) / 255.0;
+    out.color = paint_of(paint, paint_hi, vid, u);
     return out;
 }
 
@@ -175,7 +186,8 @@ struct QuadOut {
 vertex QuadOut sprite_vert(uint vid [[vertex_id]],
                            const device Quad *verts [[buffer(0)]],
                            const device Paint *paint [[buffer(1)]],
-                           constant U &u [[buffer(2)]]) {
+                           constant U &u [[buffer(2)]],
+                           const device Paint *paint_hi [[buffer(3)]]) {
     Quad v = verts[vid];
     float tangent = float(v.tangent_q) / 256.0 * 6.2831853071795864;
 
@@ -194,7 +206,7 @@ vertex QuadOut sprite_vert(uint vid [[vertex_id]],
     QuadOut out;
     out.pos = gate(u, v.zmin, v.zmax) ? clip : float4(0.0, 0.0, 2.0, 1.0);
     out.uv = v.uv;
-    out.color = float4(paint[vid].color) / 255.0;
+    out.color = paint_of(paint, paint_hi, vid, u);
     out.weight = v.weight;
     return out;
 }

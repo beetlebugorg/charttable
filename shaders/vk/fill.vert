@@ -12,7 +12,11 @@ layout(location = 1) in vec2  a_off;    // screen offset, reference px
 layout(location = 2) in uint  a_zwin;   // zmin | zmax<<16
 layout(location = 3) in uint  a_flags;  // bit 0: map_align (low byte)
 layout(location = 4) in float a_depth;  // paint-order depth (0,1)
-layout(location = 5) in vec4  a_color;  // stream B, UNORM8x4 straight alpha
+layout(location = 5) in vec4  a_color;    // stream B, UNORM8x4 straight alpha
+// The zoom-interpolated pair's upper half: the same property one integer
+// zoom up, mixed by u.zoom_t. A scene with no such property binds stream B
+// here too, so the mix collapses to a no-op and costs nothing.
+layout(location = 6) in vec4  a_color_hi;
 
 layout(set = 1, binding = 0) uniform U {
     mat4  mvp;
@@ -63,5 +67,5 @@ void main() {
     clip.xy += screen_offset(a_off, a_flags) * u.px_to_clip * u.size_scale * clip.w;
     clip.z = a_depth * clip.w; // paint-order depth (ortho: w = 1)
     gl_Position = gate(a_zwin) ? clip : vec4(0.0, 0.0, 2.0, 1.0); // z=2 -> clipped
-    v_color = a_color;
+    v_color = mix(a_color, a_color_hi, u.zoom_t);
 }

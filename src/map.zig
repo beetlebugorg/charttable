@@ -57,6 +57,14 @@ pub const Built = struct {
     /// moves a zoom-only color, which is the whole point of keeping paint in
     /// its own stream (DESIGN.md: paint changes never re-layout).
     paint: []types.PaintVertex = &.{},
+    /// The upper half of a zoom-interpolated pair: the same properties
+    /// evaluated one integer zoom higher, mixed in the shader by
+    /// Uniforms.zoom_t. EMPTY unless some layer's paint depends on both zoom
+    /// and the feature — the only case that can be served no other way.
+    paint_hi: []types.PaintVertex = &.{},
+    /// The integer zoom `paint`/`paint_hi` bracket. Crossing it invalidates
+    /// the pair, so the Map rebuilds.
+    paint_zoom_floor: f64 = 0,
     indices: []const u32 = &.{},
     quads: []const types.Quad = &.{},
     quad_paint: []const types.PaintVertex = &.{},
@@ -91,6 +99,38 @@ const PaintKind = struct {
     /// ...and it moves with the camera, so a zoom change must.
     zoom_dependent: bool,
 };
+
+/// True when this layer's color or opacity varies with BOTH zoom and the
+/// feature — the case that needs the interpolated pair.
+fn hasZoomAndData(sl: *const styles.Layer) bool {
+    const names: [2][]const u8 = switch (sl.kind) {
+        .fill => .{ "fill-color", "fill-opacity" },
+        .line => .{ "line-color", "line-opacity" },
+        else => return false,
+    };
+    for (names) |n| {
+        const lp = sl.get(n) orelse continue;
+        if (lp.class == .zoom_and_data) return true;
+    }
+    return false;
+}
+
+/// This layer's color x opacity for the feature in `ctx`, at whatever zoom
+/// `ctx` carries. Used to evaluate the upper half of a zoom pair.
+fn evalPaintAt(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    ctx: *eval_mod.Context,
+    errors: *usize,
+) ?Color {
+    const color_name: []const u8 = if (sl.kind == .fill) "fill-color" else "line-color";
+    const opacity_name: []const u8 = if (sl.kind == .fill) "fill-opacity" else "line-opacity";
+    const cv = evalProp(arena, resolveProp(sl, color_name) orelse return null, ctx, .null, errors);
+    var color = asColor(cv) orelse return null;
+    const ov = evalProp(arena, resolveProp(sl, opacity_name) orelse return null, ctx, .{ .number = 1 }, errors);
+    color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
+    return color;
+}
 
 /// How this layer's COLOR and OPACITY behave. A feature-driven color is
 /// NOT refillable: each feature has its own value, and a refill has no
@@ -583,6 +623,9 @@ pub fn buildSceneWithRasters(
     var out = Built{};
     var verts: std.ArrayList(types.Vertex) = .empty;
     var paint: std.ArrayList(types.PaintVertex) = .empty;
+    var paint_hi: std.ArrayList(types.PaintVertex) = .empty;
+    var any_zoom_data = false;
+    const zoom_floor = @floor(view.zoom);
     var indices: std.ArrayList(u32) = .empty;
     var quads: std.ArrayList(types.Quad) = .empty;
     var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
@@ -679,6 +722,10 @@ pub fn buildSceneWithRasters(
             PaintKind{ .refillable = false, .zoom_dependent = false }
         else
             paintKindOf(sl);
+        // A property that varies with BOTH zoom and the feature is baked as
+        // a pair the shader mixes; nothing else can serve it.
+        const zoom_data = !is_pattern and hasZoomAndData(sl);
+        if (zoom_data) any_zoom_data = true;
 
         for (tiles) |st| {
             const tl = st.tile.layer(source_layer) orelse continue;
@@ -828,8 +875,21 @@ pub fn buildSceneWithRasters(
                 if (added == 0) continue;
                 const rgba = color.rgba8();
                 if (rgba[3] != OPAQUE_ALPHA) all_opaque = false;
+                // The pair's upper half: the same property one integer zoom
+                // up. Identical to the lower half unless it is zoom-and-data,
+                // so the shader's mix is a no-op for everything else.
+                var rgba_hi = rgba;
+                if (zoom_data) {
+                    var hi_ctx = eval_mod.Context{ .zoom = zoom_floor + 1 };
+                    hi_ctx.feature = mf.ref();
+                    if (evalPaintAt(arena, sl, &hi_ctx, &out.eval_errors)) |c| rgba_hi = c.rgba8();
+                }
                 try paint.ensureUnusedCapacity(arena, added);
-                for (0..added) |_| paint.appendAssumeCapacity(.{ .color = rgba });
+                try paint_hi.ensureUnusedCapacity(arena, added);
+                for (0..added) |_| {
+                    paint.appendAssumeCapacity(.{ .color = rgba });
+                    paint_hi.appendAssumeCapacity(.{ .color = rgba_hi });
+                }
                 for (verts.items[before..]) |*v| {
                     v.x += dx;
                     v.y += dy;
@@ -891,6 +951,8 @@ pub fn buildSceneWithRasters(
 
     out.vertices = verts.items;
     out.paint = paint.items;
+    out.paint_hi = if (any_zoom_data) paint_hi.items else &.{};
+    out.paint_zoom_floor = zoom_floor;
     out.indices = indices.items;
     out.quads = quads.items;
     out.quad_paint = quad_paint.items;
@@ -998,6 +1060,8 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
     var out = Built{};
     var verts: std.ArrayList(types.Vertex) = .empty;
     var paint: std.ArrayList(types.PaintVertex) = .empty;
+    var paint_hi: std.ArrayList(types.PaintVertex) = .empty;
+    var any_hi = false;
     var indices: std.ArrayList(u32) = .empty;
     var quads: std.ArrayList(types.Quad) = .empty;
     var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
@@ -1029,6 +1093,15 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
             quads.appendAssumeCapacity(moved);
         }
         try paint.appendSlice(arena, b.paint);
+        // Parts without a pair still need their rows in the hi stream, or
+        // the two streams desynchronize and every later vertex mixes with
+        // someone else's color.
+        if (b.paint_hi.len == b.paint.len) {
+            try paint_hi.appendSlice(arena, b.paint_hi);
+            any_hi = true;
+        } else {
+            try paint_hi.appendSlice(arena, b.paint);
+        }
         try quad_paint.appendSlice(arena, b.quad_paint);
         try indices.ensureUnusedCapacity(arena, b.indices.len);
         for (b.indices) |ix| indices.appendAssumeCapacity(ix + vbase);
@@ -1058,6 +1131,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
         out.eval_errors += b.eval_errors;
         out.compiled_props += b.compiled_props;
         out.paint_zoom = b.paint_zoom;
+        out.paint_zoom_floor = b.paint_zoom_floor;
     }
 
     std.mem.sort(types.Range, ranges.items, {}, struct {
@@ -1068,6 +1142,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
 
     out.vertices = verts.items;
     out.paint = paint.items;
+    out.paint_hi = if (any_hi) paint_hi.items else &.{};
     out.indices = indices.items;
     out.quads = quads.items;
     out.quad_paint = quad_paint.items;
@@ -1917,6 +1992,68 @@ test "real chart: Annapolis first light" {
 // against the tile's OWN origin, symbols built once over all tiles (so
 // collision stays global), then concatenated — must land exactly where a
 // single monolithic build does.
+// A property depending on BOTH zoom and the feature cannot be baked (it has
+// to follow the camera) and cannot be refilled (every feature has its own
+// curve). The layout brackets it at the two integer zooms and the shader
+// mixes by zoom_t.
+test "buildScene: a zoom-and-data color bakes the pair the shader mixes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Per-feature endpoints, so it is zoom-and-data rather than zoom-only:
+    // at z10 the feature's own color, at z11 black.
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "water", "type": "fill", "source": "chart",
+        \\   "source-layer": "areas",
+        \\   "filter": ["==", ["get", "kind"], "water"],
+        \\   "paint": {"fill-color": ["interpolate", ["linear"], ["zoom"],
+        \\      10, ["match", ["get", "depth_band"], "deep", "#ffffff", "#888888"],
+        \\      11, "#000000"]}}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+    try std.testing.expectEqual(
+        @import("style/compile.zig").Class.zoom_and_data,
+        style.layer("water").?.get("fill-color").?.class,
+    );
+
+    const tile = try testTile(a);
+    const id = coord.TileId{ .z = 10, .x = 0, .y = 0 };
+    const rect = id.worldRect();
+    const built = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 10.0,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{});
+
+    // The pair is present and brackets the build zoom.
+    try std.testing.expectEqual(built.paint.len, built.paint_hi.len);
+    try std.testing.expect(built.paint_hi.len > 0);
+    try std.testing.expectEqual(@as(f64, 10), built.paint_zoom_floor);
+    // Lower half: the feature's own color at z10. Upper half: black at z11.
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, built.paint[0].color);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, built.paint_hi[0].color);
+
+    // A style with no such property carries no second stream at all — the
+    // whole point of keeping it parallel instead of widening PaintVertex.
+    const plain =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "water", "type": "fill", "source": "chart",
+        \\   "source-layer": "areas", "paint": {"fill-color": "#00ff00"}}]}
+    ;
+    var style2 = try styles.parse(std.testing.allocator, plain);
+    defer style2.deinit();
+    const b2 = try buildScene(a, &style2, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 10.0,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{});
+    try std.testing.expect(b2.paint.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), b2.paint_hi.len);
+}
+
 test "concatScenes: per-tile geometry plus a global symbol pass equals one build" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

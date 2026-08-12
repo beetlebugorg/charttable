@@ -471,6 +471,12 @@ pub const Map = struct {
         if (self.style == null) return false;
         if (!self.has_coverage) return true;
         if (@abs(self.buildTargetZoom() - self.cov_zoom) > self.opts.zoom_rebuild) return true;
+        // A zoom-interpolated paint pair brackets one integer zoom. Drift
+        // across that boundary and the two halves no longer bracket the
+        // camera, so the shader would mix the wrong pair.
+        if (self.built) |b| {
+            if (b.paint_hi.len > 0 and @floor(self.buildTargetZoom()) != b.paint_zoom_floor) return true;
+        }
         const he = self.cam.halfExtents();
         return @abs(cameras.wrapDx(self.cam.center.x, self.cov_origin.x)) + he.x > self.cov_hw or
             @abs(self.cam.center.y - self.cov_origin.y) + he.y > self.cov_hh;
@@ -548,6 +554,7 @@ pub const Map = struct {
         try g.uploadScene(self.gpa, .{
             .vertices = b.vertices,
             .paint = b.paint,
+            .paint_hi = b.paint_hi,
             .indices = b.indices,
             .quads = b.quads,
             .quad_paint = b.quad_paint,

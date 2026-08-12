@@ -85,6 +85,9 @@ void ctm_bind_vbuf(ctm_frame *f, ctm_buf *b);
 /* Stream B: evaluated paint (scene.PaintVertex) at [[buffer(1)]], one entry
  * per stream-A vertex of the CURRENTLY bound geometry buffer. */
 void ctm_bind_paint(ctm_frame *f, ctm_buf *b);
+/* The upper half of a zoom-interpolated paint pair, at vertex [[buffer(3)]].
+ * Bind the ordinary paint buffer when the scene has no such property. */
+void ctm_bind_paint_hi(ctm_frame *f, ctm_buf *b);
 void ctm_bind_texture(ctm_frame *f, ctm_tex *t);
 /* The 128-byte scene.Uniforms block: vertex [[buffer(2)]] + fragment
  * [[buffer(1)]] (the SDF fragment stage reads the halo color). */

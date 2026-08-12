@@ -85,9 +85,15 @@ pub const Quad = extern struct {
 
 /// Stream B: evaluated paint, one per stream-A vertex (triangle vertices and
 /// quad vertices each get their own stream-B buffer). Straight alpha. A
-/// sprite ignores it; an SDF glyph tints by it. Grows as paint properties
-/// move here (width multipliers, zoom-interpolated pairs) — today color is
-/// the whole stream.
+/// sprite ignores it; an SDF glyph tints by it.
+///
+/// A property that depends on BOTH zoom and the feature cannot be refilled
+/// per frame (each feature has its own curve) and cannot be baked (it has to
+/// follow the camera), so the layout evaluates it at the two integer zooms
+/// bracketing the build and the shader mixes by Uniforms.zoom_t. That second
+/// value rides a PARALLEL stream rather than widening this one: a scene with
+/// no such property carries no extra bytes at all, and the backend binds the
+/// same buffer twice so the shader's mix collapses to a no-op.
 pub const PaintVertex = extern struct {
     color: [4]u8,
 };

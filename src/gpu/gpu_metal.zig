@@ -106,6 +106,9 @@ pub const Gpu = struct {
         vertices: []const scene.Vertex = &.{},
         /// Stream B for `vertices`: one entry per vertex.
         paint: []const scene.PaintVertex = &.{},
+        /// The zoom pair's upper half, parallel to `paint`. Empty when no
+        /// layer's paint depends on both zoom and the feature.
+        paint_hi: []const scene.PaintVertex = &.{},
         /// u32 triangle indices; triangle ranges' first/count index HERE.
         indices: []const u32 = &.{},
         /// Quad vertices (6 per quad); quad ranges' first/count index HERE.
@@ -122,6 +125,7 @@ pub const Gpu = struct {
     pub const Scene = struct {
         vbuf: ?*mc.ctm_buf = null, // scene.Vertex stream, indexed by ibuf
         pbuf: ?*mc.ctm_buf = null, // scene.PaintVertex stream, parallel to vbuf
+        pbuf_hi: ?*mc.ctm_buf = null, // the zoom pair's upper half; == pbuf when unused
         ibuf: ?*mc.ctm_buf = null, // u32 indices; triangle ranges index HERE
         qbuf: ?*mc.ctm_buf = null, // scene.Quad stream (6 verts per quad)
         qpbuf: ?*mc.ctm_buf = null, // scene.PaintVertex stream, parallel to qbuf
@@ -307,6 +311,11 @@ pub const Gpu = struct {
         if (data.vertices.len > 0 and data.indices.len > 0) {
             out.vbuf = try self.newBuffer(std.mem.sliceAsBytes(data.vertices));
             out.pbuf = try self.newBuffer(std.mem.sliceAsBytes(data.paint));
+            // No pair means the shader mixes the stream with itself.
+            out.pbuf_hi = if (data.paint_hi.len == data.paint.len)
+                try self.newBuffer(std.mem.sliceAsBytes(data.paint_hi))
+            else
+                out.pbuf;
             out.ibuf = try self.newBuffer(std.mem.sliceAsBytes(data.indices));
             out.index_count = @intCast(data.indices.len);
             out.paint_count = @intCast(data.paint.len);
@@ -353,6 +362,10 @@ pub const Gpu = struct {
     fn freeSceneValue(self: *Gpu, s: *Scene) void {
         _ = self;
         if (s.vbuf) |b| mc.ctm_free_buffer(b);
+        if (s.pbuf_hi) |b| {
+            // Aliased onto pbuf when the scene has no pair: free once.
+            if (b != s.pbuf) mc.ctm_free_buffer(b);
+        }
         if (s.pbuf) |b| mc.ctm_free_buffer(b);
         if (s.ibuf) |b| mc.ctm_free_buffer(b);
         if (s.qbuf) |b| mc.ctm_free_buffer(b);
@@ -391,6 +404,7 @@ pub const Gpu = struct {
             mc.ctm_set_pipeline(f, mc.CTM_PIPE_FILL);
             mc.ctm_bind_vbuf(f, s.vbuf.?);
             mc.ctm_bind_paint(f, s.pbuf.?);
+            mc.ctm_bind_paint_hi(f, s.pbuf_hi.?);
             sendUniforms(f, last_u, u);
         } else {
             // The batcher excludes ALL opaque triangle ranges from phase B,
@@ -477,6 +491,7 @@ pub const Gpu = struct {
                         mc.ctm_set_pipeline(f, mc.CTM_PIPE_FILL);
                         mc.ctm_bind_vbuf(f, s.vbuf.?);
                         mc.ctm_bind_paint(f, s.pbuf.?);
+                        mc.ctm_bind_paint_hi(f, s.pbuf_hi.?);
                     }
                     sendUniforms(f, &last_u, &uu);
                     mc.ctm_draw_indexed(f, s.ibuf.?, d.first, d.count);
@@ -500,6 +515,9 @@ pub const Gpu = struct {
                     mc.ctm_set_pipeline(f, if (is_sdf) mc.CTM_PIPE_SDF else mc.CTM_PIPE_SPRITE);
                     mc.ctm_bind_vbuf(f, s.qbuf.?);
                     mc.ctm_bind_paint(f, s.qpbuf.?);
+                    // Quads carry no zoom pair yet; the shader mixes the
+                    // stream with itself.
+                    mc.ctm_bind_paint_hi(f, s.qpbuf.?);
                     mc.ctm_bind_texture(f, tex);
                     sendUniforms(f, &last_u, &uu);
                     mc.ctm_draw(f, d.first, d.count);
