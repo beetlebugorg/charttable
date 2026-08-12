@@ -950,6 +950,32 @@ test "first light: style to pixels through the Metal backend" {
     try std.testing.expectEqual([4]u8{ 0, 255, 0, 255 }, px.at(rgba, 64, 64));
 }
 
+/// Test helper: decode the (2*radius+1)^2 tile neighbourhood around `center`
+/// at zoom `z`, skipping what the archive does not hold.
+fn loadTileNeighborhood(
+    a: std.mem.Allocator,
+    reader: *@import("source/pmtiles.zig").Reader,
+    z: u8,
+    center: coord.TileId,
+    radius: i32,
+    out: *std.ArrayList(SourcedTile),
+) !void {
+    const mlt = @import("source/mlt.zig");
+    var dy: i32 = -radius;
+    while (dy <= radius) : (dy += 1) {
+        var dx: i32 = -radius;
+        while (dx <= radius) : (dx += 1) {
+            const tx: i64 = @as(i64, center.x) + dx;
+            const ty: i64 = @as(i64, center.y) + dy;
+            if (tx < 0 or ty < 0) continue;
+            const bytes = reader.getTile(a, z, @intCast(tx), @intCast(ty)) catch continue orelse continue;
+            const tile = try a.create(mvt.Tile);
+            tile.* = mlt.decode(a, bytes) catch continue;
+            try out.append(a, .{ .id = .{ .z = z, .x = @intCast(tx), .y = @intCast(ty) }, .tile = tile });
+        }
+    }
+}
+
 // The real thing: the Annapolis harbor chart (US5MD1MC) through the whole
 // stack — PMTiles → MLT decode → tile57's own day style → buildScene →
 // Metal — asserting the S-52 day palette's land and shallow-water fills
@@ -960,7 +986,6 @@ test "real chart: Annapolis first light" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpu = @import("gpu/gpu.zig");
     const pmtiles = @import("source/pmtiles.zig");
-    const mlt = @import("source/mlt.zig");
     const ct_build = @import("ct_build");
     const io = std.Io.Threaded.global_single_threaded.io();
     const gpa = std.testing.allocator;
@@ -1021,22 +1046,7 @@ test "real chart: Annapolis first light" {
     const center_w = coord.lonLatToWorld(-76.4767, 38.9763);
     const center_tile = coord.fromWorld(center_w, z);
     var tiles: std.ArrayList(SourcedTile) = .empty;
-    var dy: i32 = -1;
-    while (dy <= 1) : (dy += 1) {
-        var dx: i32 = -1;
-        while (dx <= 1) : (dx += 1) {
-            const tx: i64 = @as(i64, center_tile.x) + dx;
-            const ty: i64 = @as(i64, center_tile.y) + dy;
-            if (tx < 0 or ty < 0) continue;
-            const bytes = reader.getTile(a, z, @intCast(tx), @intCast(ty)) catch continue orelse continue;
-            const tile = try a.create(mvt.Tile);
-            tile.* = mlt.decode(a, bytes) catch continue;
-            try tiles.append(a, .{
-                .id = .{ .z = z, .x = @intCast(tx), .y = @intCast(ty) },
-                .tile = tile,
-            });
-        }
-    }
+    try loadTileNeighborhood(a, &reader, z, center_tile, 1, &tiles);
     try std.testing.expect(tiles.items.len >= 4); // harbor coverage exists
 
     const origin = cameras.Vec2{ .x = center_w[0], .y = center_w[1] };
@@ -1194,6 +1204,87 @@ test "real chart: Annapolis first light" {
         }
         try std.testing.expect(markers > 0);
         g.savePng(a, try std.fmt.allocPrint(a, "{s}/annapolis-addimage.png", .{ct_build.out_dir}), u) catch {};
+    }
+
+    // ---- pattern fills over the depth areas -------------------------------
+    // The sandwich the S-52 patterns need: fill-areas#oscl UNDER the hatch
+    // UNDER fill-areas. A pattern layer must draw OVER the depth areas and
+    // still let them through — the thing a flat-colour fallback would bury,
+    // which is why buildScene used to skip fill-pattern layers entirely.
+    //
+    // AP(OVERSC01) itself needs a MULTI-CELL bundle: tile57's baker emits the
+    // OVERSC01 coverage only where a strictly finer cell also rides the tile
+    // (scene/bake_enc.zig — whole-view overscale is the HUD readout's job, not
+    // the hatch's), and US5MD1MC is one cell. So the assertion below covers
+    // the seabed-quality patterns this archive does carry, and the OVERSC01
+    // layer check arms itself automatically on a bundle that has them.
+    if (assets.sprite != null) {
+        const over_z: u8 = 16;
+        const over_zoom: f64 = 16.0;
+        var over_tiles: std.ArrayList(SourcedTile) = .empty;
+        try loadTileNeighborhood(a, &reader, over_z, coord.fromWorld(center_w, over_z), 1, &over_tiles);
+        try std.testing.expect(over_tiles.items.len >= 4);
+        const over = try buildScene(a, &style, over_tiles.items, .{ .zoom = over_zoom, .origin = origin }, assets);
+
+        var oscl_layer: ?u32 = null;
+        for (style.layers, 0..) |*sl, li| {
+            if (std.mem.eql(u8, sl.id, "overscale")) oscl_layer = @intCast(li);
+        }
+        var has_oscl_data = false;
+        for (over_tiles.items) |st| {
+            const tl = st.tile.layer("area_patterns") orelse continue;
+            const ki = tl.keyIndex("pattern_name") orelse continue;
+            for (tl.features) |*ft| {
+                const v = tl.property(ft, ki) orelse continue;
+                if (v == .string and std.mem.eql(u8, v.string, "OVERSC01")) has_oscl_data = true;
+            }
+        }
+        var hatch_ranges: usize = 0;
+        var oscl_ranges: usize = 0;
+        for (over.ranges) |r| {
+            if (r.kind != .pattern) continue;
+            hatch_ranges += 1;
+            if (oscl_layer != null and r.paint_key == oscl_layer.?) oscl_ranges += 1;
+        }
+        std.debug.print(
+            "  z{d} patterns: {d} ranges, {d} of them pattern ({d} overscale, data {}), {d} cells\n",
+            .{ over_zoom, over.ranges.len, hatch_ranges, oscl_ranges, has_oscl_data, over.patterns.len },
+        );
+        try std.testing.expect(hatch_ranges > 0);
+        if (has_oscl_data) try std.testing.expect(oscl_ranges > 0);
+
+        try g.uploadScene(a, .{
+            .vertices = over.vertices,
+            .paint = over.paint,
+            .indices = over.indices,
+            .quads = over.quads,
+            .quad_paint = over.quad_paint,
+            .ranges = over.ranges,
+            .patterns = over.patterns,
+        });
+        var over_cam = cameras.Camera{
+            .origin = origin,
+            .center = origin,
+            .zoom = over_zoom,
+            .vw = 512,
+            .vh = 512,
+        };
+        _ = &over_cam;
+        const over_anchor = over_cam.worldToScreen(origin);
+        var ou = u;
+        ou.mvp = over_cam.mvpOrigin(origin);
+        ou.px_to_clip = over_cam.pxToClip();
+        ou.zoom = @floatFromInt(types.zq(over_zoom));
+        ou.anchor_px = .{ @floatCast(over_anchor.x), @floatCast(over_anchor.y) };
+        const over_rgba = try g.renderOffscreen(a, ou);
+        var over_water: usize = 0;
+        for (0..total) |pi| {
+            const p = over_rgba[pi * 4 ..][0..4];
+            if (p[0] == 130 and p[1] == 202 and p[2] == 255) over_water += 1;
+        }
+        // The hatch is on top of the water, not instead of it.
+        try std.testing.expect(over_water > total / 10);
+        g.savePng(a, try std.fmt.allocPrint(a, "{s}/annapolis-overscale.png", .{ct_build.out_dir}), ou) catch {};
     }
 }
 
