@@ -47,6 +47,11 @@ pub const Provider = struct {
 
     mu: Lock = .{},
     next_id: u64 = 1,
+    /// Added to every request id this provider hands out. A host with more
+    /// than one provided source answers them all through one entry point, so
+    /// the ids have to be unique ACROSS providers -- numbering each from 1
+    /// means source A's bytes can be delivered to source B's tile.
+    id_bias: u64 = 0,
     /// Tile id -> what we know about it.
     entries: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
     /// Request id -> tile id, so a response finds its slot.
@@ -98,7 +103,7 @@ pub const Provider = struct {
         const gop = self.entries.getOrPut(self.gpa, key) catch return .failed;
         if (!gop.found_existing) {
             // First ask for this tile: raise a request and park.
-            const rid = self.next_id;
+            const rid = self.id_bias + self.next_id;
             self.next_id += 1;
             gop.value_ptr.* = .{ .asked = rid };
             self.by_id.put(self.gpa, rid, key) catch {};

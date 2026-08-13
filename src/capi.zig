@@ -457,13 +457,42 @@ fn setErr(e: anyerror) c_int {
 
 /// Route a style source name through the host. Every tile of that source
 /// becomes a callback, answered by charttable_resource_respond.
+/// What a host-provided source serves. A zeroed struct is what
+/// charttable_add_source_provided gives: vector MVT over z0-22.
+pub const ProvidedOpts = extern struct {
+    kind: u32 = 0, // 0 vector, 1 raster
+    encoding: u32 = 0, // 0 mvt, 1 mlt
+    minzoom: u32 = 0,
+    maxzoom: u32 = 22,
+};
+
 export fn charttable_add_source_provided(h: ?*anyopaque, name: [*:0]const u8) callconv(.c) c_int {
+    return charttable_add_source_provided_opts(h, name, null);
+}
+
+export fn charttable_add_source_provided_opts(
+    h: ?*anyopaque,
+    name: [*:0]const u8,
+    opts: ?*const ProvidedOpts,
+) callconv(.c) c_int {
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
+    const o: ProvidedOpts = if (opts) |p| p.* else .{};
     const pr = self.gpa.create(Handle.Provided) catch return ERR_MEMORY;
     errdefer self.gpa.destroy(pr);
     pr.name = self.gpa.dupeZ(u8, std.mem.span(name)) catch return ERR_MEMORY;
     pr.provider = providers.Provider.init(self.gpa);
+    // Request ids must be unique across ALL provided sources: one callback
+    // and one respond() serve every source, so two providers numbering from
+    // 1 would answer each other's requests.
+    pr.provider.id_bias = @as(u64, self.provided.items.len + 1) << 48;
+    pr.provider.kind = if (o.kind == 1) .raster else .vector;
+    pr.provider.encoding = if (o.encoding == 1) .mlt else .mvt;
+    // A source that stops at z12 must SAY so: the build zoom is clamped by
+    // the shallowest maxzoom bound, and a default of 22 sends the map asking
+    // for tiles the host has to answer 404 to, forever.
+    pr.provider.minzoom = @intCast(@min(o.minzoom, 22));
+    pr.provider.maxzoom = @intCast(@min(@max(o.maxzoom, o.minzoom), 22));
     self.provided.append(self.gpa, pr) catch {
         self.gpa.free(pr.name);
         return ERR_MEMORY;
@@ -501,6 +530,14 @@ export fn charttable_resource_respond(
         else => .failed,
     };
     const slice: []const u8 = if (st == .ok and bytes != null) bytes.?[0..len] else &.{};
+    // The id says which source asked (see id_bias); only that provider is
+    // offered the answer. Broadcasting it was how a raster tile's PNG ended
+    // up being decoded as someone else's vector tile.
+    const which = req_id >> 48;
+    if (which >= 1 and which <= self.provided.items.len) {
+        self.provided.items[which - 1].provider.respond(req_id, slice, st);
+        return;
+    }
     for (self.provided.items) |pr| pr.provider.respond(req_id, slice, st);
 }
 
@@ -1096,4 +1133,66 @@ test "capi: an archive binds by name and the map loads through it" {
         if (dst[i] == 130 and dst[i + 1] == 202 and dst[i + 2] == 255) water += 1;
     }
     try testing.expect(water > (512 * 512) / 20);
+}
+
+/// Records every ask without answering, so a test can answer them by hand.
+const TwoSourceProbe = struct {
+    var ids: [32]u64 = @splat(0);
+    var names: [32][24]u8 = @splat(@splat(0));
+    var seen: usize = 0;
+
+    fn onResource(req_id: u64, source: [*:0]const u8, z: u32, x: u32, y: u32, user: ?*anyopaque) callconv(.c) void {
+        _ = .{ user, z, x, y };
+        if (seen >= ids.len) return;
+        const name = std.mem.span(source);
+        ids[seen] = req_id;
+        @memcpy(names[seen][0..@min(name.len, 24)], name[0..@min(name.len, 24)]);
+        seen += 1;
+    }
+};
+
+test "capi: two provided sources do not answer each other's requests" {
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"a": {"type": "vector", "tiles": ["https://a/{z}/{x}/{y}"], "maxzoom": 14},
+        \\             "b": {"type": "vector", "tiles": ["https://b/{z}/{x}/{y}"], "maxzoom": 14}},
+        \\ "layers": [{"id": "bg", "type": "background",
+        \\   "paint": {"background-color": "#000000"}}]}
+    ;
+    const h = charttable_open(&.{ .workers = 2 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+    TwoSourceProbe.seen = 0;
+    try testing.expectEqual(OK, charttable_set_style_json(h, style.ptr, style.len));
+    charttable_set_resource_provider(h, TwoSourceProbe.onResource, null);
+    try testing.expectEqual(OK, charttable_add_source_provided(h, "a"));
+    try testing.expectEqual(OK, charttable_add_source_provided(h, "b"));
+    try testing.expectEqual(OK, charttable_resize(h, 512, 512));
+    var v = View{ .lon = -76.4767, .lat = 38.9763, .zoom = 14 };
+    charttable_set_view(h, &v);
+
+    var spins: usize = 0;
+    while (spins < 200 and TwoSourceProbe.seen < 2) : (spins += 1) {
+        _ = charttable_tick(h, 16);
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try testing.expect(TwoSourceProbe.seen >= 2);
+
+    // Every id is distinct. They used to be numbered from 1 per provider, so
+    // source b's first request had the same id as source a's -- and respond()
+    // handed the answer to both.
+    for (TwoSourceProbe.ids[0..TwoSourceProbe.seen], 0..) |id, i| {
+        for (TwoSourceProbe.ids[0..TwoSourceProbe.seen], 0..) |other, j| {
+            if (i == j) continue;
+            try testing.expect(id != other);
+        }
+    }
+
+    // And an id carries which source asked, so an answer reaches one of them.
+    var from_a: usize = 0;
+    var from_b: usize = 0;
+    for (TwoSourceProbe.names[0..TwoSourceProbe.seen]) |n| {
+        if (n[0] == 'a') from_a += 1;
+        if (n[0] == 'b') from_b += 1;
+    }
+    try testing.expect(from_a > 0 and from_b > 0);
 }

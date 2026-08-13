@@ -136,8 +136,20 @@ void charttable_set_resource_provider(charttable *, charttable_resource_fn cb,
                                       void *user);
 
 /* Route a style source name through the host: every tile of that source
- * becomes a callback. */
+ * becomes a callback. Vector MVT over z0-22. */
 int charttable_add_source_provided(charttable *, const char *name);
+
+/* The same, saying what the source actually serves. A source that stops at
+ * z12 must say so: the build zoom is clamped by the shallowest maxzoom, and
+ * the default 22 makes the map ask for tiles you can only 404. */
+typedef struct {
+    uint32_t kind;     /* 0 vector, 1 raster (PNG/JPEG bytes) */
+    uint32_t encoding; /* 0 MVT, 1 MLT */
+    uint32_t minzoom, maxzoom;
+} charttable_provided_opts;
+
+int charttable_add_source_provided_opts(charttable *, const char *name,
+                                        const charttable_provided_opts *);
 
 /* Answer one request. status 0 = bytes attached, 1 = no tile there, 2 = tried
  * and failed. Only status 0 reads `bytes`, which is copied before this
