@@ -476,9 +476,27 @@ pub const Collider = struct {
     const CELL: f32 = 64;
     gpa: std.mem.Allocator,
     cells: std.AutoHashMap(u64, std.ArrayList(Box)),
+    /// Every recorded box as center + half extents. The slack scan reads all
+    /// of them, not just the cells a box covers: a distant box still
+    /// converges onto this one after enough zoom out.
+    recorded: std.ArrayList(Extents),
+
+    const Extents = struct { cx: f32, cy: f32, hx: f32, hy: f32 };
+
+    pub const PlaceResult = struct {
+        placed: bool,
+        /// Zoom levels the view can zoom out below the build zoom before the
+        /// box first touches an already recorded neighbor. null when nothing
+        /// is recorded yet. Measured only for a placed box.
+        slack: ?f32 = null,
+    };
 
     pub fn init(gpa: std.mem.Allocator) Collider {
-        return .{ .gpa = gpa, .cells = std.AutoHashMap(u64, std.ArrayList(Box)).init(gpa) };
+        return .{
+            .gpa = gpa,
+            .cells = std.AutoHashMap(u64, std.ArrayList(Box)).init(gpa),
+            .recorded = .empty,
+        };
     }
 
     fn key(cx: i32, cy: i32) u64 {
@@ -489,43 +507,93 @@ pub const Collider = struct {
         return a.x0 < b.x1 and b.x0 < a.x1 and a.y0 < b.y1 and b.y0 < a.y1;
     }
 
-    /// True (and records the box) when `box` fits without overlap.
-    /// `ignore_placement` boxes never block others: check but don't record.
-    pub fn place(self: *Collider, box: Box, allow_overlap: bool, ignore_placement: bool) !bool {
+    /// True when no recorded box overlaps `box`.
+    fn fits(self: *const Collider, box: Box) bool {
         const cx0: i32 = @intFromFloat(@floor(box.x0 / CELL));
         const cy0: i32 = @intFromFloat(@floor(box.y0 / CELL));
         const cx1: i32 = @intFromFloat(@floor(box.x1 / CELL));
         const cy1: i32 = @intFromFloat(@floor(box.y1 / CELL));
-        if (!allow_overlap) {
-            var cy = cy0;
-            while (cy <= cy1) : (cy += 1) {
-                var cx = cx0;
-                while (cx <= cx1) : (cx += 1) {
-                    const cell = self.cells.get(key(cx, cy)) orelse continue;
-                    for (cell.items) |b| {
-                        if (overlaps(box, b)) return false;
-                    }
-                }
-            }
-        }
-        if (!ignore_placement) {
-            var cy = cy0;
-            while (cy <= cy1) : (cy += 1) {
-                var cx = cx0;
-                while (cx <= cx1) : (cx += 1) {
-                    const gop = try self.cells.getOrPut(key(cx, cy));
-                    if (!gop.found_existing) gop.value_ptr.* = .empty;
-                    try gop.value_ptr.append(self.gpa, box);
+        var cy = cy0;
+        while (cy <= cy1) : (cy += 1) {
+            var cx = cx0;
+            while (cx <= cx1) : (cx += 1) {
+                const cell = self.cells.get(key(cx, cy)) orelse continue;
+                for (cell.items) |b| {
+                    if (overlaps(box, b)) return false;
                 }
             }
         }
         return true;
     }
 
+    /// Record `box` so later placements collide with it.
+    fn record(self: *Collider, box: Box) !void {
+        const cx0: i32 = @intFromFloat(@floor(box.x0 / CELL));
+        const cy0: i32 = @intFromFloat(@floor(box.y0 / CELL));
+        const cx1: i32 = @intFromFloat(@floor(box.x1 / CELL));
+        const cy1: i32 = @intFromFloat(@floor(box.y1 / CELL));
+        var cy = cy0;
+        while (cy <= cy1) : (cy += 1) {
+            var cx = cx0;
+            while (cx <= cx1) : (cx += 1) {
+                const gop = try self.cells.getOrPut(key(cx, cy));
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(self.gpa, box);
+            }
+        }
+        try self.recorded.append(self.gpa, .{
+            .cx = (box.x0 + box.x1) * 0.5,
+            .cy = (box.y0 + box.y1) * 0.5,
+            .hx = (box.x1 - box.x0) * 0.5,
+            .hy = (box.y1 - box.y0) * 0.5,
+        });
+    }
+
+    /// Zoom levels until `box` first touches a recorded box as the view
+    /// zooms out, or null with nothing recorded. Anchors converge on screen
+    /// as 2^(z - Z) while a box holds its screen size, so a pair whose
+    /// centers are `d` px apart with combined half extents `need` on the
+    /// separating axis touches at z = Z - log2(d / need). Both axes must
+    /// close before boxes overlap, so the wider axis ratio governs a pair,
+    /// and the nearest pair governs the box.
+    fn slackLevels(self: *const Collider, box: Box) ?f32 {
+        if (self.recorded.items.len == 0) return null;
+        const cx = (box.x0 + box.x1) * 0.5;
+        const cy = (box.y0 + box.y1) * 0.5;
+        const hx = (box.x1 - box.x0) * 0.5;
+        const hy = (box.y1 - box.y0) * 0.5;
+        var min_ratio = std.math.floatMax(f32);
+        for (self.recorded.items) |r| {
+            const rx = @abs(cx - r.cx) / @max(hx + r.hx, 1e-3);
+            const ry = @abs(cy - r.cy) / @max(hy + r.hy, 1e-3);
+            min_ratio = @min(min_ratio, @max(rx, ry));
+        }
+        return @max(0.0, @log2(min_ratio));
+    }
+
+    /// True (and records the box) when `box` fits without overlap.
+    /// `ignore_placement` boxes never block others: check but don't record.
+    pub fn place(self: *Collider, box: Box, allow_overlap: bool, ignore_placement: bool) !bool {
+        if (!allow_overlap and !self.fits(box)) return false;
+        if (!ignore_placement) try self.record(box);
+        return true;
+    }
+
+    /// place(), and for an admitted box also its zoom-out slack. The caller
+    /// turns the slack into a zmin gate so the box hides itself before it
+    /// can reach a neighbor.
+    pub fn placeWithSlack(self: *Collider, box: Box, allow_overlap: bool, ignore_placement: bool) !PlaceResult {
+        if (!allow_overlap and !self.fits(box)) return .{ .placed = false };
+        const slack = self.slackLevels(box);
+        if (!ignore_placement) try self.record(box);
+        return .{ .placed = true, .slack = slack };
+    }
+
     pub fn deinit(self: *Collider) void {
         var it = self.cells.valueIterator();
         while (it.next()) |cell| cell.deinit(self.gpa);
         self.cells.deinit();
+        self.recorded.deinit(self.gpa);
     }
 };
 
@@ -684,6 +752,30 @@ test "placeAlongLine: text-max-angle skips a hairpin" {
         .max_angle_deg = 0,
     }, &out);
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
+}
+
+test "collider: placeWithSlack measures zoom-out room to the nearest neighbor" {
+    var c = Collider.init(std.testing.allocator);
+    defer c.deinit();
+    // Nothing recorded yet: placed, no slack to report.
+    const first = try c.placeWithSlack(.{ .x0 = 0, .y0 = 0, .x1 = 10, .y1 = 10 }, false, false);
+    try std.testing.expect(first.placed);
+    try std.testing.expect(first.slack == null);
+    // Centers 30 px apart on x, combined half extents 10: the pair touches
+    // after log2(30/10) levels of zoom out.
+    const second = try c.placeWithSlack(.{ .x0 = 30, .y0 = 0, .x1 = 40, .y1 = 10 }, false, false);
+    try std.testing.expect(second.placed);
+    try std.testing.expectApproxEqAbs(@log2(@as(f32, 3.0)), second.slack.?, 1e-4);
+    // An overlapping box is still rejected, and reports no slack.
+    const rejected = try c.placeWithSlack(.{ .x0 = 5, .y0 = 5, .x1 = 15, .y1 = 15 }, false, false);
+    try std.testing.expect(!rejected.placed);
+    try std.testing.expect(rejected.slack == null);
+    // The nearest neighbor governs: 30 px to the second box, 60 to the first.
+    const third = try c.placeWithSlack(.{ .x0 = 60, .y0 = 0, .x1 = 70, .y1 = 10 }, false, false);
+    try std.testing.expectApproxEqAbs(@log2(@as(f32, 3.0)), third.slack.?, 1e-4);
+    // A pair separated on y measures on y: 40 px apart, half extents 10.
+    const above = try c.placeWithSlack(.{ .x0 = 0, .y0 = 40, .x1 = 10, .y1 = 50 }, false, false);
+    try std.testing.expectApproxEqAbs(@log2(@as(f32, 4.0)), above.slack.?, 1e-4);
 }
 
 test "collider: overlap rejected, allow-overlap passes, ignored boxes don't block" {

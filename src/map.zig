@@ -921,6 +921,7 @@ pub fn buildSceneWithRasters(
                             .sym = sym,
                             .depth = feat_depth,
                             .size_scale = view.size_scale,
+                            .zoom = view.zoom,
                         }, &quads, &quad_paint, &text_scratch, &text_paint_scratch, &collider, &missing, &out.eval_errors);
                         continue;
                     },
@@ -1504,6 +1505,9 @@ const SymbolCtx = struct {
     /// What the frame will scale symbol/text offsets by; collision boxes are
     /// measured in those drawn px.
     size_scale: f32,
+    /// The build zoom: collision boxes are projected at it, and the zoom-out
+    /// text gate is stated relative to it.
+    zoom: f64,
 };
 
 /// One symbol feature: resolve icon and text, collide, emit quads (already
@@ -1640,10 +1644,28 @@ fn layoutSymbolFeature(
             const scratch_before = text_scratch.items.len;
             const box = (try symbol.layoutText(arena, text, ga, topts, tcommon, text_scratch)) orelse break :text;
             const text_allow = sc.sym.text_allow_overlap;
-            const placed = try collider.place(scaledBox(box, px, py, sc.size_scale), text_allow, false);
-            if (!placed) {
+            const sbox = scaledBox(box, px, py, sc.size_scale);
+            // An allow-overlap label always draws and is never gated; a
+            // collided one also learns its zoom-out slack.
+            const res = if (text_allow)
+                symbol.Collider.PlaceResult{ .placed = try collider.place(sbox, true, false) }
+            else
+                try collider.placeWithSlack(sbox, false, false);
+            if (!res.placed) {
                 text_scratch.shrinkRetainingCapacity(scratch_before);
             } else {
+                if (res.slack) |slack| {
+                    // Collision ran at the build zoom, but the scene draws at
+                    // the live zoom: zooming out converges anchors on screen
+                    // while each label holds its size, so labels that cleared
+                    // here can overlap before the next build lands. Raise the
+                    // label's zmin to the zoom where it would first touch a
+                    // neighbor; the shader hides it per frame from there.
+                    // Narrow only: a window the feature already carries stays
+                    // in force.
+                    const zmin = types.zq(sc.zoom - slack);
+                    for (text_scratch.items[scratch_before..]) |*q| q.zmin = @max(q.zmin, zmin);
+                }
                 const added = text_scratch.items.len - scratch_before;
                 const rgba = tcolor.rgba8();
                 try text_paint_scratch.ensureUnusedCapacity(arena, added);
