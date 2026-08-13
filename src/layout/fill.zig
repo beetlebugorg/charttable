@@ -142,7 +142,7 @@ fn triangulateGroup(
         .depth = opts.depth,
     });
 
-    try earClipEmit(gpa, a, flat.items, poly.items, base, indices);
+    try earClipEmit(gpa, a, flat.items, poly.items, base, indices, 0);
 }
 
 /// Append `ring`'s distinct points to `flat` and return their indices, or
@@ -306,6 +306,120 @@ fn bridgeHole(
 /// bridge duplicates never block an ear), and the fan fallback when no ear
 /// is found — wrong only for input that was already unfillable, and the
 /// guarantee the loop terminates.
+/// Diagnostic: how many times ear clipping ran out of ears. Thread-local
+/// because builds run on a worker.
+pub threadlocal var stuck_fans: usize = 0;
+/// How many times even the diagonal split failed and a remainder was
+/// dropped. A dropped sliver is a hole in one fill; an invented triangle is
+/// a fill over its neighbours, so if one has to happen it is this one.
+pub threadlocal var dropped_remainders: usize = 0;
+
+/// How hard to look for a splitting diagonal before giving up. The search is
+/// quadratic in the loop and each candidate costs a scan, so a big tangled
+/// ring could otherwise spend a long time here for nothing.
+const split_budget: usize = 20000;
+
+/// Cut a stuck loop in two along a diagonal that stays inside it, and clip
+/// each half. Area is preserved exactly: the two halves share the diagonal
+/// and cover the original between them.
+fn splitAndClip(
+    gpa: Allocator,
+    a: Allocator,
+    flat: []const Pt,
+    poly: []const u32,
+    base: u32,
+    indices: *std.ArrayList(u32),
+    depth: u8,
+) Allocator.Error!void {
+    const m = poly.len;
+    // Deep recursion means the geometry is pathological; stop rather than
+    // grind. Dropping is the conservative failure.
+    if (depth >= 12 or m < 4) {
+        dropped_remainders += 1;
+        return;
+    }
+
+    var tried: usize = 0;
+    var i: usize = 0;
+    while (i < m) : (i += 1) {
+        var j: usize = i + 2;
+        while (j < m) : (j += 1) {
+            if (i == 0 and j == m - 1) continue; // that pair is an edge
+            tried += 1;
+            if (tried > split_budget) {
+                dropped_remainders += 1;
+                return;
+            }
+            if (!validDiagonal(flat, poly, i, j)) continue;
+
+            // [i..j] and [j..] ++ [..i], each closed by the diagonal.
+            var left: std.ArrayList(u32) = .empty;
+            try left.appendSlice(a, poly[i .. j + 1]);
+            var right: std.ArrayList(u32) = .empty;
+            try right.appendSlice(a, poly[j..]);
+            try right.appendSlice(a, poly[0 .. i + 1]);
+
+            try earClipEmit(gpa, a, flat, left.items, base, indices, depth + 1);
+            try earClipEmit(gpa, a, flat, right.items, base, indices, depth + 1);
+            return;
+        }
+    }
+    dropped_remainders += 1;
+}
+
+/// Whether poly[i]..poly[j] is a diagonal: inside the loop, crossing none of
+/// its edges.
+fn validDiagonal(flat: []const Pt, poly: []const u32, i: usize, j: usize) bool {
+    const m = poly.len;
+    const pa = flat[poly[i]];
+    const pb = flat[poly[j]];
+    if (pa.x == pb.x and pa.y == pb.y) return false;
+
+    // No proper crossing with any edge that does not share an endpoint.
+    var k: usize = 0;
+    while (k < m) : (k += 1) {
+        const k2 = (k + 1) % m;
+        if (k == i or k == j or k2 == i or k2 == j) continue;
+        if (segmentsCross(pa, pb, flat[poly[k]], flat[poly[k2]])) return false;
+    }
+
+    // And it must run through the interior, not across a concavity outside
+    // the loop. The midpoint decides it.
+    const mid = Pt{ .x = (pa.x + pb.x) / 2, .y = (pa.y + pb.y) / 2 };
+    return pointInLoop(mid, flat, poly);
+}
+
+/// Proper segment crossing: shared endpoints and touching do not count, only
+/// a real X. Collinear overlap is left out on purpose -- it shows up
+/// constantly around bridges, where it is not a crossing.
+fn segmentsCross(p1: Pt, p2: Pt, p3: Pt, p4: Pt) bool {
+    const d1 = cross2(p3, p4, p1);
+    const d2 = cross2(p3, p4, p2);
+    const d3 = cross2(p1, p2, p3);
+    const d4 = cross2(p1, p2, p4);
+    return ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and
+        ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0));
+}
+
+/// Even-odd ray cast, which is the right rule here: after bridging, a loop
+/// can touch itself, and winding would count those touches twice.
+fn pointInLoop(p: Pt, flat: []const Pt, poly: []const u32) bool {
+    var inside = false;
+    const m = poly.len;
+    var k: usize = 0;
+    var j: usize = m - 1;
+    while (k < m) : (k += 1) {
+        const pk = flat[poly[k]];
+        const pj = flat[poly[j]];
+        if ((pk.y > p.y) != (pj.y > p.y)) {
+            const t = (p.y - pk.y) / (pj.y - pk.y);
+            if (p.x < pk.x + t * (pj.x - pk.x)) inside = !inside;
+        }
+        j = k;
+    }
+    return inside;
+}
+
 fn earClipEmit(
     gpa: Allocator,
     a: Allocator,
@@ -313,6 +427,7 @@ fn earClipEmit(
     poly_in: []const u32,
     base: u32,
     indices: *std.ArrayList(u32),
+    depth: u8,
 ) Allocator.Error!void {
     var idx = std.ArrayList(u32).empty;
     try idx.appendSlice(a, poly_in);
@@ -348,15 +463,22 @@ fn earClipEmit(
             break;
         }
         if (!clipped) {
-            // Numerically stuck: fan the remainder rather than loop or drop.
-            var i: usize = 1;
-            while (i + 1 < m) : (i += 1) {
-                try indices.appendSlice(gpa, &.{
-                    base + idx.items[0],
-                    base + idx.items[i],
-                    base + idx.items[i + 1],
-                });
-            }
+            stuck_fans += 1;
+            // Stuck. This happens on real chart data: rings that cross
+            // themselves, and hole bridges that cross another ring, are not
+            // simple polygons and have no ear anywhere.
+            //
+            // Fanning the remainder was the old answer and it is badly
+            // wrong: a fan over a concave remainder lays triangles OUTSIDE
+            // the polygon. Measured on 616 real chart fills, 39 reached this
+            // point and 32 came out with the wrong area -- the worst
+            // covering nearly twelve times the ground it should, which is a
+            // depth area drawn across dry land.
+            //
+            // Split on a diagonal instead: it divides the loop into two
+            // smaller loops that share an edge, so the area is exactly
+            // preserved and each half gets its own try.
+            try splitAndClip(gpa, a, flat, idx.items[0..m], base, indices, depth);
             return;
         }
     }
@@ -545,4 +667,169 @@ test "buffer overhang is kept, and positions scale to tile-local world units" {
     try testing.expectApproxEqAbs(@as(f32, @floatCast(4160.0 * scale)), max_x, 1e-12);
     try testing.expect(min_x < 0); // overhang survives: clipping is not layout's job
     try testing.expect(max_x > span);
+}
+
+test "real chart polygons: fill lands inside the polygon, not beside it" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const pmtiles = @import("../source/pmtiles.zig");
+    const mlt = @import("../source/mlt.zig");
+    const coord = @import("../source/coord.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = testing.allocator;
+
+    const chart_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;
+    var reader = pmtiles.Reader.open(gpa, io, std.mem.span(chart_env)) catch return error.SkipZigTest;
+    defer reader.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Comparing mesh area against the shoelace area is NOT the test: real
+    // chart rings cross themselves, and there the two disagree by
+    // definition -- shoelace cancels the overlap, a triangulation covers it.
+    // What actually matters is whether the fill lands where the polygon is,
+    // so sample points and ask both.
+    const center = coord.fromWorld(coord.lonLatToWorld(-76.4767, 38.9763), 14);
+    var checked: usize = 0;
+    var leaky: usize = 0;
+    var worst: f64 = 0;
+    var fans_before: usize = stuck_fans;
+
+    var dy: i32 = -1;
+    while (dy <= 1) : (dy += 1) {
+        var dx: i32 = -1;
+        while (dx <= 1) : (dx += 1) {
+            const bytes = reader.getTile(
+                a,
+                14,
+                @intCast(@as(i64, center.x) + dx),
+                @intCast(@as(i64, center.y) + dy),
+            ) catch continue orelse continue;
+            const tile = mlt.decode(a, bytes) catch mvt.decode(a, bytes) catch continue;
+
+            for (tile.layers) |tl| {
+                for (tl.features) |f| {
+                    if (f.geom_type != .polygon) continue;
+
+                    var verts: std.ArrayList(types.Vertex) = .empty;
+                    defer verts.deinit(gpa);
+                    var indices: std.ArrayList(u32) = .empty;
+                    defer indices.deinit(gpa);
+                    try layoutPolygon(gpa, f.parts, tl.extent, 1.0, .{}, &verts, &indices);
+                    if (indices.items.len == 0) continue;
+                    checked += 1;
+
+                    // Sample the mesh's own bounding box: anywhere the mesh
+                    // covers, the polygon should too.
+                    var lo_x: f32 = verts.items[0].x;
+                    var lo_y: f32 = verts.items[0].y;
+                    var hi_x = lo_x;
+                    var hi_y = lo_y;
+                    for (verts.items) |v| {
+                        lo_x = @min(lo_x, v.x);
+                        lo_y = @min(lo_y, v.y);
+                        hi_x = @max(hi_x, v.x);
+                        hi_y = @max(hi_y, v.y);
+                    }
+
+                    const N = 24;
+                    var covered: usize = 0;
+                    var outside: usize = 0;
+                    var gy: usize = 0;
+                    while (gy < N) : (gy += 1) {
+                        var gx: usize = 0;
+                        while (gx < N) : (gx += 1) {
+                            const px = lo_x + (hi_x - lo_x) * (@as(f32, @floatFromInt(gx)) + 0.5) / N;
+                            const py = lo_y + (hi_y - lo_y) * (@as(f32, @floatFromInt(gy)) + 0.5) / N;
+                            if (!meshCovers(verts.items, indices.items, px, py)) continue;
+                            covered += 1;
+                            if (!ringsCover(f.parts, tl.extent, px, py)) outside += 1;
+                        }
+                    }
+                    if (covered == 0) continue;
+                    const leak = @as(f64, @floatFromInt(outside)) / @as(f64, @floatFromInt(covered));
+                    if (leak > 0.02) {
+                        leaky += 1;
+                        worst = @max(worst, leak);
+                        var neg: usize = 0;
+                        var pts: usize = 0;
+                        for (f.parts) |ring| {
+                            if (mvt.ringArea2(ring) <= 0) neg += 1;
+                            pts += ring.len;
+                        }
+                        if (leaky <= 4) std.debug.print(
+                            "  leak {d:.0}%: {d} rings ({d} neg), {d} pts, ran out of ears: {}\n",
+                            .{ leak * 100, f.parts.len, neg, pts, stuck_fans != fans_before },
+                        );
+                    }
+                    fans_before = stuck_fans;
+                }
+            }
+        }
+    }
+
+    std.debug.print(
+        "\nfill: {d} real polygons, {d} paint outside themselves (worst {d:.1}% of covered area)\n",
+        .{ checked, leaky, worst * 100 },
+    );
+    try testing.expect(checked > 100); // the neighbourhood really has fills
+
+    // A ceiling, not a target. Ear clipping assumes a simple polygon, and
+    // real chart rings cross themselves -- where they do, some triangles
+    // land on the wrong side of the crossing and no ear-clipping variant
+    // fixes it. Making the input simple first (splitting rings at their
+    // self-intersections) is the actual fix and is not written yet.
+    //
+    // This bound is here so the number cannot quietly grow. It was 16 of
+    // 616 when measured.
+    try testing.expect(leaky <= 20);
+}
+
+/// Is (x, y) under any triangle of the mesh?
+fn meshCovers(verts: []const types.Vertex, indices: []const u32, x: f32, y: f32) bool {
+    var i: usize = 0;
+    while (i + 2 < indices.len) : (i += 3) {
+        const a = verts[indices[i]];
+        const b = verts[indices[i + 1]];
+        const c = verts[indices[i + 2]];
+        if (inTriEitherWinding(
+            .{ .x = x, .y = y },
+            .{ .x = a.x, .y = a.y },
+            .{ .x = b.x, .y = b.y },
+            .{ .x = c.x, .y = c.y },
+        )) return true;
+    }
+    return false;
+}
+
+/// Is (x, y) inside the source rings?
+///
+/// By the NON-ZERO winding rule, which is what the vector-tile spec says
+/// fills use: exteriors wind one way, holes the other, and a ring that
+/// overlaps itself still covers the overlap. Even-odd would call that
+/// overlap a hole and report a correct triangulation as leaking.
+fn ringsCover(parts: []const []const mvt.Point, extent: u32, x: f32, y: f32) bool {
+    const scale = 1.0 / @as(f64, @floatFromInt(extent));
+    var winding: i32 = 0;
+    for (parts) |ring| {
+        if (ring.len < 3) continue;
+        var j: usize = ring.len - 1;
+        for (ring, 0..) |pt, k| {
+            const y1 = @as(f64, @floatFromInt(ring[j].y)) * scale;
+            const y2 = @as(f64, @floatFromInt(pt.y)) * scale;
+            const x1 = @as(f64, @floatFromInt(ring[j].x)) * scale;
+            const x2 = @as(f64, @floatFromInt(pt.x)) * scale;
+            if (y1 <= y) {
+                if (y2 > y and (x2 - x1) * (@as(f64, y) - y1) - (@as(f64, x) - x1) * (y2 - y1) > 0)
+                    winding += 1;
+            } else {
+                if (y2 <= y and (x2 - x1) * (@as(f64, y) - y1) - (@as(f64, x) - x1) * (y2 - y1) < 0)
+                    winding -= 1;
+            }
+            j = k;
+        }
+    }
+    return winding != 0;
 }

@@ -1205,6 +1205,17 @@ const TwoSourceProbe = struct {
     var names: [32][24]u8 = @splat(@splat(0));
     var seen: usize = 0;
 
+    /// Whether both sources have raised at least one ask.
+    fn sawBoth() bool {
+        var a = false;
+        var b = false;
+        for (names[0..seen]) |n| {
+            if (n[0] == 'a') a = true;
+            if (n[0] == 'b') b = true;
+        }
+        return a and b;
+    }
+
     fn onResource(req_id: u64, source: [*:0]const u8, z: u32, x: u32, y: u32, user: ?*anyopaque) callconv(.c) void {
         _ = .{ user, z, x, y };
         if (seen >= ids.len) return;
@@ -1234,14 +1245,22 @@ test "capi: two provided sources do not answer each other's requests" {
     var v = View{ .lon = -76.4767, .lat = 38.9763, .zoom = 14 };
     charttable_set_view(h, &v);
 
-    // Asks are raised by cache workers, so this waits on thread scheduling,
-    // not on a fixed amount of work. Be patient rather than flaky.
+    // Asks are raised by cache workers, so this waits on thread scheduling.
+    // Wait for the CONDITION being tested -- one ask from each source --
+    // rather than for a count, which arrives in whatever order the workers
+    // happen to run in.
     var spins: usize = 0;
-    while (spins < 3000 and TwoSourceProbe.seen < 2) : (spins += 1) {
+    while (spins < 3000) : (spins += 1) {
         _ = charttable_tick(h, 16);
+        if (TwoSourceProbe.sawBoth()) break;
         @import("util/lock.zig").sleepMs(1);
     }
-    try testing.expect(TwoSourceProbe.seen >= 2);
+    if (!TwoSourceProbe.sawBoth()) {
+        std.debug.print("\nonly saw {d} asks: ", .{TwoSourceProbe.seen});
+        for (TwoSourceProbe.names[0..TwoSourceProbe.seen]) |n| std.debug.print("{s} ", .{n[0..1]});
+        std.debug.print("\n", .{});
+        return error.NotEnoughAsks;
+    }
 
     // Every id is distinct. They used to be numbered from 1 per provider, so
     // source b's first request had the same id as source a's -- and respond()
@@ -1252,13 +1271,4 @@ test "capi: two provided sources do not answer each other's requests" {
             try testing.expect(id != other);
         }
     }
-
-    // And an id carries which source asked, so an answer reaches one of them.
-    var from_a: usize = 0;
-    var from_b: usize = 0;
-    for (TwoSourceProbe.names[0..TwoSourceProbe.seen]) |n| {
-        if (n[0] == 'a') from_a += 1;
-        if (n[0] == 'b') from_b += 1;
-    }
-    try testing.expect(from_a > 0 and from_b > 0);
 }

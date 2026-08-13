@@ -72,6 +72,11 @@ pub const RasterSource = struct {
     minzoom: f64 = 0,
     maxzoom: f64 = 22,
     tile_size: f64 = 512, // "Defaults to 512"
+    /// raster-dem: the pixels are elevation, not color. Fetched and decoded
+    /// exactly like a raster; only the layers reading it differ.
+    dem: bool = false,
+    /// How that elevation is packed ("mapbox" or "terrarium").
+    encoding: ?[]const u8 = null,
 };
 
 pub const Source = union(enum) {
@@ -451,8 +456,8 @@ fn parseLayer(p: *P, j: std.json.Value, index: usize, seen: *std.StringArrayHash
         try p.diag(id, "type", "layer has no type — skipped", .{});
         return null;
     };
-    const kind = std.meta.stringToEnum(LayerType, type_name) orelse {
-        try p.diag(id, "type", "unsupported layer type \"{s}\" (tier 1: background/fill/line/symbol/raster) — skipped", .{type_name});
+    const kind = LayerType.parse(type_name) orelse {
+        try p.diag(id, "type", "unsupported layer type \"{s}\" (tier 1: background/fill/line/symbol/raster/hillshade/color-relief) — skipped", .{type_name});
         return null;
     };
 
@@ -505,17 +510,20 @@ fn parseSource(p: *P, name: []const u8, j: std.json.Value) Error!?Source {
         }
         return .{ .vector = src };
     }
-    if (std.mem.eql(u8, kind, "raster")) {
+    if (std.mem.eql(u8, kind, "raster") or std.mem.eql(u8, kind, "raster-dem")) {
         var src = RasterSource{
             .url = strField(obj, "url"),
             .tiles = try strArrayField(p, obj, "tiles"),
+            // "mapbox" unless it says otherwise, which is the spec default.
+            .dem = std.mem.eql(u8, kind, "raster-dem"),
+            .encoding = strField(obj, "encoding"),
         };
         if (numField(obj, "minzoom")) |z| src.minzoom = z;
         if (numField(obj, "maxzoom")) |z| src.maxzoom = z;
         if (numField(obj, "tileSize")) |ts| src.tile_size = ts;
         return .{ .raster = src };
     }
-    try p.diag("", name, "unsupported source type \"{s}\" (tier 1: vector/raster) — skipped", .{kind});
+    try p.diag("", name, "unsupported source type \"{s}\" (tier 1: vector/raster/raster-dem) — skipped", .{kind});
     return null;
 }
 

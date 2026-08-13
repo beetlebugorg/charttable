@@ -23,6 +23,7 @@ const line = @import("layout/line.zig");
 const symbol = @import("layout/symbol.zig");
 const sprites = @import("symbol/sprite.zig");
 const glyphs = @import("symbol/glyphs.zig");
+const dem = @import("layout/dem.zig");
 const types = @import("scene/types.zig");
 const cameras = @import("camera.zig");
 
@@ -477,7 +478,8 @@ pub const LayerFilter = enum {
     global,
 
     fn admits(self: LayerFilter, kind: properties.LayerType) bool {
-        const is_global = kind == .symbol or kind == .raster;
+        const is_global = kind == .symbol or kind == .raster or
+            kind == .hillshade or kind == .color_relief;
         return switch (self) {
             .all => true,
             .tile_local => !is_global,
@@ -741,6 +743,10 @@ pub fn buildSceneWithRasters(
             },
             .fill, .line => {},
             .symbol => if (assets.sprite == null and assets.glyph_atlas == null) continue,
+            .hillshade, .color_relief => {
+                try layoutDemLayer(arena, style, sl, layer_i, rasters, view, &ctx, layerDepth(layer_i, n_layers), &quads, &quad_paint, &patterns, &ranges, &out.eval_errors);
+                continue;
+            },
             .raster => {
                 try layoutRasterLayer(arena, sl, layer_i, rasters, view, layerDepth(layer_i, n_layers), &quads, &quad_paint, &patterns, &ranges);
                 continue;
@@ -1061,6 +1067,166 @@ pub fn buildSceneWithRasters(
 /// per scene rebuild, so a rebuild re-uploads every visible raster tile. The
 /// fix is a texture cache keyed by tile id in the backend; until raster is
 /// load-bearing, correctness first.
+/// A hillshade or color-relief layer: read the DEM tiles of this layer's
+/// source, turn each into an RGBA image, and hand it to the raster path as
+/// though it had arrived that way. Everything a terrain layer needs is a
+/// picture per tile, so nothing below the scene contract has to know that
+/// terrain exists.
+fn layoutDemLayer(
+    arena: std.mem.Allocator,
+    style: *const styles.Style,
+    sl: *const styles.Layer,
+    layer_i: usize,
+    rasters: []const RasterTile,
+    view: View,
+    ctx: *eval_mod.Context,
+    depth: f32,
+    quads: *std.ArrayList(types.Quad),
+    quad_paint: *std.ArrayList(types.PaintVertex),
+    patterns: *std.ArrayList(types.PatternCell),
+    ranges: *std.ArrayList(types.Range),
+    errors: *usize,
+) !void {
+    const want_source = sl.source orelse return;
+    // The encoding is a property of the SOURCE: the layer only says which
+    // source to read.
+    const enc = switch (style.sources.get(want_source) orelse return) {
+        .raster => |r| dem.Encoding.parse(r.encoding),
+        else => return,
+    };
+
+    for (rasters) |rt| {
+        if (!std.mem.eql(u8, rt.source, want_source)) continue;
+        if (rt.w == 0 or rt.h == 0) continue;
+        if (rt.rgba.len < @as(usize, rt.w) * rt.h * 4) continue;
+
+        const grid = dem.decode(arena, enc, rt.rgba, rt.w, rt.h) catch continue;
+        const img = try arena.alloc(u8, @as(usize, rt.w) * rt.h * 4);
+
+        switch (sl.kind) {
+            .hillshade => {
+                const shade = dem.HillshadeOpts{
+                    .illumination_direction = @floatCast(numProp(arena, sl, "hillshade-illumination-direction", ctx, 335, errors)),
+                    .exaggeration = @floatCast(numProp(arena, sl, "hillshade-exaggeration", ctx, 0.5, errors)),
+                    .shadow = rgbaOf(arena, sl, "hillshade-shadow-color", ctx, .{ .r = 0, .g = 0, .b = 0, .a = 1 }, errors),
+                    .highlight = rgbaOf(arena, sl, "hillshade-highlight-color", ctx, .{ .r = 1, .g = 1, .b = 1, .a = 1 }, errors),
+                    .accent = rgbaOf(arena, sl, "hillshade-accent-color", ctx, .{ .r = 0, .g = 0, .b = 0, .a = 1 }, errors),
+                    // Slope is height over DISTANCE, so the shading needs to
+                    // know what a pixel is worth on the ground.
+                    .meters_per_px = dem.metersPerPixel(rt.id.z, rt.id.y, rt.w),
+                };
+                dem.hillshade(arena, grid, shade, img) catch continue;
+            },
+            .color_relief => {
+                const ramp = try reliefRamp(arena, sl, ctx, errors);
+                const opacity: f32 = @floatCast(numProp(arena, sl, "color-relief-opacity", ctx, 1, errors));
+                dem.colorRelief(grid, ramp, opacity, img) catch continue;
+            },
+            else => continue,
+        }
+
+        const rect = rt.id.worldRect();
+        const x0: f32 = @floatCast(rect.x0 - view.origin.x);
+        const y0: f32 = @floatCast(rect.y0 - view.origin.y);
+        const x1: f32 = @floatCast(rect.x1 - view.origin.x);
+        const y1: f32 = @floatCast(rect.y1 - view.origin.y);
+
+        const image: u32 = @intCast(patterns.items.len);
+        try patterns.append(arena, .{ .w = rt.w, .h = rt.h, .rgba = img });
+
+        const first: u32 = @intCast(quads.items.len);
+        const corners = [4][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
+        const uvs = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+        const order = [6]u8{ 0, 1, 2, 0, 2, 3 };
+        try quads.ensureUnusedCapacity(arena, 6);
+        try quad_paint.ensureUnusedCapacity(arena, 6);
+        for (order) |ci| {
+            quads.appendAssumeCapacity(.{
+                .x = corners[ci][0],
+                .y = corners[ci][1],
+                .ox = 0,
+                .oy = 0,
+                .u = uvs[ci][0],
+                .v = uvs[ci][1],
+                .weight = 0,
+                .zmin = types.ZMIN_ALL,
+                .zmax = types.ZMAX_ALL,
+                .flags = 0,
+                .flip = 0,
+                .tangent_q = 0,
+                .depth = depth,
+            });
+            quad_paint.appendAssumeCapacity(.{ .color = .{ 255, 255, 255, 255 } });
+        }
+        try ranges.append(arena, .{
+            .first = first,
+            .count = 6,
+            .paint_key = @intCast(layer_i),
+            .pattern = image,
+            .kind = .raster,
+            .prim = .quads,
+            .atlas = .none,
+        });
+    }
+}
+
+/// Sample `color-relief-color` into a lookup table. The property is a ramp
+/// over ELEVATION, which the expression language reaches through the same
+/// slot `zoom` uses, so the table is built by walking that slot.
+fn reliefRamp(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    ctx: *eval_mod.Context,
+    errors: *usize,
+) !dem.Ramp {
+    const lut = try arena.alloc(u8, dem.Ramp.steps * 4);
+    const pv = resolveProp(sl, "color-relief-color");
+    const lo: f32 = -11000; // the deepest ocean
+    const hi: f32 = 9000; // the highest ground
+    const saved = ctx.elevation;
+    defer ctx.elevation = saved;
+    for (0..dem.Ramp.steps) |i| {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(dem.Ramp.steps - 1));
+        ctx.elevation = lo + (hi - lo) * t;
+        var c = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
+        if (pv) |p| {
+            if (asColor(evalProp(arena, p, ctx, .null, errors))) |got| c = got;
+        }
+        lut[i * 4 ..][0..4].* = .{
+            @intFromFloat(std.math.clamp(c.r, 0, 1) * 255 + 0.5),
+            @intFromFloat(std.math.clamp(c.g, 0, 1) * 255 + 0.5),
+            @intFromFloat(std.math.clamp(c.b, 0, 1) * 255 + 0.5),
+            @intFromFloat(std.math.clamp(c.a, 0, 1) * 255 + 0.5),
+        };
+    }
+    return .{ .lo = lo, .hi = hi, .lut = lut };
+}
+
+fn numProp(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    name: []const u8,
+    ctx: *eval_mod.Context,
+    dflt: f64,
+    errors: *usize,
+) f64 {
+    const pv = resolveProp(sl, name) orelse return dflt;
+    return asNum(evalProp(arena, pv, ctx, .{ .number = dflt }, errors), dflt);
+}
+
+fn rgbaOf(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    name: []const u8,
+    ctx: *eval_mod.Context,
+    dflt: dem.Rgba,
+    errors: *usize,
+) dem.Rgba {
+    const pv = resolveProp(sl, name) orelse return dflt;
+    const c = asColor(evalProp(arena, pv, ctx, .null, errors)) orelse return dflt;
+    return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+}
+
 fn layoutRasterLayer(
     arena: std.mem.Allocator,
     sl: *const styles.Layer,

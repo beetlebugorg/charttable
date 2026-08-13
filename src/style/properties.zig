@@ -22,7 +22,23 @@ pub const Color = vals.Color;
 
 /// The five tier-1 layer types (spec `layers` § type). `circle`, `heatmap`,
 /// `fill-extrusion`, `hillshade`, `color-relief` are tier 2+.
-pub const LayerType = enum { background, fill, line, symbol, raster };
+pub const LayerType = enum {
+    background,
+    fill,
+    line,
+    symbol,
+    raster,
+    /// Terrain from a raster-dem source. Both draw as a generated image per
+    /// DEM tile, through the same path as any other raster.
+    hillshade,
+    color_relief,
+
+    /// The spec's names, which are not all valid Zig identifiers.
+    pub fn parse(name: []const u8) ?LayerType {
+        if (std.mem.eql(u8, name, "color-relief")) return .color_relief;
+        return std.meta.stringToEnum(LayerType, name);
+    }
+};
 
 /// Which section of the layer object carries the property.
 pub const Scope = enum { paint, layout };
@@ -188,6 +204,24 @@ pub const symbol_props = [_]Prop{
     .{ .name = "text-halo-blur", .scope = .paint, .value_type = .number, .default = .{ .number = 0 }, .data_driven = true },
 };
 
+pub const hillshade_props = [_]Prop{
+    visibility_prop,
+    // Degrees clockwise from north that the light comes FROM.
+    .{ .name = "hillshade-illumination-direction", .scope = .paint, .value_type = .number, .default = .{ .number = 335 }, .data_driven = false },
+    .{ .name = "hillshade-exaggeration", .scope = .paint, .value_type = .number, .default = .{ .number = 0.5 }, .data_driven = false },
+    .{ .name = "hillshade-shadow-color", .scope = .paint, .value_type = .color, .default = .{ .color = .{ .r = 0, .g = 0, .b = 0, .a = 1 } }, .data_driven = false },
+    .{ .name = "hillshade-highlight-color", .scope = .paint, .value_type = .color, .default = .{ .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 } }, .data_driven = false },
+    .{ .name = "hillshade-accent-color", .scope = .paint, .value_type = .color, .default = .{ .color = .{ .r = 0, .g = 0, .b = 0, .a = 1 } }, .data_driven = false },
+};
+
+pub const color_relief_props = [_]Prop{
+    visibility_prop,
+    // A ramp over elevation in metres. Sampled into a lookup table at
+    // layout, because evaluating it per pixel is 65k evaluations a tile.
+    .{ .name = "color-relief-color", .scope = .paint, .value_type = .color, .default = .{ .color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } }, .data_driven = false },
+    .{ .name = "color-relief-opacity", .scope = .paint, .value_type = .number, .default = .{ .number = 1 }, .data_driven = false },
+};
+
 pub const raster_props = [_]Prop{
     visibility_prop,
     // "Defaults to 1", range [0, 1]. No data-driven row (interpolate only).
@@ -197,6 +231,8 @@ pub const raster_props = [_]Prop{
 /// The tier-1 property table for a layer type.
 pub fn table(t: LayerType) []const Prop {
     return switch (t) {
+        .hillshade => &hillshade_props,
+        .color_relief => &color_relief_props,
         .background => &background_props,
         .fill => &fill_props,
         .line => &line_props,

@@ -608,6 +608,17 @@ static void loadRemoteAssets(charttable *map, NSDictionary *sj, NSString *base, 
     double dt = _lastTickMs > 0 ? now - _lastTickMs : 0;
     _lastTickMs = now;
     if (charttable_tick(_map, dt) != CHARTTABLE_OK) NSLog(@"tick failed");
+    if (getenv("CHARTTABLE_TRACE_VIEW")) {
+        static int n = 0;
+        if (n++ % 60 == 0) {
+            charttable_view cur = {0};
+            charttable_get_view(_map, &cur);
+            NSSize sz = self.bounds.size;
+            NSLog(@"view: lon %.4f lat %.4f zoom %.2f | viewport %.0fx%.0f pending %u",
+                  cur.lon, cur.lat, cur.zoom, sz.width, sz.height,
+                  charttable_pending_tiles(_map));
+        }
+    }
     // Honest damage: a still camera over a settled map draws nothing. A pan
     // or zoom counts, so input needs no special case here.
     if (charttable_needs_redraw(_map)) charttable_render(_map);
@@ -899,7 +910,10 @@ int main(int argc, const char *argv[]) {
             for (NSString *name in sj[@"sources"]) {
                 NSDictionary *src = sj[@"sources"][name];
                 NSString *type = src[@"type"];
-                const BOOL isRaster = [type isEqualToString:@"raster"];
+                // raster-dem is fetched and decoded exactly like a raster;
+                // only the layers reading it treat the pixels as elevation.
+                const BOOL isRaster = [type isEqualToString:@"raster"] ||
+                                      [type isEqualToString:@"raster-dem"];
                 if (![type isEqualToString:@"vector"] && !isRaster) {
                     NSLog(@"source '%@' is type '%@' -- skipped", name, type);
                     continue;
