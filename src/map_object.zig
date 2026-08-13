@@ -207,6 +207,11 @@ pub const Map = struct {
     /// Set by anything that must force a rebuild regardless of coverage.
     dirty: bool = true,
 
+    /// Tiles being fetched ahead of a rebuild, for the zoom the camera is
+    /// heading to. Never drawn from directly -- `wanted` is what the scene
+    /// is built from -- but held against eviction just the same.
+    ahead: std.ArrayListUnmanaged(u64) = .empty,
+
     /// The last rebuild ran out of tessellation budget and left tiles out of
     /// the scene. Not an error state: the next update picks them up.
     partial: bool = false,
@@ -292,6 +297,7 @@ pub const Map = struct {
     }
 
     pub fn deinit(self: *Map) void {
+        self.ahead.deinit(self.gpa);
         self.progs.deinit(self.gpa);
         self.dropBuckets();
         self.buckets.deinit(self.gpa);
@@ -560,6 +566,26 @@ pub const Map = struct {
         }
         // Asking every frame is also what holds the set against eviction.
         for (self.wanted.items) |k| _ = self.cache.want(@bitCast(k));
+
+        // Fetch what the camera is zooming TOWARD, before the rebuild that
+        // will need it.
+        //
+        // `wanted` is only re-chosen when a rebuild is due, and a rebuild is
+        // deliberately deferred for the length of a gesture -- so nothing
+        // asked for the new level's tiles until the gesture was already
+        // over, and only then did the fetch, the host's compose and the
+        // decode begin. That wait is the whole reason a zoom sits on a stale
+        // or half-empty scene: not the tessellation, the supply.
+        //
+        // This asks early and changes nothing about what is drawn. The set
+        // is not adopted, the scene is not rebuilt; the tiles are merely on
+        // their way, so the rebuild that follows finds them already there.
+        if (!coverage_broke and self.buildZoom() != self.cov_zoom) {
+            self.ahead.clearRetainingCapacity();
+            try self.visibleTiles(&self.ahead);
+            for (self.ahead.items) |k| _ = self.cache.want(@bitCast(k));
+        } else self.ahead.clearRetainingCapacity();
+
         tick.pending = self.pendingWanted();
 
         // Which of those are actually here. A tile that came back empty or
@@ -677,7 +703,7 @@ pub const Map = struct {
 
     pub fn needsRebuild(self: *Map) bool {
         if (self.style == null) return false;
-        if (!self.coverageHolds()) return true;
+        if (!self.has_coverage) return true;
         // The build zoom is quantized, so this fires when the quantum
         // changes -- which is exactly when the cached geometry is stale.
         //
@@ -690,6 +716,23 @@ pub const Map = struct {
         // coverage box is different -- that shows blank edges, and is
         // handled above, before this.
         const drift = @abs(self.buildZoom() - self.cov_zoom);
+
+        // Leaving the coverage box shows blank edges, so it normally forces
+        // a rebuild at once -- but WHY the view left it decides whether that
+        // is affordable.
+        //
+        // A pan leaves it at an unchanged build zoom, where every bucket is
+        // still valid and the rebuild is a concatenation. Do it immediately.
+        //
+        // A zoom-out leaves it by growing, and there every bucket is stale
+        // at once. Rebuilding per frame through a gesture re-tessellates a
+        // fresh set at every quantum and throws each one away when the next
+        // arrives -- measured at 3.2 s of frame time and a 272 ms worst
+        // frame across a four-level zoom-out. So a zoom waits for the same
+        // one-level staleness budget as everything else, while the tiles it
+        // will need are already being fetched (see `ahead` in update).
+        if (!self.coverageHolds() and (drift == 0 or !self.gesturing())) return true;
+
         if (self.gesturing()) {
             // Mid-gesture the scene is still projecting correctly, just at
             // the detail of where the camera WAS. Let that ride -- but not
@@ -725,8 +768,15 @@ pub const Map = struct {
     /// really has gone stale. 1/4 of a zoom holds dash periods and line
     /// widths within 2^(1/8) = 9% of true.
     pub fn buildZoom(self: *const Map) f64 {
-        var maxz: f64 = 24;
-        for (self.cache.sources.items) |s| maxz = @min(maxz, @as(f64, @floatFromInt(s.maxzoom)));
+        // Capped by the DEEPEST source, not the shallowest. Each source
+        // already picks its own tile level inside its own band (see
+        // visibleTiles), so a style whose overlay stops at z8 must not pin
+        // the whole map to z8 -- which is what taking the minimum did, and
+        // what a real MapLibre style with a low-zoom overlay source hits
+        // immediately.
+        var maxz: f64 = 0;
+        for (self.cache.sources.items) |s| maxz = @max(maxz, @as(f64, @floatFromInt(s.maxzoom)));
+        if (self.cache.sources.items.len == 0) maxz = 24;
         const q = self.opts.zoom_quantum;
         const quantized = @round(self.cam.zoom / q) * q;
         return @min(quantized, maxz);
@@ -943,7 +993,11 @@ pub const Map = struct {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         errdefer arena.deinit();
         const rect = key.tileId().worldRect();
-        var one: [1]map.SourcedTile = .{.{ .id = key.tileId(), .tile = tile }};
+        var one: [1]map.SourcedTile = .{.{
+            .id = key.tileId(),
+            .tile = tile,
+            .source = self.sourceName(key.source),
+        }};
         const built = try map.buildScene(arena.allocator(), style, &one, .{
             .zoom = zoom,
             .origin = .{ .x = rect.x0, .y = rect.y0 },
@@ -1057,14 +1111,27 @@ pub const Map = struct {
         // on. Geometry is ~18 ms per 6 tiles against 4 ms for the global
         // pass, so spreading the misses over frames keeps each one inside a
         // frame while the uncacheable part is paid once per frame regardless.
-        var budget: usize = self.opts.tiles_per_build;
+        // How much tessellation this pass may do. The budget exists to keep
+        // a catch-up from eating a frame while a complete chart is up -- but
+        // when the screen has blank edges (or nothing at all) the user is
+        // already looking at the problem, and finishing beats pacing. A
+        // scene is only shown once complete, so a small budget there just
+        // means a longer wait.
+        var budget: usize = if (self.built == null or !self.coverageHolds())
+            MAX_TILES
+        else
+            self.opts.tiles_per_build;
         var deferred: usize = 0;
         for (have) |k| {
             const key: caches.Key = @bitCast(k);
             switch (self.cache.sourceKind(key)) {
                 .vector => {
                     const tile = self.cache.get(key) orelse continue;
-                    try vector_tiles.append(a, .{ .id = key.tileId(), .tile = tile });
+                    try vector_tiles.append(a, .{
+                        .id = key.tileId(),
+                        .tile = tile,
+                        .source = self.sourceName(key.source),
+                    });
                     if (!self.bucketReady(key, zoom)) {
                         if (budget == 0) {
                             deferred += 1;
@@ -2219,4 +2286,115 @@ test "Map: a zoom never empties the scene" {
     }
     try settle(&m);
     try testing.expect(m.scene().?.vertices.len > 0);
+}
+
+test "Map: a layer draws only from the source it names" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    // Two sources carrying the SAME source-layer name and the same geometry.
+    var main_src = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+    var other_src = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    const two_source_style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["a/{z}/{x}/{y}"]},
+        \\             "overlay": {"type": "vector", "tiles": ["b/{z}/{x}/{y}"]}},
+        \\ "layers": [
+        \\   {"id": "areas", "type": "fill", "source": "chart", "source-layer": "areas",
+        \\    "paint": {"fill-color": "#123456"}}]}
+    ;
+
+    var one = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer one.deinit();
+    try one.setStyleJson(two_source_style);
+    _ = try one.bindSource("chart", main_src.source(14));
+    one.setViewport(512, 512);
+    one.setView(-76.4767, 38.9763, 14);
+    try settle(&one);
+    const alone = one.scene().?.vertices.len;
+    try testing.expect(alone > 0);
+
+    // Binding a SECOND source the layer does not name must change nothing.
+    // Tiles used to be matched on source-layer alone, so both sources drew
+    // the layer and the map drew the same ground twice.
+    var both = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer both.deinit();
+    try both.setStyleJson(two_source_style);
+    _ = try both.bindSource("chart", main_src.source(14));
+    _ = try both.bindSource("overlay", other_src.source(14));
+    both.setViewport(512, 512);
+    both.setView(-76.4767, 38.9763, 14);
+    try settle(&both);
+    try testing.expectEqual(alone, both.scene().?.vertices.len);
+}
+
+test "Map: a shallow source does not cap the build zoom" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var deep = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+    var shallow = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", deep.source(14));
+    _ = try m.bindSource("overlay", shallow.source(8));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 13);
+    try settle(&m);
+
+    // The overlay stopping at z8 must not drag the layout down with it.
+    try testing.expectEqual(@as(f64, 13), m.buildZoom());
+
+    // And each source is still asked at a level it actually has.
+    var levels = [_]bool{false} ** 25;
+    for (m.resident.items) |k| levels[@as(caches.Key, @bitCast(k)).tileId().z] = true;
+    try testing.expect(levels[13]); // the deep source, at the build zoom
+    try testing.expect(levels[8]); // the overlay, overzoomed from its own max
+}
+
+test "Map: a raster source alongside a vector one does not blank the scene" {
+    const a = testing.allocator;
+    const png = @import("util/png.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    var vec = StubSource{ .bytes = try stubTileBytes(ar) };
+    const px = try ar.alloc(u8, 4 * 4 * 4);
+    for (0..16) |i| px[i * 4 ..][0..4].* = .{ 255, 128, 0, 255 };
+    var img = StubSource{ .bytes = try png.encode(ar, px, 4, 4) };
+
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["a/{z}/{x}/{y}"]},
+        \\             "photo": {"type": "raster", "tiles": ["b/{z}/{x}/{y}"], "maxzoom": 14}},
+        \\ "layers": [
+        \\   {"id": "picture", "type": "raster", "source": "photo"},
+        \\   {"id": "areas", "type": "fill", "source": "chart", "source-layer": "areas",
+        \\    "paint": {"fill-color": "#123456"}}]}
+    ;
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(style);
+    // The RASTER source bound first, which is what a real style does when
+    // its basemap sits under everything.
+    _ = try m.bindSource("photo", .{ .ptr = &img, .fetch = StubSource.fetch, .kind = .raster, .maxzoom = 14 });
+    _ = try m.bindSource("chart", vec.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    const b = m.scene() orelse return error.NoScene;
+    var fills: usize = 0;
+    var rasters: usize = 0;
+    for (b.ranges) |r| {
+        if (r.kind == .raster) rasters += 1 else fills += 1;
+    }
+    try testing.expect(rasters > 0); // the basemap
+    try testing.expect(fills > 0); // and the vector layer over it
+    try testing.expect(b.vertices.len > 0);
 }

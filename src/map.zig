@@ -33,6 +33,14 @@ pub const Color = vals.Color;
 pub const SourcedTile = struct {
     id: coord.TileId,
     tile: *const mvt.Tile,
+    /// Which style source this tile came from. A layer only draws from the
+    /// source it names -- without this, two vector sources that both have a
+    /// layer called "contours" both render it, and the map draws the same
+    /// ground twice at two resolutions.
+    ///
+    /// Empty means unlabeled, which matches any layer: a caller with one
+    /// source has nothing to disambiguate.
+    source: []const u8 = "",
 };
 
 /// The build's output: everything Gpu.SceneData borrows, plus the effective
@@ -801,6 +809,9 @@ pub fn buildSceneWithRasters(
         if (zoom_data) any_zoom_data = true;
 
         for (tiles) |st| {
+            if (sl.source) |want| {
+                if (st.source.len > 0 and !std.mem.eql(u8, want, st.source)) continue;
+            }
             const tl = st.tile.layer(source_layer) orelse continue;
             // Resolve every program's key slots against THIS layer's key
             // table, once -- the whole point of compiling.
