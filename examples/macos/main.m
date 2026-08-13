@@ -800,6 +800,14 @@ int main(int argc, const char *argv[]) {
         if (ss_env) size_scale = atof(ss_env);
         charttable_set_size_scale(map, size_scale);
 
+        // S-52 display category: Base, Standard, and Other. Other is ON,
+        // which is what a mariner working a chart wants and what
+        // lookout-marine shows -- with it off, whole classes of feature
+        // (the spot soundings among them) are simply absent.
+        // CHARTTABLE_DISPLAY_OTHER=0 turns it back off.
+        const char *other_env = getenv("CHARTTABLE_DISPLAY_OTHER");
+        const BOOL displayOther = !(other_env && other_env[0] == '0');
+
         NSData *style = nil;
         BOOL builtStyle = NO;
         if (customStyle) NSLog(@"style: %@ (used verbatim)", stylePath);
@@ -814,7 +822,7 @@ int main(int argc, const char *argv[]) {
             tm.four_shade_water = true;
             tm.depth_unit = 0; // metres
             tm.display_base = true; tm.display_standard = true;
-            tm.display_other = getenv("CHARTTABLE_DISPLAY_OTHER") != NULL;
+            tm.display_other = displayOther;
             tm.data_quality = false;         // seabed-quality overlay off
             tm.show_inform_callouts = false; // the [i] boxes off
             tm.soundings = 1;                // spot soundings on
@@ -862,8 +870,9 @@ int main(int argc, const char *argv[]) {
         // `encoding` means MVT, and every tile fails to decode -- a clean
         // parse, no diagnostics, and a blank window.
         if (composing) style = stampEncoding(style, @"mlt");
-        if (builtStyle && !getenv("CHARTTABLE_DISPLAY_OTHER"))
-            style = soundingsIndependentOfCategory(style);
+        // Only needed when Other is off: it lifts the soundings out of a
+        // category that is not being drawn.
+        if (builtStyle && !displayOther) style = soundingsIndependentOfCategory(style);
 
         const char *dump = getenv("CHARTTABLE_DUMP_STYLE");
         if (dump) [style writeToFile:@(dump) atomically:YES];
