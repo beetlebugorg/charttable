@@ -212,6 +212,10 @@ pub const Map = struct {
     partial: bool = false,
     /// How many tiles' geometry the live scene actually holds.
     scene_tiles: usize = 0,
+    /// Whether the LIVE scene went on screen with tiles missing. Only ever
+    /// true when there was nothing better to show; a covering scene is never
+    /// replaced by an incomplete one.
+    scene_partial: bool = false,
 
     /// Updates since the host last moved the camera.
     ///
@@ -641,6 +645,26 @@ pub const Map = struct {
     /// True when the view has panned or zoomed out of the built coverage. The
     /// x distance WRAPS: crossing the antimeridian is a short hop, not a
     /// world-width jump.
+    /// Whether a freshly assembled scene holding `tiles` of geometry should
+    /// go on screen in place of the live one.
+    ///
+    /// Only ever asked of an INCOMPLETE scene -- a complete one always goes
+    /// up. The answer is simply whether there is anything on screen yet:
+    /// with a blank window, a partial scene is the progressive fill of a
+    /// cold start; with a chart already drawn, it is a chart that sprouts
+    /// holes for a few frames, and no rule about "covers enough" or "at
+    /// least as many tiles" makes that acceptable. Both were tried; the
+    /// test caught both, zooming out.
+    ///
+    /// The wait is bounded and short: the budget clears the backlog at
+    /// tiles_per_build per update, so a viewport of misses completes in a
+    /// handful of frames, during which the live scene keeps projecting
+    /// correctly under the moving camera.
+    fn worthShowing(self: *const Map, tiles: usize) bool {
+        _ = tiles;
+        return self.built == null;
+    }
+
     /// Whether the scene already built still reaches every screen edge.
     /// A scene that does can keep being drawn: a camera move inside its box
     /// is a matrix change, not a layout change.
@@ -1043,10 +1067,6 @@ pub const Map = struct {
                     try vector_tiles.append(a, .{ .id = key.tileId(), .tile = tile });
                     if (!self.bucketReady(key, zoom)) {
                         if (budget == 0) {
-                            // No bucket and no budget: this tile simply is
-                            // not in this frame's scene. It is already in
-                            // vector_tiles, so its symbols still place and
-                            // collide -- only its fills and lines wait.
                             deferred += 1;
                             continue;
                         }
@@ -1073,6 +1093,19 @@ pub const Map = struct {
             }
         }
 
+        // A scene with tiles missing must not push a better one off the
+        // screen. Doing that swaps a whole chart for a two-tile fragment
+        // which then fills back in over the following frames, and that is
+        // the flicker: the budget exists to spread the WORK across frames,
+        // not to put half-built scenes in front of anyone. Tessellation
+        // already done is held in the bucket cache, so the next update
+        // resumes instead of repeating.
+        if (deferred > 0 and !self.worthShowing(parts.items.len)) {
+            self.partial = true;
+            self.dirty = false;
+            return;
+        }
+
         // Symbols and rasters once over every tile: collision stays global,
         // and raster images stay borrowed from the tile cache rather than
         // cached past their owner's lifetime.
@@ -1094,6 +1127,7 @@ pub const Map = struct {
         self.paint_generation += 1;
         self.rebuilds += 1;
         self.dirty = false;
+        self.scene_partial = deferred > 0;
         // Tiles left untessellated by the budget: come back next update and
         // take the next batch. Their buckets are cached now, so the work
         // already done is not repeated.
@@ -2128,6 +2162,16 @@ test "Map: a zoom never empties the scene" {
                     .{ where, map_ptr.cam.zoom, map_ptr.resident.items.len },
                 );
                 return error.SceneBlanked;
+            }
+            // Flicker: a scene that was covering the screen has been
+            // replaced by one with tiles missing, so the chart drops to a
+            // fragment and fills back in over the next few frames.
+            if (map_ptr.scene_partial) {
+                std.debug.print(
+                    "\nflickered {s} at z{d}: showing {d} of {d} tiles\n",
+                    .{ where, map_ptr.cam.zoom, map_ptr.scene_tiles, map_ptr.resident.items.len },
+                );
+                return error.ScenePartialOnScreen;
             }
         }
     };
