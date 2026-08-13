@@ -1843,6 +1843,13 @@ test "Map: setPaintProperty refills; setLayoutProperty and setFilter rebuild" {
     try testing.expect(m.dirty);
     try settle(&m);
     try testing.expect(m.rebuilds > after);
+    // And it actually takes effect: "none" means the layer does not draw.
+    try testing.expectEqual(@as(usize, 0), m.scene().?.ranges.len);
+
+    const visible = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(), "\"visible\"", .{});
+    try m.setLayoutProperty("areas", "visibility", visible);
+    try settle(&m);
+    try testing.expect(m.scene().?.ranges.len > 0);
 
     const filt = try std.json.parseFromSliceLeaky(std.json.Value, doc.allocator(),
         \\["==", ["get", "kind"], "nothing-matches-this"]

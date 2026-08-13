@@ -730,6 +730,17 @@ pub fn buildSceneWithRasters(
         if (sl.maxzoom) |mz| {
             if (view.zoom >= mz) continue;
         }
+        // `visibility: none` means the layer does not draw. The property was
+        // parsed and stored from the start, and setVisibility wrote it, but
+        // nothing read it -- so a style that switched a layer off got it
+        // anyway, and charttable_set_layer_visibility did nothing at all.
+        if (resolveProp(sl, "visibility")) |vis| {
+            const v = evalProp(arena, vis, &ctx, .{ .string = "visible" }, &out.eval_errors);
+            switch (v) {
+                .string => |name| if (std.mem.eql(u8, name, "none")) continue,
+                else => {},
+            }
+        }
         switch (sl.kind) {
             .background => {
                 if (resolveProp(sl, "background-color")) |pv| {
