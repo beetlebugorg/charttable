@@ -45,6 +45,23 @@ pub const Flags = struct {
     pub const map_align: u8 = 1 << 0;
 };
 
+/// One vertex of HOST overlay geometry: a world-space position relative to
+/// the overlay frame's own origin, and a colour. 24 bytes.
+///
+/// This is the only geometry charttable draws that it did not build. A host
+/// that keeps its own annotations above the map (a chartplotter's own ship and
+/// targets, an editor's handles) tessellates them itself and hands over one
+/// flat stream; charttable draws it after the scene, in the same encoder, so
+/// the two cannot tear apart. See Gpu.setOverlay.
+pub const OverlayVertex = extern struct {
+    x: f32,
+    y: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+};
+
 /// One triangle vertex (stream A). 28 bytes.
 pub const Vertex = extern struct {
     x: f32, // tile-local world units (world - tile NW corner)

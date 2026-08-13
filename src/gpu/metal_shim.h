@@ -37,7 +37,8 @@ enum {
     CTM_PIPE_SPRITE = 1,  /* sprite_vert / sprite_frag   */
     CTM_PIPE_SDF = 2,     /* sprite_vert / sdf_frag      */
     CTM_PIPE_PATTERN = 3, /* pattern_vert / pattern_frag */
-    CTM_PIPE_COUNT = 4,
+    CTM_PIPE_OVERLAY = 4, /* overlay_vert / overlay_frag — host geometry */
+    CTM_PIPE_COUNT = 5,
 };
 
 #define CTM_ERR_LEN 256

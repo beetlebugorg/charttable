@@ -168,6 +168,7 @@ ctm_ctx *ctm_create(void *metal_layer, const char *msl_source, int want_msaa,
                 [CTM_PIPE_SPRITE] = { @"sprite_vert", @"sprite_frag" },
                 [CTM_PIPE_SDF] = { @"sprite_vert", @"sdf_frag" },
                 [CTM_PIPE_PATTERN] = { @"pattern_vert", @"pattern_frag" },
+                [CTM_PIPE_OVERLAY] = { @"overlay_vert", @"overlay_frag" },
             };
             int built = 1;
             for (int i = 0; i < CTM_PIPE_COUNT; i++) {

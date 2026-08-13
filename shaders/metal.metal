@@ -254,3 +254,50 @@ fragment float4 sdf_frag(QuadOut in [[stage_in]],
     if (a <= 0.0) discard_fragment();
     return float4(in.color.rgb, in.color.a * a);
 }
+
+
+// ---- the host overlay pass --------------------------------------------------
+//
+// Geometry the HOST hands over already tessellated, drawn after the scene in
+// the same encoder: a chartplotter's own ship, its targets and its routes, or
+// any annotation an embedder keeps above the map. charttable neither builds
+// nor styles it — it owns the surface, so it is the only thing that can draw
+// it in the right place in the frame.
+//
+// The stream is world-space positions relative to the frame's own origin, with
+// a colour per vertex. The host supplies the matching uniform (an mvp built
+// for that origin), so this shader reads only mvp and wrap_x.
+struct OverlayVertex {          // scene.OverlayVertex, 24 B
+    // packed_float2/4 hold the stride at 24; natural alignment would pad to 32
+    // and shear the stream.
+    packed_float2 world;
+    packed_float4 color;
+};
+static_assert(sizeof(OverlayVertex) == 24, "OverlayVertex must match scene.OverlayVertex");
+
+struct OverlayOut {
+    float4 pos [[position]];
+    float4 color;
+};
+
+vertex OverlayOut overlay_vert(uint vid [[vertex_id]],
+                               const device OverlayVertex *verts [[buffer(0)]],
+                               constant U &u [[buffer(2)]]) {
+    OverlayVertex v = verts[vid];
+    // The same antimeridian wrap the scene shaders apply: draw at the world
+    // instance nearest the camera, so an overlay across the seam is seamless.
+    float2 world = float2(v.world.x + rint(u.wrap_x - v.world.x), v.world.y);
+    float4 clip = u.mvp * float4(world, 0.0, 1.0);
+    // z = 0 is the near plane. Every paint-order depth the scene writes is in
+    // (0,1), so a depth-test-only overlay pass is never hidden by the map it
+    // annotates — and it writes no depth, so it cannot hide the map either.
+    clip.z = 0.0;
+    OverlayOut out;
+    out.pos = clip;
+    out.color = v.color;
+    return out;
+}
+
+fragment float4 overlay_frag(OverlayOut in [[stage_in]]) {
+    return in.color;
+}

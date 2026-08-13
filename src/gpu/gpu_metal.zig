@@ -95,6 +95,16 @@ pub const Gpu = struct {
     glyph_bold_tex: ?*mc.ctm_tex = null,
     glyph_italic_tex: ?*mc.ctm_tex = null,
 
+    // ---- host overlay (see setOverlay) --------------------------------------
+    overlay_buf: ?*mc.ctm_buf = null,
+    overlay_count: u32 = 0,
+    /// The generation the buffer holds, so a host may hand the same frame over
+    /// every tick and pay nothing.
+    overlay_gen: u64 = 0,
+    /// The overlay's OWN uniform: its vertices are relative to the frame's
+    /// origin, so the mvp and wrap are built for that origin, not the scene's.
+    overlay_u: ?Uniforms = null,
+
     // One pattern cell as its own sampler texture, plus its device-px size
     // (the on-screen tiling period — scene.PatternCell.w/h ARE that period).
     const PatternTex = struct { tex: ?*mc.ctm_tex = null, w: f32 = 1, h: f32 = 1 };
@@ -180,6 +190,7 @@ pub const Gpu = struct {
 
     pub fn deinit(self: *Gpu) void {
         self.freeScene();
+        self.clearOverlay();
         if (self.sprite_tex) |t| mc.ctm_free_texture(t);
         if (self.glyph_tex) |t| mc.ctm_free_texture(t);
         if (self.glyph_bold_tex) |t| mc.ctm_free_texture(t);
@@ -453,6 +464,57 @@ pub const Gpu = struct {
     /// else blends exactly as painter's order always did. scene/batch.zig
     /// decides what each range draws and merges contiguous ranges sharing a
     /// spec; phase A's ranges are excluded there rather than re-skipped here.
+    // ---- host overlay ---------------------------------------------------------
+
+    /// Adopt a frame of host geometry and the view it is drawn with.
+    ///
+    /// The upload is a no-op while `generation` is unchanged, so a host may
+    /// call this every frame; the buffer is replaced wholesale otherwise (the
+    /// encoder retains what an in-flight frame bound, so releasing the old one
+    /// here is safe). `u` is taken every time: the vertices are relative to
+    /// the frame's origin, so the pass needs the mvp and wrap built for THAT
+    /// origin, and the camera moves every frame while the geometry does not.
+    pub fn setOverlay(self: *Gpu, verts: []const scene.OverlayVertex, generation: u64, u: Uniforms) !void {
+        self.overlay_u = u;
+        if (generation == self.overlay_gen) return;
+        self.overlay_gen = generation;
+        self.freeOverlayBuf();
+        if (verts.len == 0) return;
+        const bytes = std.mem.sliceAsBytes(verts);
+        self.overlay_buf = mc.ctm_new_buffer(self.ctx, bytes.ptr, bytes.len) orelse
+            return error.MetalFailure;
+        self.overlay_count = @intCast(verts.len);
+    }
+
+    /// Drop the overlay geometry. The next setOverlay re-uploads whatever the
+    /// host then holds.
+    pub fn clearOverlay(self: *Gpu) void {
+        self.freeOverlayBuf();
+        self.overlay_gen = 0;
+        self.overlay_u = null;
+    }
+
+    fn freeOverlayBuf(self: *Gpu) void {
+        if (self.overlay_buf) |b| mc.ctm_free_buffer(b);
+        self.overlay_buf = null;
+        self.overlay_count = 0;
+    }
+
+    /// Draw the host's geometry LAST, after the whole scene, in the same
+    /// encoder. Depth test only: the shader emits z = 0 (the near plane) so
+    /// nothing the map wrote can hide host content, and the pass writes no
+    /// depth so host content cannot hide the map from a later pass either.
+    fn recordOverlay(self: *Gpu, f: *mc.ctm_frame) void {
+        const buf = self.overlay_buf orelse return;
+        const u = self.overlay_u orelse return;
+        if (self.overlay_count == 0) return;
+        mc.ctm_set_depth_mode(f, 0);
+        mc.ctm_set_pipeline(f, mc.CTM_PIPE_OVERLAY);
+        mc.ctm_bind_vbuf(f, buf);
+        mc.ctm_set_uniforms(f, &u, @sizeOf(Uniforms));
+        mc.ctm_draw(f, 0, self.overlay_count);
+    }
+
     fn recordScene(self: *Gpu, f: *mc.ctm_frame, u: Uniforms) void {
         const s = if (self.scene) |*sc| sc else return;
         var last_u: ?Uniforms = null;
@@ -570,6 +632,7 @@ pub const Gpu = struct {
             if (d > 0.25 and d < 8) self.pixel_density = d;
         }
         self.recordScene(f, u);
+        self.recordOverlay(f);
         mc.ctm_end_frame(f);
         return true;
     }
@@ -584,6 +647,7 @@ pub const Gpu = struct {
         const clear = [4]f32{ self.clear.r, self.clear.g, self.clear.b, self.clear.a };
         const f = mc.ctm_begin_offscreen(self.ctx, self.width, self.height, &clear) orelse return error.MetalFailure;
         self.recordScene(f, u);
+        self.recordOverlay(f);
         const n = @as(usize, self.width) * self.height * 4;
         const pixels = try alloc.alloc(u8, n);
         errdefer alloc.free(pixels);
