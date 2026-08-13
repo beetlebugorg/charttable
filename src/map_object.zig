@@ -615,9 +615,17 @@ pub const Map = struct {
         // This asks early and changes nothing about what is drawn. The set
         // is not adopted, the scene is not rebuilt; the tiles are merely on
         // their way, so the rebuild that follows finds them already there.
-        if (!coverage_broke and self.buildZoom() != self.cov_zoom) {
+        // Aimed at the eased TARGET, in both directions. The build zoom only
+        // leads outward, because a build carries the extent it is built for
+        // and an inward one would not cover the screen yet. A prefetch carries
+        // nothing: these tiles are never drawn from, only held against
+        // eviction, so it can aim wherever the camera is going. Asking at the
+        // build zoom instead meant a zoom IN requested each level only on
+        // arriving at it, and every level waited on its own supply.
+        const heading = self.headingZoom();
+        if (!coverage_broke and (self.buildZoom() != self.cov_zoom or heading != self.buildZoom())) {
             self.ahead.clearRetainingCapacity();
-            try self.visibleTiles(&self.ahead);
+            try self.visibleTilesAt(heading, &self.ahead);
             for (self.ahead.items) |k| _ = self.cache.want(@bitCast(k));
         } else self.ahead.clearRetainingCapacity();
 
@@ -785,17 +793,22 @@ pub const Map = struct {
     /// the quantum changes, and that is exactly when the cached geometry
     /// really has gone stale. 1/4 of a zoom holds dash periods and line
     /// widths within 2^(1/8) = 9% of true.
-    pub fn buildZoom(self: *const Map) f64 {
-        // Capped by the DEEPEST source, not the shallowest. Each source
-        // already picks its own tile level inside its own band (see
-        // visibleTiles), so a style whose overlay stops at z8 must not pin
-        // the whole map to z8 -- which is what taking the minimum did, and
-        // what a real MapLibre style with a low-zoom overlay source hits
-        // immediately.
+    /// A zoom quantized to the build quantum and capped by the deepest source.
+    ///
+    /// Capped by the DEEPEST source, not the shallowest. Each source already
+    /// picks its own tile level inside its own band (see visibleTilesAt), so a
+    /// style whose overlay stops at z8 must not pin the whole map to z8 --
+    /// which is what taking the minimum did, and what a real MapLibre style
+    /// with a low-zoom overlay source hits immediately.
+    fn quantizedZoom(self: *const Map, zoom: f64) f64 {
         var maxz: f64 = 0;
         for (self.cache.sources.items) |s| maxz = @max(maxz, @as(f64, @floatFromInt(s.maxzoom)));
         if (self.cache.sources.items.len == 0) maxz = 24;
         const q = self.opts.zoom_quantum;
+        return @min(@round(zoom / q) * q, maxz);
+    }
+
+    pub fn buildZoom(self: *const Map) f64 {
         // Lead the eased target only OUTWARD. `buildExtents` derives the
         // ground extent from this zoom, so a lead outward builds a WIDER
         // extent -- a superset of what is on screen, which is safe to show at
@@ -808,8 +821,15 @@ pub const Map = struct {
         // goes rather than arriving all at once at the end.
         const target = self.cam.target_zoom;
         const lead = if (self.cam.animating() and target < self.cam.zoom) target else self.cam.zoom;
-        const quantized = @round(lead / q) * q;
-        return @min(quantized, maxz);
+        return self.quantizedZoom(lead);
+    }
+
+    /// The zoom the PREFETCH aims at: the eased target in both directions.
+    /// The build only leads outward, because a build carries the extent it was
+    /// built for. A prefetch carries nothing, so it can aim wherever the
+    /// camera is going.
+    fn headingZoom(self: *const Map) f64 {
+        return self.quantizedZoom(if (self.cam.animating()) self.cam.target_zoom else self.cam.zoom);
     }
 
     /// Deprecated spelling kept for callers that meant "what will the next
@@ -1099,8 +1119,14 @@ pub const Map = struct {
     /// integer zoom nearest the build target and inside that source's band.
     /// Keys come out sorted so `sameResident` is an ordered compare.
     fn visibleTiles(self: *Map, out: *std.ArrayListUnmanaged(u64)) !void {
-        const zoom = self.buildZoom();
-        const he = self.buildExtents();
+        return self.visibleTilesAt(self.buildZoom(), out);
+    }
+
+    /// The tiles covering the view at an arbitrary zoom. The build uses the
+    /// build zoom; the prefetch uses where the camera is heading, which is not
+    /// the same thing on the way in.
+    fn visibleTilesAt(self: *Map, zoom: f64, out: *std.ArrayListUnmanaged(u64)) !void {
+        const he = self.extentsAt(zoom);
         const hw = he.x;
         const hh = he.y;
         const cx = self.cam.center.x;
