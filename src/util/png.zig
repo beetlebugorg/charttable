@@ -127,8 +127,17 @@ pub fn read(arena: std.mem.Allocator, bytes: []const u8) ReadError!Image {
     var width: u32 = 0;
     var height: u32 = 0;
     var channels: u32 = 0;
+    var depth: u32 = 8;
+    var color_type: u8 = 0;
     var seen_ihdr = false;
     var idat: std.ArrayList(u8) = .empty;
+    // Palette and its per-entry alpha. A tile server hands out palette PNGs
+    // far more often than RGBA ones -- OpenStreetMap's do, so without this a
+    // raster basemap decodes to nothing at all.
+    var plte: [256 * 3]u8 = undefined;
+    var plte_len: usize = 0;
+    var trns: [256]u8 = @splat(255);
+    var trns_len: usize = 0;
 
     // Chunk walk. Every length is validated against the remaining input and
     // every chunk's CRC is checked before its data is believed.
@@ -153,15 +162,22 @@ pub fn read(arena: std.mem.Allocator, bytes: []const u8) ReadError!Image {
             height = std.mem.readInt(u32, data[4..8], .big);
             if (width == 0 or height == 0) return error.Malformed;
             if (width > max_dim or height > max_dim) return error.Unsupported;
-            if (data[8] != 8) return error.Unsupported; // bit depth
-            channels = switch (data[9]) { // color type
+            depth = data[8];
+            color_type = data[9];
+            channels = switch (color_type) {
                 0 => 1, // grayscale
                 2 => 3, // RGB
+                3 => 1, // palette: one index per pixel
                 4 => 2, // grayscale + alpha
                 6 => 4, // RGBA
-                3 => return error.Unsupported, // palette
                 else => return error.Malformed,
             };
+            // Depth 8 everywhere, plus the sub-byte depths a palette is
+            // allowed to pack itself into.
+            if (color_type == 3) {
+                if (depth != 1 and depth != 2 and depth != 4 and depth != 8)
+                    return error.Unsupported;
+            } else if (depth != 8) return error.Unsupported;
             if (data[10] != 0) return error.Malformed; // compression method
             if (data[11] != 0) return error.Malformed; // filter method
             switch (data[12]) { // interlace
@@ -173,11 +189,24 @@ pub fn read(arena: std.mem.Allocator, bytes: []const u8) ReadError!Image {
             if (!seen_ihdr) return error.Malformed; // IHDR must come first
             if (std.mem.eql(u8, typ, "IDAT")) {
                 try idat.appendSlice(arena, data);
+            } else if (std.mem.eql(u8, typ, "PLTE")) {
+                if (len == 0 or len % 3 != 0 or len > 256 * 3) return error.Malformed;
+                @memcpy(plte[0..len], data);
+                plte_len = len / 3;
+            } else if (std.mem.eql(u8, typ, "tRNS")) {
+                // For a palette this is one alpha per entry. For the other
+                // color types it names a single transparent value, which
+                // this reader still ignores.
+                if (color_type == 3) {
+                    if (len > 256) return error.Malformed;
+                    @memcpy(trns[0..len], data);
+                    trns_len = len;
+                }
             } else if (std.mem.eql(u8, typ, "IEND")) {
                 if (len != 0) return error.Malformed;
                 break :walk; // trailing bytes after IEND are ignored
             }
-            // Any other chunk (tRNS, gAMA, tEXt, …) is skipped.
+            // Any other chunk (gAMA, tEXt, …) is skipped.
         }
     }
     if (idat.items.len == 0) return error.Malformed;
@@ -185,7 +214,8 @@ pub fn read(arena: std.mem.Allocator, bytes: []const u8) ReadError!Image {
     // Inflate the zlib stream into exactly the filtered-scanline size:
     // height rows of (filter byte + width*channels). Anything shorter or
     // longer than that is malformed, and the adler footer must match.
-    const stride: usize = @as(usize, width) * channels;
+    // Rows are byte-aligned, so a sub-byte depth rounds UP.
+    const stride: usize = (@as(usize, width) * channels * depth + 7) / 8;
     const raw = try arena.alloc(u8, height * (1 + stride));
     var in: std.Io.Reader = .fixed(idat.items);
     const window = try arena.alloc(u8, std.compress.flate.max_window_len);
@@ -204,13 +234,42 @@ pub fn read(arena: std.mem.Allocator, bytes: []const u8) ReadError!Image {
         const src = raw[y * (1 + stride) + 1 ..][0..stride];
         const dst = pix[y * stride ..][0..stride];
         const prev: ?[]const u8 = if (y == 0) null else pix[(y - 1) * stride ..][0..stride];
-        try unfilterRow(raw[y * (1 + stride)], src, dst, prev, channels);
+        // Filtering works on BYTES: below 8 bits the unit is one byte.
+        const bpp: u32 = @max(1, channels * depth / 8);
+        try unfilterRow(raw[y * (1 + stride)], src, dst, prev, bpp);
     }
 
     // Expand to RGBA.
     const rgba = try arena.alloc(u8, @as(usize, width) * height * 4);
     const n: usize = @as(usize, width) * height;
-    switch (channels) {
+    // A palette shares channels==1 with grayscale but is nothing like it:
+    // the byte is an INDEX, and below 8 bits several pack into one byte.
+    if (color_type == 3) {
+        if (plte_len == 0) return error.Malformed; // a palette image needs one
+        var i: usize = 0;
+        var row: usize = 0;
+        while (row < height) : (row += 1) {
+            const line = pix[row * stride ..][0..stride];
+            var x: usize = 0;
+            while (x < width) : (x += 1) {
+                const idx: usize = switch (depth) {
+                    8 => line[x],
+                    4 => (line[x >> 1] >> @intCast(4 * (1 - (x & 1)))) & 0x0F,
+                    2 => (line[x >> 2] >> @intCast(2 * (3 - (x & 3)))) & 0x03,
+                    1 => (line[x >> 3] >> @intCast(7 - (x & 7))) & 0x01,
+                    else => unreachable,
+                };
+                if (idx >= plte_len) return error.Malformed;
+                rgba[i * 4 ..][0..4].* = .{
+                    plte[idx * 3],
+                    plte[idx * 3 + 1],
+                    plte[idx * 3 + 2],
+                    if (idx < trns_len) trns[idx] else 255,
+                };
+                i += 1;
+            }
+        }
+    } else switch (channels) {
         1 => for (0..n) |i| {
             const v = pix[i];
             rgba[i * 4 ..][0..4].* = .{ v, v, v, 255 };
@@ -443,7 +502,9 @@ test "unsupported shapes are rejected as Unsupported" {
     const Patch = struct { off: usize, val: u8, err: ReadError };
     const patches = [_]Patch{
         .{ .off = 16 + 8, .val = 16, .err = error.Unsupported }, // bit depth 16
-        .{ .off = 16 + 9, .val = 3, .err = error.Unsupported }, // palette
+        // Palette IS supported now -- but a palette image with no PLTE
+        // chunk (which is what patching an RGBA header produces) is broken.
+        .{ .off = 16 + 9, .val = 3, .err = error.Malformed },
         .{ .off = 16 + 12, .val = 1, .err = error.Unsupported }, // interlaced
         .{ .off = 16 + 9, .val = 7, .err = error.Malformed }, // bogus color type
         .{ .off = 16 + 10, .val = 1, .err = error.Malformed }, // bogus compression
@@ -500,5 +561,69 @@ test "every truncation errors, never crashes" {
     while (n < good.len) : (n += 1) {
         // Every strict prefix is missing at least IEND: must error.
         try testing.expectError(error.Malformed, read(a, good[0..n]));
+    }
+}
+
+/// A palette PNG at `depth` bits per index: 4 colors, the last transparent.
+/// Rows are packed and byte-aligned, as PNG requires.
+fn makePalettePng(a: std.mem.Allocator, w: u32, h: u32, depth: u8, idx: []const u8) ![]u8 {
+    const per_byte: usize = 8 / depth;
+    const stride: usize = (@as(usize, w) * depth + 7) / 8;
+    var raw: std.ArrayList(u8) = .empty;
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        try raw.append(a, 0); // filter: none
+        var row = try a.alloc(u8, stride);
+        @memset(row, 0);
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            const shift: u3 = @intCast(@as(usize, depth) * (per_byte - 1 - (x % per_byte)));
+            row[x / per_byte] |= @as(u8, idx[y * w + x]) << shift;
+        }
+        try raw.appendSlice(a, row);
+    }
+
+    var zl: std.Io.Writer.Allocating = try .initCapacity(a, 256);
+    const cwin = try a.alloc(u8, std.compress.flate.max_window_len);
+    var comp = try std.compress.flate.Compress.init(&zl.writer, cwin, .zlib, .default);
+    try comp.writer.writeAll(raw.items);
+    try comp.finish();
+
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, &sig);
+    var ihdr: [13]u8 = .{0} ** 13;
+    std.mem.writeInt(u32, ihdr[0..4], w, .big);
+    std.mem.writeInt(u32, ihdr[4..8], h, .big);
+    ihdr[8] = depth;
+    ihdr[9] = 3; // palette
+    try chunk(&out, a, "IHDR", &ihdr);
+    try chunk(&out, a, "PLTE", &[_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 9, 9, 9 });
+    try chunk(&out, a, "tRNS", &[_]u8{ 255, 255, 255, 0 }); // entry 3 transparent
+    try chunk(&out, a, "IDAT", zl.written());
+    try chunk(&out, a, "IEND", "");
+    return out.items;
+}
+
+test "palette PNGs decode, at every depth a palette may use" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 4x2 of palette indices. A tile server's basemap is exactly this shape
+    // (OpenStreetMap serves 8-bit palette), and rejecting it drew nothing.
+    const idx = [_]u8{ 0, 1, 2, 3, 3, 2, 1, 0 };
+    const want = [_][4]u8{
+        .{ 255, 0, 0, 255 }, .{ 0, 255, 0, 255 }, .{ 0, 0, 255, 255 }, .{ 9, 9, 9, 0 },
+        .{ 9, 9, 9, 0 },     .{ 0, 0, 255, 255 }, .{ 0, 255, 0, 255 }, .{ 255, 0, 0, 255 },
+    };
+
+    for ([_]u8{ 2, 4, 8 }) |depth| {
+        const bytes = try makePalettePng(a, 4, 2, depth, &idx);
+        const img = try read(a, bytes);
+        try testing.expectEqual(@as(u32, 4), img.w);
+        try testing.expectEqual(@as(u32, 2), img.h);
+        for (want, 0..) |px, i| {
+            try testing.expectEqualSlices(u8, &px, img.rgba[i * 4 ..][0..4]);
+        }
     }
 }
