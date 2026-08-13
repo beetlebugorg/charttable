@@ -1031,6 +1031,25 @@ int main(int argc, const char *argv[]) {
     sources_done:;
 
 
+        // How far out the camera may go.
+        //
+        // A chart library has a floor: below it the ENC data is a smear, the
+        // wanted set is every tile on earth, and the compositor is asked to
+        // merge thousands of cells per tile. There is no way to derive it
+        // from the tiles themselves -- the partition covers the world at
+        // every zoom -- so it comes from what the data IS: a bake of
+        // coastal-scale charts stops being legible around z4. A style-driven
+        // map keeps whatever the style implies.
+        //
+        // CHARTTABLE_MIN_ZOOM overrides it.
+        {
+            double floor_z = composing ? 4.0 : 0.0;
+            const char *mz = getenv("CHARTTABLE_MIN_ZOOM");
+            if (mz) floor_z = atof(mz);
+            charttable_set_zoom_range(map, floor_z, 24.0);
+            if (floor_z > 0) NSLog(@"zoom floor: z%.1f", floor_z);
+        }
+
         // Annapolis harbor, the view the test suite renders.
         charttable_set_view(map, &v);
 

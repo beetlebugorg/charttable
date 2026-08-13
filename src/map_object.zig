@@ -537,7 +537,9 @@ pub const Map = struct {
     pub fn setView(self: *Map, lon: f64, lat: f64, zoom: f64) void {
         const w = coord.lonLatToWorld(lon, lat);
         self.cam.center = .{ .x = w[0], .y = w[1] };
-        self.cam.zoom = zoom;
+        // Inside the band, like every other way of moving the camera. The
+        // gesture paths clamp in the camera itself; this one assigns.
+        self.cam.zoom = std.math.clamp(zoom, self.cam.min_zoom, self.cam.max_zoom);
         self.cam.setTarget();
         self.cam.clampY();
     }
@@ -749,14 +751,18 @@ pub const Map = struct {
         // will need are already being fetched (see `ahead` in update).
         if (!self.coverageHolds() and (drift == 0 or !self.gesturing())) return true;
 
-        if (self.gesturing()) {
-            // Mid-gesture the scene is still projecting correctly, just at
-            // the detail of where the camera WAS. Let that ride -- but not
-            // forever: past a full zoom level the geometry is drawn at
-            // double or half its intended scale and the chart visibly
-            // coarsens. One level is the staleness budget for a gesture.
-            return drift >= 1.0;
-        }
+        // Deliberately NO special case for "mid-gesture" any more.
+        //
+        // While the build ran on the owner thread, rebuilding through a
+        // gesture meant re-tessellating scenes nobody looked at for more
+        // than a frame, so the scene was held and allowed to drift a whole
+        // zoom level. That is what makes lines and symbols look jagged until
+        // the gesture stops: they are drawn at the detail of where the
+        // camera was, scaled.
+        //
+        // The build is off-thread now and only one runs at a time, so a
+        // rebuild during a gesture costs the frame nothing and the chart
+        // sharpens as it goes.
         if (drift != 0) return true;
         // A zoom-interpolated paint pair brackets one integer zoom. Drift
         // across that boundary and the two halves no longer bracket the
@@ -844,6 +850,20 @@ pub const Map = struct {
     /// next `needsRedraw` can tell a moved camera from a still one.
     pub fn markDrawn(self: *Map) void {
         self.drawn = DrawnView.of(self);
+    }
+
+    /// The zoom band the camera may move in. A chart library has a natural
+    /// floor -- below it the data is a smear and every tile in the world is
+    /// wanted -- and no renderer can guess it, so the host says.
+    pub fn setZoomRange(self: *Map, min_zoom: f64, max_zoom: f64) void {
+        self.cam.min_zoom = @min(min_zoom, max_zoom);
+        self.cam.max_zoom = @max(min_zoom, max_zoom);
+        const clamped = std.math.clamp(self.cam.zoom, self.cam.min_zoom, self.cam.max_zoom);
+        if (clamped != self.cam.zoom) {
+            self.cam.zoom = clamped;
+            self.cam.setTarget();
+            self.dirty = true;
+        }
     }
 
     /// Zoom about a screen point, keeping the build target in step. Setting

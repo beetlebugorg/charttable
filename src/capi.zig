@@ -294,6 +294,15 @@ export fn charttable_resize(h: ?*anyopaque, w_pt: u32, h_pt: u32) callconv(.c) c
 /// catalogue's own px-per-mm, so a host that wants those physical sizes on
 /// ITS display passes the ratio here. 1.0 (the default) draws sprite cells
 /// at their logical size. Uniform-only: no relayout, no re-upload.
+/// The zoom band the camera may move in. A chart library has a natural
+/// floor; below it every tile in the world is wanted and the data is a
+/// smear. Defaults to 0..24, i.e. no limit worth speaking of.
+export fn charttable_set_zoom_range(h: ?*anyopaque, min_zoom: f64, max_zoom: f64) callconv(.c) void {
+    const self = locked(h) orelse return;
+    defer self.mu.unlock();
+    self.m.setZoomRange(min_zoom, max_zoom);
+}
+
 export fn charttable_set_size_scale(h: ?*anyopaque, scale: f32) callconv(.c) void {
     const self = locked(h) orelse return;
     defer self.mu.unlock();

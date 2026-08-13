@@ -81,6 +81,11 @@ void charttable_set_pixel_density(charttable *, float density);
  * logical size. Uniform-only: no relayout, no re-upload. */
 void charttable_set_size_scale(charttable *, float scale);
 
+/* The zoom band the camera may move in (default 0..24). A chart library has
+ * a natural floor -- below it every tile in the world is wanted and the data
+ * is a smear -- and only the host knows what it is. */
+void charttable_set_zoom_range(charttable *, double min_zoom, double max_zoom);
+
 /* The scene contract's struct-layout guard. Compare against the value your
  * build expects: a mismatch means header and library disagree about the
  * vertex/uniform layout, which shades wrong rather than failing. */
