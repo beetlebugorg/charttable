@@ -3,3 +3,6 @@ zig-out/
 zig-cache/
 test/spec/conformance-failures.txt
 specs/
+
+# Example app build output
+examples/macos/chartview
