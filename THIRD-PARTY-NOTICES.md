@@ -7,6 +7,50 @@ engine and the tile57 chart engine. No MapLibre source code is used in, or
 was consulted for, the implementation, with the single disclosed exception
 below.
 
+One third-party component is used deliberately and under its own license:
+mapbox/earcut, ported for polygon triangulation. It is not part of
+MapLibre.
+
+## mapbox/earcut — polygon triangulation (ISC)
+
+`src/layout/earcut.zig` is a PORT of earcut.js from
+https://github.com/mapbox/earcut, not an independent implementation. It
+follows that library's structure and algorithms function for function:
+linked-list rings, David Eberly's hole-bridge search, the z-order hash that
+bounds the ear test, and the three-stage recovery when ear slicing stalls
+(filter collinear points, cure local self-intersections, split on a
+diagonal). The source was read on 2026-08-12 and ported deliberately.
+
+It replaced charttable's own ear clipper, which assumed a simple polygon
+and fanned the remainder when it ran out of ears — laying triangles outside
+the polygon. Measured over 616 real chart fills, 16 painted over their
+neighbours before the port and 1 after.
+
+Two departures, both about size rather than behaviour: the hole-bridge
+search scans the ring instead of earcut's block-bbox index (whose own
+comments note it can pick a different, equally valid bridge), and the
+z-order index sorts an array rather than merge-sorting the list in place.
+
+earcut is ISC licensed. Its license, in full:
+
+```
+ISC License
+
+Copyright (c) 2026, Mapbox
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.
+```
+
 ## Disclosure: maplibre-native-ffi (read during pre-design reconnaissance)
 
 On 2026-08-12, before the clean-room policy for this project was set, an

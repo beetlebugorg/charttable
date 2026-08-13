@@ -29,6 +29,7 @@ pub const provider = @import("source/provider.zig");
 pub const fill = @import("layout/fill.zig");
 pub const line = @import("layout/line.zig");
 pub const dem = @import("layout/dem.zig");
+pub const earcut = @import("layout/earcut.zig");
 pub const sprite = @import("symbol/sprite.zig");
 pub const glyphs = @import("symbol/glyphs.zig");
 pub const gpu = @import("gpu/gpu.zig");
@@ -67,6 +68,7 @@ test {
     _ = fill;
     _ = line;
     _ = dem;
+    _ = earcut;
     _ = sprite;
     _ = glyphs;
     _ = gpu;
