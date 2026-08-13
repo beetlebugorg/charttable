@@ -249,6 +249,16 @@ pub const Map = struct {
     /// arena and remembers the style generation it was built for.
     buckets: std.AutoHashMapUnmanaged(u64, Bucket) = .empty,
 
+    /// The build in flight, if any. `building` is owner-only; `build_done`
+    /// is how the worker says it is finished.
+    building: bool = false,
+    build_thread: ?std.Thread = null,
+    build_done: std.atomic.Value(bool) = .init(false),
+    build_have: std.ArrayListUnmanaged(u64) = .empty,
+    build_style: ?*const styles.Style = null,
+    build_in: BuildInputs = .{ .origin = .{ .x = 0, .y = 0 }, .zoom = 0, .budget = 0, .blank = true },
+    staged: Staged = .{},
+
     /// Compiled property programs, shared by every build. Reset lazily when
     /// the style generation moves rather than at each mutation site, so no
     /// future setter can forget to invalidate it.
@@ -297,6 +307,8 @@ pub const Map = struct {
     }
 
     pub fn deinit(self: *Map) void {
+        self.waitForBuild();
+        self.build_have.deinit(self.gpa);
         self.ahead.deinit(self.gpa);
         self.progs.deinit(self.gpa);
         self.dropBuckets();
@@ -316,6 +328,7 @@ pub const Map = struct {
     /// Replace the style. Every tile stays resident — decoded tiles do not
     /// depend on the style — but the scene is rebuilt from scratch.
     pub fn setStyleJson(self: *Map, json: []const u8) !void {
+        self.waitForBuild(); // the worker holds this style
         var parsed = try styles.parse(self.gpa, json);
         errdefer parsed.deinit();
         if (self.style) |*s| s.deinit();
@@ -332,6 +345,7 @@ pub const Map = struct {
     /// Point a style source name at a place tiles come from. Returns the
     /// cache's source index. Re-binding a name replaces it.
     pub fn bindSource(self: *Map, name: []const u8, src: caches.Source) !usize {
+        self.waitForBuild(); // the worker reads cache.sources
         for (self.bound.items) |*b| {
             if (std.mem.eql(u8, b.name, name)) {
                 self.cache.sources.items[b.index] = src;
@@ -415,6 +429,7 @@ pub const Map = struct {
         name: []const u8,
         json_value: std.json.Value,
     ) !bool {
+        self.waitForBuild();
         const style = if (self.style) |*s| s else return error.NoStyle;
         try style.setProperty(layer_id, name, json_value);
         const idx = self.layerIndex(layer_id) orelse {
@@ -456,6 +471,7 @@ pub const Map = struct {
     /// no merge and no partial update — a host that assumes otherwise
     /// silently widens what draws.
     pub fn setFilter(self: *Map, layer_id: []const u8, json_filter: ?std.json.Value) !void {
+        self.waitForBuild();
         const style = if (self.style) |*s| s else return error.NoStyle;
         try style.setFilter(layer_id, json_filter);
         self.style_generation += 1;
@@ -463,6 +479,7 @@ pub const Map = struct {
     }
 
     pub fn setLayerVisibility(self: *Map, layer_id: []const u8, on: bool) !void {
+        self.waitForBuild();
         const style = if (self.style) |*s| s else return error.NoStyle;
         try style.setVisibility(layer_id, on);
         self.style_generation += 1;
@@ -500,6 +517,7 @@ pub const Map = struct {
     /// Symbol assets. Changing them re-lays-out (an icon that was missing may
     /// now resolve), so this bumps the style generation.
     pub fn setAssets(self: *Map, assets: Assets) void {
+        self.waitForBuild(); // the worker reads the atlases
         self.assets = assets;
         self.style_generation += 1;
         self.dirty = true;
@@ -525,6 +543,7 @@ pub const Map = struct {
 
     /// Set the physical size multiplier. Uniform-only: no rebuild.
     pub fn setSizeScale(self: *Map, scale: f32) void {
+        self.waitForBuild();
         if (!(scale > 0) or scale == self.size_scale) return;
         self.size_scale = scale;
         // Symbol placement is measured in DRAWN px, so a new scale changes
@@ -549,8 +568,21 @@ pub const Map = struct {
     /// "never block a frame on layout" invariant.
     pub fn update(self: *Map) !Tick {
         var tick = Tick{};
-        tick.tiles_landed = self.cache.tick();
         if (self.updates_since_input < std.math.maxInt(u32)) self.updates_since_input += 1;
+
+        // A build in flight owns the tile cache, the bucket cache, the style
+        // and the assets for its duration. cache.tick() adopts decoded tiles
+        // AND evicts, both of which free memory the worker is reading, so
+        // this frame does nothing but wait -- and draw the scene already up,
+        // which the worker never touches.
+        if (self.building) {
+            if (!self.build_done.load(.acquire)) return tick;
+            try self.finishBuild();
+            tick.rebuilt = true;
+            return tick;
+        }
+
+        tick.tiles_landed = self.cache.tick();
 
         // A style with no bound source still builds: its background layer is
         // a real scene, and a map that never builds never reports idle.
@@ -628,8 +660,11 @@ pub const Map = struct {
             if (worse) return tick;
         }
 
-        try self.rebuild(&style, have.items);
-        tick.rebuilt = true;
+        // &self.style.?, NOT &style: the local is a COPY of the optional's
+        // payload living on update's stack, and a worker outlives the frame
+        // that started it.
+        try self.startBuild(&self.style.?, have.items);
+        tick.rebuilt = !self.building; // an inline fallback build is already done
         return tick;
     }
 
@@ -671,26 +706,6 @@ pub const Map = struct {
     /// True when the view has panned or zoomed out of the built coverage. The
     /// x distance WRAPS: crossing the antimeridian is a short hop, not a
     /// world-width jump.
-    /// Whether a freshly assembled scene holding `tiles` of geometry should
-    /// go on screen in place of the live one.
-    ///
-    /// Only ever asked of an INCOMPLETE scene -- a complete one always goes
-    /// up. The answer is simply whether there is anything on screen yet:
-    /// with a blank window, a partial scene is the progressive fill of a
-    /// cold start; with a chart already drawn, it is a chart that sprouts
-    /// holes for a few frames, and no rule about "covers enough" or "at
-    /// least as many tiles" makes that acceptable. Both were tried; the
-    /// test caught both, zooming out.
-    ///
-    /// The wait is bounded and short: the budget clears the backlog at
-    /// tiles_per_build per update, so a viewport of misses completes in a
-    /// handful of frames, during which the live scene keeps projecting
-    /// correctly under the moving camera.
-    fn worthShowing(self: *const Map, tiles: usize) bool {
-        _ = tiles;
-        return self.built == null;
-    }
-
     /// Whether the scene already built still reaches every screen edge.
     /// A scene that does can keep being drawn: a camera move inside its box
     /// is a matrix change, not a layout change.
@@ -793,7 +808,11 @@ pub const Map = struct {
     /// build zoom is the mismatch that made a zoom-in ask for the deep tiles
     /// covering a wide view -- hundreds of them, every one thrown away.
     fn buildExtents(self: *const Map) cameras.Vec2 {
-        const wp = 512.0 * std.math.pow(f64, 2.0, self.buildZoom());
+        return self.extentsAt(self.buildZoom());
+    }
+
+    fn extentsAt(self: *const Map, zoom: f64) cameras.Vec2 {
+        const wp = 512.0 * std.math.pow(f64, 2.0, zoom);
         return .{
             .x = @as(f64, self.cam.vw) * 0.5 / wp * self.opts.overscan,
             .y = @as(f64, self.cam.vh) * 0.5 / wp * self.opts.overscan,
@@ -809,7 +828,7 @@ pub const Map = struct {
     /// Work outstanding, ignoring whether the current camera has been drawn:
     /// loading, an animation, a rebuild owed.
     fn busy(self: *Map) bool {
-        return self.dirty or self.partial or self.cam.animating() or
+        return self.building or self.dirty or self.partial or self.cam.animating() or
             self.needsRebuild() or self.pendingWanted() > 0;
     }
 
@@ -921,6 +940,11 @@ pub const Map = struct {
     /// anything was sent. Split from drawing so a host can upload on a
     /// worker-fed frame boundary and draw whenever it likes.
     pub fn uploadIfChanged(self: *Map, g: *gpu.Gpu, state: *Uploaded) !bool {
+        // Deliberately does NOT wait for a build in flight. It uploads the
+        // LIVE scene, which the worker never touches -- it writes the other
+        // arena and stages its result. Waiting here handed the frame thread
+        // the whole build and put the hitch straight back: 213 ms frames,
+        // all of it inside this call.
         const b = self.built orelse return false;
         if (state.scene == self.scene_generation) {
             // Geometry is current; only the paint stream may have moved.
@@ -1085,15 +1109,128 @@ pub const Map = struct {
         std.mem.sort(u64, out.items, {}, std.sort.asc(u64));
     }
 
-    fn rebuild(self: *Map, style: *const styles.Style, have: []const u64) !void {
+    /// Start a build on a worker thread and return immediately. The caller
+    /// must not touch the tile cache, the style, the assets or the bucket
+    /// cache until it finishes: the worker reads all of them.
+    fn startBuild(self: *Map, style: *const styles.Style, have: []const u64) !void {
+        self.build_have.clearRetainingCapacity();
+        try self.build_have.appendSlice(self.gpa, have);
+        self.build_style = style;
+        self.build_in = self.buildInputs();
+        self.staged = .{};
+        self.build_done.store(false, .release);
+        self.building = true;
+        self.build_thread = std.Thread.spawn(.{}, buildWorker, .{self}) catch {
+            // No thread to be had: do it inline. Slower, never wrong.
+            self.building = false;
+            const st = self.buildStaged(style, self.build_have.items, self.build_in) catch
+                return error.OutOfMemory;
+            try self.adopt(st, self.build_have.items);
+            return;
+        };
+    }
+
+    fn buildWorker(self: *Map) void {
+        self.staged = self.buildStaged(self.build_style.?, self.build_have.items, self.build_in) catch
+            Staged{ .failed = true };
+        self.build_done.store(true, .release);
+    }
+
+    /// Adopt a finished build. Owner thread.
+    fn finishBuild(self: *Map) !void {
+        if (self.build_thread) |t| t.join();
+        self.build_thread = null;
+        self.building = false;
+        const st = self.staged;
+        self.staged = .{};
+        if (st.failed) {
+            // The scene on screen stays; try again next update.
+            self.dirty = true;
+            return;
+        }
+        try self.adopt(st, self.build_have.items);
+    }
+
+    /// Whether a build is running right now. A host that would otherwise
+    /// have to block on `waitForBuild` can use this to defer its work
+    /// instead.
+    pub fn buildInFlight(self: *const Map) bool {
+        return self.building;
+    }
+
+    /// Block until any build in flight is done and adopted. Every mutator
+    /// that touches what a build READS -- the style, the sources, the
+    /// assets, the size scale -- calls this FIRST, because the worker holds
+    /// pointers into all of them.
+    pub fn waitForBuild(self: *Map) void {
+        if (!self.building) return;
+        self.finishBuild() catch {
+            self.dirty = true;
+        };
+    }
+
+    /// What a build produced, before it goes on screen. The worker fills
+    /// this; the owner thread adopts it. Nothing the owner reads while
+    /// drawing is written by the worker, which is what lets the build run
+    /// off-thread at all.
+    const Staged = struct {
+        built: ?Built = null,
+        arena: usize = 0,
+        scene_tiles: usize = 0,
+        partial: bool = false,
+        /// The budget ran out and the result was not worth showing, so
+        /// there is nothing to adopt -- just come back next update.
+        held: bool = false,
+        failed: bool = false,
+        origin: cameras.Vec2 = .{ .x = 0, .y = 0 },
+        zoom: f64 = 0,
+    };
+
+    /// Everything a build needs from the CAMERA, read once on the owner
+    /// thread when the build is decided. The worker must not touch the
+    /// camera: it moves every frame, and a build that samples it midway
+    /// produces a scene whose geometry, extents and tile level disagree.
+    const BuildInputs = struct {
+        origin: cameras.Vec2,
+        zoom: f64,
+        budget: usize,
+        /// Whether anything is on screen at all.
+        ///
+        /// This alone decides whether a scene with tiles missing may be
+        /// shown: with a blank window it is the progressive fill of a cold
+        /// start; with a chart already drawn it is a chart that sprouts
+        /// holes for a few frames, and no rule about "covers enough" or "at
+        /// least as many tiles" makes that acceptable. Both were tried; the
+        /// test caught both, zooming out.
+        blank: bool,
+    };
+
+    fn buildInputs(self: *const Map) BuildInputs {
+        return .{
+            .origin = self.cam.center,
+            .zoom = self.buildZoom(),
+            // The budget exists to keep a catch-up from eating a frame while
+            // a complete chart is up. With blank edges (or nothing at all)
+            // the user is already looking at the problem, and finishing
+            // beats pacing -- a scene is only shown once complete, so a
+            // small budget there just means a longer wait.
+            .budget = if (self.built == null or !self.coverageHolds())
+                MAX_TILES
+            else
+                self.opts.tiles_per_build,
+            .blank = self.built == null,
+        };
+    }
+
+    fn buildStaged(self: *Map, style: *const styles.Style, have: []const u64, in: BuildInputs) !Staged {
         // Build into the arena the current scene is NOT using, so the old
         // scene stays valid until the new one replaces it.
         const next = (self.live + 1) % 2;
         _ = self.arenas[next].reset(.retain_capacity);
         const a = self.arenas[next].allocator();
 
-        const origin = self.cam.center;
-        const zoom = self.buildZoom();
+        const origin = in.origin;
+        const zoom = in.zoom;
 
         // Geometry: one cached bucket per tile, rebased at concatenation.
         // Rasters ride the merged pass with the symbols — they carry
@@ -1111,16 +1248,7 @@ pub const Map = struct {
         // on. Geometry is ~18 ms per 6 tiles against 4 ms for the global
         // pass, so spreading the misses over frames keeps each one inside a
         // frame while the uncacheable part is paid once per frame regardless.
-        // How much tessellation this pass may do. The budget exists to keep
-        // a catch-up from eating a frame while a complete chart is up -- but
-        // when the screen has blank edges (or nothing at all) the user is
-        // already looking at the problem, and finishing beats pacing. A
-        // scene is only shown once complete, so a small budget there just
-        // means a longer wait.
-        var budget: usize = if (self.built == null or !self.coverageHolds())
-            MAX_TILES
-        else
-            self.opts.tiles_per_build;
+        var budget: usize = in.budget;
         var deferred: usize = 0;
         for (have) |k| {
             const key: caches.Key = @bitCast(k);
@@ -1167,10 +1295,8 @@ pub const Map = struct {
         // not to put half-built scenes in front of anyone. Tessellation
         // already done is held in the bucket cache, so the next update
         // resumes instead of repeating.
-        if (deferred > 0 and !self.worthShowing(parts.items.len)) {
-            self.partial = true;
-            self.dirty = false;
-            return;
+        if (deferred > 0 and !in.blank) {
+            return .{ .held = true, .origin = origin, .zoom = zoom };
         }
 
         // Symbols and rasters once over every tile: collision stays global,
@@ -1188,13 +1314,33 @@ pub const Map = struct {
             .dy = 0,
         });
 
-        self.built = try map.concatScenes(a, parts.items);
-        self.live = next;
+        return .{
+            .built = try map.concatScenes(a, parts.items),
+            .arena = next,
+            // Tiles whose geometry is actually IN the scene: `have` less
+            // whatever the budget deferred. The gap is what a test can watch
+            // to catch the scene silently losing ground.
+            .scene_tiles = parts.items.len - 1, // less the global pass
+            .partial = deferred > 0,
+            .origin = origin,
+            .zoom = zoom,
+        };
+    }
+
+    /// Put a staged scene on screen. Owner thread only: everything here is
+    /// read by drawing.
+    fn adopt(self: *Map, st: Staged, have: []const u64) !void {
+        self.dirty = false;
+        if (st.held) {
+            self.partial = true;
+            return;
+        }
+        self.built = st.built;
+        self.live = st.arena;
         self.scene_generation += 1;
         self.paint_generation += 1;
         self.rebuilds += 1;
-        self.dirty = false;
-        self.scene_partial = deferred > 0;
+        self.scene_partial = st.partial;
         // Tiles left untessellated by the budget: come back next update and
         // take the next batch. Their buckets are cached now, so the work
         // already done is not repeated.
@@ -1205,22 +1351,22 @@ pub const Map = struct {
         // tiles had not loaded -- and build a scene out of nothing. That is
         // a map that blanks whenever you zoom. `partial` means the narrower
         // thing it should: finish tessellating the set already chosen.
-        self.partial = deferred > 0;
-
-        // Tiles whose geometry is actually IN the scene, which is `have`
-        // minus whatever the budget deferred. The gap is what a test can
-        // watch to catch the scene silently losing ground.
-        self.scene_tiles = parts.items.len - 1; // less the global pass
+        self.partial = st.partial;
+        self.scene_tiles = st.scene_tiles;
         self.resident.clearRetainingCapacity();
         try self.resident.appendSlice(self.gpa, have);
         self.evictBuckets(self.wanted.items);
-        self.recordCoverage(origin, zoom);
+        self.recordCoverage(st.origin, st.zoom);
     }
 
     /// Record what the scene just built actually covers, so needsRebuild can
     /// tell when the view has left it.
     fn recordCoverage(self: *Map, origin: cameras.Vec2, zoom: f64) void {
-        const he = self.buildExtents();
+        // At the zoom the scene was BUILT at. A build now finishes some
+        // frames after it started, and the camera has usually moved on --
+        // describing its coverage with the current zoom is how the extents
+        // and the tile level come apart.
+        const he = self.extentsAt(zoom);
         self.cov_origin = origin;
         self.cov_zoom = zoom;
         self.cov_hw = he.x;
@@ -2397,4 +2543,43 @@ test "Map: a raster source alongside a vector one does not blank the scene" {
     try testing.expect(rasters > 0); // the basemap
     try testing.expect(fills > 0); // and the vector layer over it
     try testing.expect(b.vertices.len > 0);
+}
+
+test "Map: the scene builds off the owner thread" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+
+    // Drive updates until one hands the work to a worker and returns with
+    // the build still running. That IS the contract: update never blocks on
+    // layout, so the frame it was called from can go on and draw.
+    var saw_in_flight = false;
+    var spins: usize = 0;
+    while (spins < 2000 and !saw_in_flight) : (spins += 1) {
+        _ = try m.update();
+        if (m.buildInFlight()) saw_in_flight = true;
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try testing.expect(saw_in_flight);
+
+    // A build in flight must not stop the map from drawing what it has, and
+    // must not report the map as settled.
+    try testing.expect(!m.idle());
+
+    try settle(&m);
+    try testing.expect(!m.buildInFlight());
+    try testing.expect(m.scene().?.vertices.len > 0);
+
+    // The camera can move while a build runs; the result still describes the
+    // zoom it was STARTED at, so its coverage and its tiles agree.
+    const before = m.cov_zoom;
+    try testing.expectEqual(m.buildZoom(), before);
 }

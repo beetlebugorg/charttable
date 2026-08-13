@@ -120,6 +120,10 @@ const Handle = struct {
     /// Names collected during the last render, to report after the lock drops.
     pending_missing: std.ArrayListUnmanaged([:0]u8) = .empty,
 
+    /// Images the host handed over while a build was reading the atlases.
+    /// Applied as soon as it lands.
+    pending_images: std.ArrayListUnmanaged(PendingImage) = .empty,
+
     /// Scratch for borrowed strings (diagnostics), valid until the next call
     /// of the same kind.
     scratch: std.ArrayListUnmanaged(u8) = .empty,
@@ -127,6 +131,14 @@ const Handle = struct {
     const Archive = struct {
         reader: pmtiles.Reader,
         src: caches.PmtilesSource,
+    };
+
+    const PendingImage = struct {
+        name: []u8,
+        rgba: []u8,
+        w: u32,
+        h: u32,
+        ratio: f32,
     };
 
     const Provided = struct {
@@ -221,6 +233,11 @@ export fn charttable_close(h: ?*anyopaque) callconv(.c) void {
     self.reported.deinit(self.gpa);
     for (self.pending_missing.items) |n| self.gpa.free(n);
     self.pending_missing.deinit(self.gpa);
+    for (self.pending_images.items) |img| {
+        self.gpa.free(img.name);
+        self.gpa.free(img.rgba);
+    }
+    self.pending_images.deinit(self.gpa);
     self.scratch.deinit(self.gpa);
     const gpa = self.gpa;
     self.mu.unlock();
@@ -541,6 +558,17 @@ export fn charttable_resource_respond(
     for (self.provided.items) |pr| pr.provider.respond(req_id, slice, st);
 }
 
+/// Apply images queued while a build was reading the atlases.
+fn flushPendingImages(self: *Handle) void {
+    if (self.pending_images.items.len == 0 or self.m.buildInFlight()) return;
+    for (self.pending_images.items) |img| {
+        _ = applyImage(self, img.name, img.rgba, img.w, img.h, img.ratio);
+        self.gpa.free(img.name);
+        self.gpa.free(img.rgba);
+    }
+    self.pending_images.clearRetainingCapacity();
+}
+
 /// Hand the host every ask raised since the last call. Runs OUTSIDE the
 /// lock so the callback may answer immediately.
 fn pumpResources(self: *Handle) void {
@@ -585,13 +613,43 @@ export fn charttable_add_image(
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
     if (w == 0 or h_px == 0) return ERR_ARG;
+    // A build in flight is reading the atlases, and this is the ONE asset
+    // call a host makes at frame rate: answering missing images. Blocking
+    // here would hand the frame thread the rest of the build -- measured at
+    // a 190 ms frame across a zoom-out. Queue the pixels and apply them when
+    // the build lands; a symbol that appears one frame later is invisible
+    // next to a stall.
+    if (self.m.buildInFlight()) {
+        const n = @as(usize, w) * h_px * 4;
+        const img = Handle.PendingImage{
+            .name = self.gpa.dupe(u8, std.mem.span(name)) catch return ERR_MEMORY,
+            .rgba = self.gpa.dupe(u8, rgba[0..n]) catch return ERR_MEMORY,
+            .w = w,
+            .h = h_px,
+            .ratio = pixel_ratio,
+        };
+        self.pending_images.append(self.gpa, img) catch return ERR_MEMORY;
+        return OK;
+    }
+    return applyImage(self, std.mem.span(name), rgba[0 .. @as(usize, w) * h_px * 4], w, h_px, pixel_ratio);
+}
+
+/// Put one image into the sprite atlas. Caller holds the lock and has
+/// already made sure no build is reading it.
+fn applyImage(
+    self: *Handle,
+    name: []const u8,
+    rgba: []const u8,
+    w: u32,
+    h_px: u32,
+    pixel_ratio: f32,
+) c_int {
     if (self.sprite == null) {
         // A style with no sprite still has to accept runtime images.
         self.sprite = sprites.Sprite.initEmpty(self.gpa, 512) catch return ERR_MEMORY;
         self.m.setAssets(.{ .sprite = &self.sprite.?, .glyph_atlas = if (self.glyph_atlas) |*a| a else null });
     }
-    const n = @as(usize, w) * h_px * 4;
-    self.sprite.?.addImage(std.mem.span(name), rgba[0..n], w, h_px, pixel_ratio) catch return ERR_ARG;
+    self.sprite.?.addImage(name, rgba, w, h_px, pixel_ratio) catch return ERR_ARG;
     // New pixels mean an icon that was missing may now resolve: re-lay-out.
     self.m.setAssets(.{ .sprite = &self.sprite.?, .glyph_atlas = if (self.glyph_atlas) |*a| a else null });
     self.uploaded = .{};
@@ -601,6 +659,8 @@ export fn charttable_add_image(
 export fn charttable_remove_image(h: ?*anyopaque, name: [*:0]const u8) callconv(.c) void {
     const self = locked(h) orelse return;
     defer self.mu.unlock();
+    // A build in flight is reading these atlases.
+    self.m.waitForBuild();
     if (self.sprite) |*s| s.removeImage(std.mem.span(name));
 }
 
@@ -615,6 +675,8 @@ export fn charttable_set_sprite(
 ) callconv(.c) c_int {
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
+    // A build in flight is reading these atlases.
+    self.m.waitForBuild();
     var loaded = sprites.Sprite.load(self.gpa, index_json[0..json_len], png_bytes[0..png_len]) catch
         return ERR_ARG;
     if (self.sprite) |*s| s.deinit();
@@ -629,6 +691,8 @@ export fn charttable_set_sprite(
 export fn charttable_add_glyphs(h: ?*anyopaque, pbf: [*]const u8, len: usize) callconv(.c) c_int {
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
+    // A build in flight is reading these atlases.
+    self.m.waitForBuild();
     if (self.glyph_atlas == null) {
         self.glyph_atlas = glyphs.GlyphAtlas.init(self.gpa, glyphs.default_width) catch
             return ERR_MEMORY;
@@ -1170,8 +1234,10 @@ test "capi: two provided sources do not answer each other's requests" {
     var v = View{ .lon = -76.4767, .lat = 38.9763, .zoom = 14 };
     charttable_set_view(h, &v);
 
+    // Asks are raised by cache workers, so this waits on thread scheduling,
+    // not on a fixed amount of work. Be patient rather than flaky.
     var spins: usize = 0;
-    while (spins < 200 and TwoSourceProbe.seen < 2) : (spins += 1) {
+    while (spins < 3000 and TwoSourceProbe.seen < 2) : (spins += 1) {
         _ = charttable_tick(h, 16);
         @import("util/lock.zig").sleepMs(1);
     }
