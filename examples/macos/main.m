@@ -746,7 +746,20 @@ int main(int argc, const char *argv[]) {
         if (!haveSprite)
 #endif
         if (spriteDir) haveSprite = loadSprite(map, @(spriteDir));
-        if (glyphDir) loadGlyphs(map, @(glyphDir));
+        // Text needs a glyph atlas, and charttable fetches nothing itself:
+        // with none supplied, every label silently does not draw. Fall back
+        // to the checked-in fontnik ranges so text is on by default rather
+        // than depending on the launcher remembering an env var.
+        if (!glyphDir) {
+            for (NSString *guess in @[ @"test/assets", @"../../test/assets" ]) {
+                NSString *probe = [guess stringByAppendingPathComponent:@"Noto Sans Regular/0-255.pbf"];
+                if ([NSFileManager.defaultManager fileExistsAtPath:probe]) {
+                    glyphDir = guess.UTF8String;
+                    break;
+                }
+            }
+        }
+        if (glyphDir) loadGlyphs(map, @(glyphDir)); else NSLog(@"no glyphs: text will not draw");
 
         if (!stylePath) {
             NSString *assets = @"test/assets";
