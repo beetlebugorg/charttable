@@ -1271,7 +1271,8 @@ pub const Map = struct {
                     const rect = key.tileId().worldRect();
                     try parts.append(self.gpa, .{
                         .built = bucket.built,
-                        .dx = @floatCast(rect.x0 - origin.x),
+                        // The nearest world copy: see the note in map.zig.
+                        .dx = @floatCast(cameras.wrapDx(rect.x0, origin.x)),
                         .dy = @floatCast(rect.y0 - origin.y),
                     });
                 },

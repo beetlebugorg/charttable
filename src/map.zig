@@ -835,7 +835,13 @@ pub fn buildSceneWithRasters(
             progs.bind(tl);
             const rect = st.id.worldRect();
             const tile_span = rect.x1 - rect.x0;
-            const dx: f32 = @floatCast(rect.x0 - view.origin.x);
+            // Nearest world copy, not the canonical one. Longitude is
+            // cyclic, so a tile the view wants off its left edge is fetched
+            // as the wrapped column near the far right -- and placing it at
+            // that column's own world position puts it on the wrong side of
+            // the map. Harmless while the viewport is a sliver of the world;
+            // at low zoom it scrambles the geography.
+            const dx: f32 = @floatCast(cameras.wrapDx(rect.x0, view.origin.x));
             const dy: f32 = @floatCast(rect.y0 - view.origin.y);
             const tile_quads_first: u32 = @intCast(quads.items.len);
             var text_scratch: std.ArrayList(types.Quad) = .empty;
@@ -1137,9 +1143,9 @@ fn layoutDemLayer(
         }
 
         const rect = rt.id.worldRect();
-        const x0: f32 = @floatCast(rect.x0 - view.origin.x);
+        const x0: f32 = @floatCast(cameras.wrapDx(rect.x0, view.origin.x));
         const y0: f32 = @floatCast(rect.y0 - view.origin.y);
-        const x1: f32 = @floatCast(rect.x1 - view.origin.x);
+        const x1: f32 = x0 + @as(f32, @floatCast(rect.x1 - rect.x0));
         const y1: f32 = @floatCast(rect.y1 - view.origin.y);
 
         const image: u32 = @intCast(patterns.items.len);
@@ -1266,9 +1272,9 @@ fn layoutRasterLayer(
         if (rt.rgba.len < @as(usize, rt.w) * rt.h * 4) continue;
 
         const rect = rt.id.worldRect();
-        const x0: f32 = @floatCast(rect.x0 - view.origin.x);
+        const x0: f32 = @floatCast(cameras.wrapDx(rect.x0, view.origin.x));
         const y0: f32 = @floatCast(rect.y0 - view.origin.y);
-        const x1: f32 = @floatCast(rect.x1 - view.origin.x);
+        const x1: f32 = x0 + @as(f32, @floatCast(rect.x1 - rect.x0));
         const y1: f32 = @floatCast(rect.y1 - view.origin.y);
 
         const image: u32 = @intCast(patterns.items.len);
@@ -2389,7 +2395,7 @@ test "concatScenes: per-tile geometry plus a global symbol pass equals one build
         }, .{});
         try parts.append(a, .{
             .built = part,
-            .dx = @floatCast(rect.x0 - view.origin.x),
+            .dx = @floatCast(cameras.wrapDx(rect.x0, view.origin.x)),
             .dy = @floatCast(rect.y0 - view.origin.y),
         });
     }
