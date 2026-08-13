@@ -13,10 +13,15 @@
 CHARTTABLE := ../..
 ZIG        ?= zig
 OPT        ?= ReleaseFast
+# WebP tiles (elevation sources commonly serve them) need libwebp.
+WEBP       ?= true
 
 CFLAGS  := -O2 -fobjc-arc -I$(CHARTTABLE)/include
 LDFLAGS := -framework Cocoa -framework Metal -framework QuartzCore \
            -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
+ifeq ($(WEBP),true)
+LDFLAGS += -L/opt/homebrew/lib -lwebp
+endif
 LIBS    := $(CHARTTABLE)/zig-out/lib/libcharttable.a
 
 ifdef TILE57
@@ -30,7 +35,7 @@ all: chartview
 # The static library the app links. Built here so `make` in this directory
 # is the whole story.
 lib:
-	$(ZIG) build -Doptimize=$(OPT) --build-file $(CHARTTABLE)/build.zig
+	$(ZIG) build -Doptimize=$(OPT) -Dwebp=$(WEBP) --build-file $(CHARTTABLE)/build.zig
 
 chartview: main.m lib
 	clang $(CFLAGS) main.m $(LIBS) $(LDFLAGS) -o $@

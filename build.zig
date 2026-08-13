@@ -39,7 +39,22 @@ pub fn build(b: *std.Build) void {
     // Where the vendored spec conformance fixtures live (absolute, so the
     // test binary finds them regardless of its own cwd). The harness skips
     // itself when the directory is absent.
+    // libwebp, when the host has it. Optional on purpose: charttable's own
+    // PNG reader covers what tile servers usually send, and a hard
+    // dependency would land on every embedder. Tile servers that serve WebP
+    // (elevation tiles especially) need this.
+    const use_webp = b.option(bool, "webp", "Decode WebP tiles with libwebp") orelse false;
+    if (use_webp) {
+        mod.linkSystemLibrary("webp", .{});
+        // Homebrew's prefix is not on the default search path.
+        if (target.result.os.tag == .macos) {
+            mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+            mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        }
+    }
+
     const ct_opts = b.addOptions();
+    ct_opts.addOption(bool, "webp", use_webp);
     ct_opts.addOption([]const u8, "spec_fixture_dir", b.pathFromRoot("test/spec/expression"));
     ct_opts.addOption([]const u8, "report_path", b.pathFromRoot("test/spec/conformance-failures.txt"));
     ct_opts.addOption([]const u8, "assets_dir", b.pathFromRoot("test/assets"));

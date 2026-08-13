@@ -152,23 +152,91 @@ pub fn hillshade(
     }
 }
 
-/// A color ramp sampled over a fixed elevation window, so a per-pixel color
-/// is a table lookup rather than an expression evaluation 65 000 times.
+/// A color ramp as breakpoints, not a uniform table.
+///
+/// A bathymetric ramp puts all of its structure in a few metres either side
+/// of the waterline -- the seascape style steps at -50, -20, -10, -5, -2,
+/// -1.99, -0.004, 0, 0.004, 1, 2 -- while its domain runs to -10000. Sampled
+/// evenly over that domain, 256 entries land about 78 m apart and every one
+/// of those steps falls inside a single entry: the whole map comes out one
+/// flat wash. So the breakpoints are found by subdividing where the color
+/// actually changes, and lookup interpolates between them.
 pub const Ramp = struct {
-    lo: f32,
-    hi: f32,
-    /// RGBA8, `steps` entries.
-    lut: []const u8,
-
-    pub const steps: usize = 256;
+    /// Ascending elevations, and the color at each.
+    xs: []const f32,
+    cs: []const [4]u8,
 
     pub fn sample(self: Ramp, z: f32) [4]u8 {
-        if (self.hi <= self.lo) return self.lut[0..4].*;
-        const t = std.math.clamp((z - self.lo) / (self.hi - self.lo), 0, 1);
-        const i: usize = @intFromFloat(t * @as(f32, @floatFromInt(steps - 1)) + 0.5);
-        return self.lut[i * 4 ..][0..4].*;
+        if (self.xs.len == 0) return .{ 0, 0, 0, 0 };
+        if (z <= self.xs[0]) return self.cs[0];
+        if (z >= self.xs[self.xs.len - 1]) return self.cs[self.cs.len - 1];
+
+        var lo: usize = 0;
+        var hi: usize = self.xs.len - 1;
+        while (hi - lo > 1) {
+            const mid = (lo + hi) / 2;
+            if (self.xs[mid] <= z) lo = mid else hi = mid;
+        }
+        const span = self.xs[hi] - self.xs[lo];
+        const t: f32 = if (span > 0) (z - self.xs[lo]) / span else 0;
+        var out: [4]u8 = undefined;
+        for (0..4) |i| {
+            const a: f32 = @floatFromInt(self.cs[lo][i]);
+            const b: f32 = @floatFromInt(self.cs[hi][i]);
+            out[i] = @intFromFloat(std.math.clamp(a + (b - a) * t, 0, 255) + 0.5);
+        }
+        return out;
     }
 };
+
+/// Build a ramp by asking `colorAt` for the color at an elevation, splitting
+/// every interval whose ends differ until they agree or the budget runs out.
+/// Cheap where the ramp is flat, dense where it steps.
+pub fn buildRamp(
+    arena: std.mem.Allocator,
+    lo: f32,
+    hi: f32,
+    ctx: anytype,
+    comptime colorAt: fn (@TypeOf(ctx), f32) [4]u8,
+) !Ramp {
+    var xs: std.ArrayListUnmanaged(f32) = .empty;
+    var cs: std.ArrayListUnmanaged([4]u8) = .empty;
+
+    const budget: usize = 1024;
+    const Split = struct { a: f32, b: f32, ca: [4]u8, cb: [4]u8 };
+    var stack: std.ArrayListUnmanaged(Split) = .empty;
+
+    try xs.append(arena, lo);
+    try cs.append(arena, colorAt(ctx, lo));
+    try stack.append(arena, .{ .a = lo, .b = hi, .ca = cs.items[0], .cb = colorAt(ctx, hi) });
+
+    while (stack.pop()) |sp| {
+        const differ = differs(sp.ca, sp.cb);
+        // A metre either side of the waterline is where charts care most, so
+        // keep splitting there long after a coarse ramp would have stopped.
+        const fine = @abs(sp.b - sp.a) <= 0.002;
+        if (!differ or fine or xs.items.len >= budget) {
+            try xs.append(arena, sp.b);
+            try cs.append(arena, sp.cb);
+            continue;
+        }
+        const mid = (sp.a + sp.b) / 2;
+        const cm = colorAt(ctx, mid);
+        // Push the far half first so the near half pops next: the list comes
+        // out ascending.
+        try stack.append(arena, .{ .a = mid, .b = sp.b, .ca = cm, .cb = sp.cb });
+        try stack.append(arena, .{ .a = sp.a, .b = mid, .ca = sp.ca, .cb = cm });
+    }
+    return .{ .xs = xs.items, .cs = cs.items };
+}
+
+fn differs(a: [4]u8, b: [4]u8) bool {
+    for (0..4) |i| {
+        const d = @as(i32, a[i]) - @as(i32, b[i]);
+        if (@abs(d) > 1) return true;
+    }
+    return false;
+}
 
 /// Paint every pixel by its elevation.
 pub fn colorRelief(grid: Grid, ramp: Ramp, opacity: f32, out: []u8) !void {
@@ -254,32 +322,39 @@ test "flat ground casts no shade; a slope does" {
     try testing.expect(shaded > w * h / 2);
 }
 
-test "a color ramp maps elevation through its window" {
+test "a ramp finds the steps a bathymetric palette hides near zero" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Black at the bottom, white at the top.
-    const lut = try a.alloc(u8, Ramp.steps * 4);
-    for (0..Ramp.steps) |i| {
-        const v: u8 = @intCast(i * 255 / (Ramp.steps - 1));
-        lut[i * 4 ..][0..4].* = .{ v, v, v, 255 };
-    }
-    const ramp = Ramp{ .lo = 0, .hi = 100, .lut = lut };
-    try testing.expectEqual(@as(u8, 0), ramp.sample(0)[0]);
-    try testing.expectEqual(@as(u8, 255), ramp.sample(100)[0]);
-    try testing.expectEqual(@as(u8, 255), ramp.sample(1000)[0]); // clamped
-    try testing.expectEqual(@as(u8, 0), ramp.sample(-50)[0]); // clamped
-    try testing.expectApproxEqAbs(@as(f32, 128), @as(f32, @floatFromInt(ramp.sample(50)[0])), 2);
+    // The shape a chart palette actually has: flat for kilometres, then
+    // several steps within two metres of the waterline.
+    const Palette = struct {
+        fn at(_: void, z: f32) [4]u8 {
+            if (z < -50) return .{ 233, 247, 255, 255 };
+            if (z < -20) return .{ 201, 233, 253, 255 };
+            if (z < -2) return .{ 127, 199, 248, 255 };
+            if (z < 0) return .{ 31, 134, 203, 255 };
+            if (z < 2) return .{ 168, 213, 186, 255 };
+            return .{ 247, 240, 221, 168 };
+        }
+    };
+    const ramp = try buildRamp(a, -11000, 9000, {}, Palette.at);
 
-    const grid = Grid{ .w = 2, .h = 1, .z = try a.alloc(f32, 2) };
-    grid.z[0] = 0;
-    grid.z[1] = 100;
-    const out = try a.alloc(u8, 2 * 4);
-    try colorRelief(grid, ramp, 0.5, out);
-    try testing.expectEqual(@as(u8, 0), out[0]);
-    try testing.expectEqual(@as(u8, 255), out[4]);
-    try testing.expectEqual(@as(u8, 128), out[3]); // opacity applied
+    // Every band comes back, including the ones inside two metres of zero --
+    // a 256-entry even sweep of this domain lands 78 m apart and returns one
+    // flat color for all of them.
+    try testing.expectEqual(@as(u8, 233), ramp.sample(-9000)[0]);
+    try testing.expectEqual(@as(u8, 201), ramp.sample(-30)[0]);
+    try testing.expectEqual(@as(u8, 127), ramp.sample(-10)[0]);
+    try testing.expectEqual(@as(u8, 31), ramp.sample(-1)[0]);
+    try testing.expectEqual(@as(u8, 168), ramp.sample(1)[0]);
+    try testing.expectEqual(@as(u8, 247), ramp.sample(50)[0]);
+    try testing.expectEqual(@as(u8, 168), ramp.sample(50)[3]); // alpha too
+
+    // Beyond the ends it clamps rather than wrapping.
+    try testing.expectEqual(@as(u8, 233), ramp.sample(-99999)[0]);
+    try testing.expectEqual(@as(u8, 247), ramp.sample(99999)[0]);
 }
 
 test "metres per pixel shrinks with zoom and with latitude" {

@@ -31,6 +31,7 @@ const mvt = @import("mvt.zig");
 const mlt = @import("mlt.zig");
 const pmtiles = @import("pmtiles.zig");
 const png = @import("../util/png.zig");
+const webp = @import("../util/webp.zig");
 const Lock = @import("../util/lock.zig").Lock;
 const sleepMs = @import("../util/lock.zig").sleepMs;
 
@@ -742,7 +743,13 @@ pub const Cache = struct {
             .bytes => {},
         }
         if (src.kind == .raster) {
-            const img = png.read(a, got.bytes) catch return .{ .key = k, .state = .failed };
+            // PNG is decoded here; WebP goes to libwebp when the build has
+            // it. Elevation tiles in particular are usually WebP.
+            const img: png.Image = if (webp.looksLikeWebp(got.bytes)) blk: {
+                const wi = webp.decode(a, got.bytes) catch
+                    return .{ .key = k, .state = .failed };
+                break :blk .{ .w = wi.w, .h = wi.h, .rgba = wi.rgba };
+            } else png.read(a, got.bytes) catch return .{ .key = k, .state = .failed };
             keep = true;
             return .{
                 .key = k,

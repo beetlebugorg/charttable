@@ -34,6 +34,7 @@ pub const sprite = @import("symbol/sprite.zig");
 pub const glyphs = @import("symbol/glyphs.zig");
 pub const gpu = @import("gpu/gpu.zig");
 pub const png = @import("util/png.zig");
+pub const webp = @import("util/webp.zig");
 pub const lock = @import("util/lock.zig");
 pub const clock = @import("util/clock.zig");
 
@@ -73,6 +74,7 @@ test {
     _ = glyphs;
     _ = gpu;
     _ = png;
+    _ = webp;
     _ = lock;
     _ = clock;
 }

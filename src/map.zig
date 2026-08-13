@@ -1170,36 +1170,45 @@ fn layoutDemLayer(
     }
 }
 
-/// Sample `color-relief-color` into a lookup table. The property is a ramp
-/// over ELEVATION, which the expression language reaches through the same
-/// slot `zoom` uses, so the table is built by walking that slot.
-fn reliefRamp(
+/// Turn `color-relief-color` into a ramp. The property is an expression over
+/// ELEVATION, which the expression language already exposes, so the ramp is
+/// built by evaluating it at elevations chosen by the ramp builder.
+const ReliefCtx = struct {
     arena: std.mem.Allocator,
-    sl: *const styles.Layer,
+    pv: ?styles.PropValue,
     ctx: *eval_mod.Context,
     errors: *usize,
-) !dem.Ramp {
-    const lut = try arena.alloc(u8, dem.Ramp.steps * 4);
-    const pv = resolveProp(sl, "color-relief-color");
-    const lo: f32 = -11000; // the deepest ocean
-    const hi: f32 = 9000; // the highest ground
-    const saved = ctx.elevation;
-    defer ctx.elevation = saved;
-    for (0..dem.Ramp.steps) |i| {
-        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(dem.Ramp.steps - 1));
-        ctx.elevation = lo + (hi - lo) * t;
-        var c = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
-        if (pv) |p| {
-            if (asColor(evalProp(arena, p, ctx, .null, errors))) |got| c = got;
-        }
-        lut[i * 4 ..][0..4].* = .{
+
+    fn colorAt(self: *const ReliefCtx, z: f32) [4]u8 {
+        self.ctx.elevation = z;
+        const pv = self.pv orelse return .{ 0, 0, 0, 0 };
+        const c = asColor(evalProp(self.arena, pv, self.ctx, .null, self.errors)) orelse
+            return .{ 0, 0, 0, 0 };
+        return .{
             @intFromFloat(std.math.clamp(c.r, 0, 1) * 255 + 0.5),
             @intFromFloat(std.math.clamp(c.g, 0, 1) * 255 + 0.5),
             @intFromFloat(std.math.clamp(c.b, 0, 1) * 255 + 0.5),
             @intFromFloat(std.math.clamp(c.a, 0, 1) * 255 + 0.5),
         };
     }
-    return .{ .lo = lo, .hi = hi, .lut = lut };
+};
+
+fn reliefRamp(
+    arena: std.mem.Allocator,
+    sl: *const styles.Layer,
+    ctx: *eval_mod.Context,
+    errors: *usize,
+) !dem.Ramp {
+    const rc = ReliefCtx{
+        .arena = arena,
+        .pv = resolveProp(sl, "color-relief-color"),
+        .ctx = ctx,
+        .errors = errors,
+    };
+    const saved = ctx.elevation;
+    defer ctx.elevation = saved;
+    // The deepest ocean to the highest ground.
+    return dem.buildRamp(arena, -11000, 9000, &rc, ReliefCtx.colorAt);
 }
 
 fn numProp(
