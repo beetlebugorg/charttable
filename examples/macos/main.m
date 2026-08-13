@@ -393,6 +393,137 @@ static void onComposeTile(uint64_t req_id, const char *source, uint32_t z, uint3
 }
 #endif
 
+
+// ---- remote styles ---------------------------------------------------------
+//
+// charttable fetches nothing, by design: the host owns where bytes come from.
+// So a style served over HTTP is entirely the app's job -- pull the style,
+// resolve the URLs inside it against the style's own address, pull the sprite
+// and glyphs, and answer tile requests from the source's URL template.
+
+static BOOL isURL(NSString *s) {
+    return [s hasPrefix:@"http://"] || [s hasPrefix:@"https://"];
+}
+
+/// Blocking GET, for the handful of things fetched before the first frame:
+/// the style, its sprite, its glyph ranges.
+static NSData *fetchURL(NSString *url) {
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block NSData *out = nil;
+    NSURLSessionDataTask *t = [NSURLSession.sharedSession
+        dataTaskWithURL:[NSURL URLWithString:url]
+      completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+          NSInteger code = [r isKindOfClass:NSHTTPURLResponse.class]
+                               ? ((NSHTTPURLResponse *)r).statusCode : 0;
+          if (e) NSLog(@"GET %@: %@", url, e.localizedDescription);
+          else if (code >= 400) NSLog(@"GET %@: HTTP %ld", url, (long)code);
+          else out = d;
+          dispatch_semaphore_signal(done);
+      }];
+    [t resume];
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+    return out;
+}
+
+/// Style URLs may be relative ("/sprite", "sprite.png"), and MapLibre also
+/// allows the mapbox:// forms, which are not resolvable without a token --
+/// those are reported rather than guessed at.
+static NSString *resolveURL(NSString *ref, NSString *base) {
+    if (!ref) return nil;
+    if (isURL(ref)) return ref;
+    if ([ref hasPrefix:@"mapbox://"]) { NSLog(@"cannot resolve %@ (no token)", ref); return nil; }
+    if (!base) return ref;
+    return [[NSURL URLWithString:ref relativeToURL:[NSURL URLWithString:base]] absoluteString];
+}
+
+/// source name -> tile URL template, filled from the style.
+static NSMutableDictionary<NSString *, NSString *> *g_tileURLs;
+
+static void onHTTPTile(uint64_t req_id, const char *sourceC, uint32_t z, uint32_t x, uint32_t y,
+                       void *user) {
+    (void)user;
+    // The name belongs to the caller; the block below outlives this frame.
+    NSString *source = @(sourceC);
+    NSString *tmpl = g_tileURLs[source];
+    if (!tmpl) {
+        charttable_resource_respond(g_map, req_id, NULL, 0, CHARTTABLE_RESOURCE_FAILED);
+        return;
+    }
+    NSString *url = [[[tmpl stringByReplacingOccurrencesOfString:@"{z}"
+                                                      withString:@(z).stringValue]
+        stringByReplacingOccurrencesOfString:@"{x}" withString:@(x).stringValue]
+        stringByReplacingOccurrencesOfString:@"{y}" withString:@(y).stringValue];
+    // Asynchronous on purpose: the request parks, and the callback runs on
+    // the OWNER thread -- blocking here would put a network round trip in the
+    // middle of a frame.
+    [[NSURLSession.sharedSession
+        dataTaskWithURL:[NSURL URLWithString:url]
+      completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+          NSInteger code = [r isKindOfClass:NSHTTPURLResponse.class]
+                               ? ((NSHTTPURLResponse *)r).statusCode : 0;
+          int st = CHARTTABLE_RESOURCE_OK;
+          // 404 is a real "nothing there" and is worth remembering; anything
+          // else that went wrong is a failure, not an empty tile.
+          if (e || code >= 400 || !d.length)
+              st = (code == 404 || (!e && !d.length)) ? CHARTTABLE_RESOURCE_EMPTY
+                                                      : CHARTTABLE_RESOURCE_FAILED;
+          if (getenv("CHARTTABLE_TRACE_TILES"))
+              NSLog(@"tile %@ %u/%u/%u -> %ld bytes, status %d", source, z, x, y,
+                    (long)d.length, st);
+          charttable_resource_respond(g_map, req_id, st == CHARTTABLE_RESOURCE_OK ? d.bytes : NULL,
+                                      st == CHARTTABLE_RESOURCE_OK ? d.length : 0, st);
+      }] resume];
+}
+
+/// Sprite and glyphs named by the style, through the ABI. charttable never
+/// goes and gets these itself, so a style that asks for them and a host that
+/// ignores the ask is a chart with no icons and no labels.
+static void loadRemoteAssets(charttable *map, NSDictionary *sj, NSString *base, double ratio) {
+    NSString *sprite = resolveURL(sj[@"sprite"], base);
+    if (sprite) {
+        // @2x first on a Retina panel; the 1x sheet is the fallback.
+        NSString *suffix = ratio >= 2 ? @"@2x" : @"";
+        NSData *idx = fetchURL([NSString stringWithFormat:@"%@%@.json", sprite, suffix]);
+        NSData *png = fetchURL([NSString stringWithFormat:@"%@%@.png", sprite, suffix]);
+        if (!idx || !png) {
+            idx = fetchURL([sprite stringByAppendingString:@".json"]);
+            png = fetchURL([sprite stringByAppendingString:@".png"]);
+        }
+        if (idx && png &&
+            charttable_set_sprite(map, idx.bytes, idx.length, png.bytes, png.length) == CHARTTABLE_OK)
+            NSLog(@"sprite: %@ (%lu B json, %lu B png)", sprite,
+                  (unsigned long)idx.length, (unsigned long)png.length);
+        else
+            NSLog(@"sprite %@ unavailable -- icons will be missing", sprite);
+    }
+
+    NSString *glyphs = resolveURL(sj[@"glyphs"], base);
+    if (!glyphs) return;
+    // Which fontstacks the style actually asks for, so this fetches what is
+    // used rather than a guess.
+    NSMutableSet<NSString *> *stacks = [NSMutableSet set];
+    for (NSDictionary *L in sj[@"layers"]) {
+        id f = L[@"layout"][@"text-font"];
+        if ([f isKindOfClass:NSArray.class] && [f count] && [f[0] isKindOfClass:NSString.class])
+            [stacks addObject:[f componentsJoinedByString:@","]];
+    }
+    if (!stacks.count) return;
+    int loaded = 0;
+    for (NSString *stack in stacks) {
+        NSString *enc = [stack stringByAddingPercentEncodingWithAllowedCharacters:
+                                   NSCharacterSet.URLPathAllowedCharacterSet];
+        // Latin plus Latin-1 covers the labels in a western style; more ranges
+        // are a fetch each and this is a test harness, not a map app.
+        for (NSString *range in @[ @"0-255", @"256-511" ]) {
+            NSString *u = [[glyphs stringByReplacingOccurrencesOfString:@"{fontstack}" withString:enc]
+                stringByReplacingOccurrencesOfString:@"{range}" withString:range];
+            NSData *pbf = fetchURL(u);
+            if (pbf && charttable_add_glyphs(map, pbf.bytes, pbf.length) == CHARTTABLE_OK) loaded++;
+        }
+    }
+    NSLog(@"glyphs: %d ranges from %lu fontstack(s)", loaded, (unsigned long)stacks.count);
+}
+
 @interface ChartView : NSView
 @end
 
@@ -476,7 +607,7 @@ static void onComposeTile(uint64_t req_id, const char *source, uint32_t z, uint3
     double now = CACurrentMediaTime() * 1000.0;
     double dt = _lastTickMs > 0 ? now - _lastTickMs : 0;
     _lastTickMs = now;
-    charttable_tick(_map, dt);
+    if (charttable_tick(_map, dt) != CHARTTABLE_OK) NSLog(@"tick failed");
     // Honest damage: a still camera over a settled map draws nothing. A pan
     // or zoom counts, so input needs no special case here.
     if (charttable_needs_redraw(_map)) charttable_render(_map);
@@ -569,15 +700,20 @@ static void onComposeTile(uint64_t req_id, const char *source, uint32_t z, uint3
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSString *home = NSHomeDirectory();
-        NSString *chart = argc > 1 ? @(argv[1])
-                                   : [home stringByAppendingPathComponent:
-                                              @"Charts/ENC_ROOT/US5MD1MC/US5MD1MC.pmtiles"];
+        NSString *arg1 = argc > 1 ? @(argv[1]) : nil;
+        // A URL, or a .json file, IS the style: it names its own tile
+        // sources, so there may be no local chart to open at all.
+        const BOOL remoteStyle = arg1 && (isURL(arg1) ||
+                                          [arg1.pathExtension isEqualToString:@"json"]);
+        NSString *chart = remoteStyle ? nil
+                        : arg1 ?: [home stringByAppendingPathComponent:
+                                            @"Charts/ENC_ROOT/US5MD1MC/US5MD1MC.pmtiles"];
         // argv[2] or CHARTTABLE_STYLE: any MapLibre style JSON, used
         // VERBATIM. No mariner surgery, no tile57 style build, no S-52
         // assumptions -- the point is to test charttable against an ordinary
         // style, so nothing here may quietly rewrite it. Sources are bound
         // under the names the style itself declares.
-        NSString *stylePath = argc > 2 ? @(argv[2]) : nil;
+        NSString *stylePath = remoteStyle ? arg1 : (argc > 2 ? @(argv[2]) : nil);
         if (!stylePath && getenv("CHARTTABLE_STYLE")) stylePath = @(getenv("CHARTTABLE_STYLE"));
         const BOOL customStyle = stylePath != nil;
 
@@ -674,6 +810,11 @@ int main(int argc, const char *argv[]) {
             free(scamin);
         }
 #endif
+        NSString *styleBase = nil;
+        if (!style && isURL(stylePath)) {
+            style = fetchURL(stylePath);
+            styleBase = stylePath;
+        }
         if (!style) style = readFile(stylePath);
         if (!style) { NSLog(@"cannot read style %@", stylePath); return 1; }
 
@@ -753,25 +894,65 @@ int main(int argc, const char *argv[]) {
         NSMutableArray<NSString *> *srcNames = [NSMutableArray array];
         if (customStyle) {
             NSDictionary *sj = [NSJSONSerialization JSONObjectWithData:style options:0 error:nil];
-            [sj[@"sources"] enumerateKeysAndObjectsUsingBlock:^(NSString *name, NSDictionary *src, BOOL *stop) {
+            g_tileURLs = [NSMutableDictionary dictionary];
+            NSMutableArray<NSString *> *localNames = [NSMutableArray array];
+            for (NSString *name in sj[@"sources"]) {
+                NSDictionary *src = sj[@"sources"][name];
                 NSString *type = src[@"type"];
-                if ([type isEqualToString:@"vector"]) [srcNames addObject:name];
-                else NSLog(@"source '%@' is type '%@' -- not bound (no fetching here)", name, type);
-            }];
-            if (srcNames.count == 0) { NSLog(@"style declares no vector source"); return 1; }
-            if (srcNames.count > 1)
-                NSLog(@"style declares %lu vector sources; binding the chart to each",
-                      (unsigned long)srcNames.count);
-            NSLog(@"binding archives to source(s): %@", [srcNames componentsJoinedByString:@", "]);
-            if (sj[@"sprite"] && !haveSprite)
-                NSLog(@"style asks for sprite %@ -- charttable does not fetch; "
-                      @"set CHARTTABLE_SPRITE_DIR or icons will be missing", sj[@"sprite"]);
-            if (sj[@"glyphs"] && !glyphDir)
-                NSLog(@"style asks for glyphs %@ -- set CHARTTABLE_GLYPHS_DIR or text "
-                      @"will be missing", sj[@"glyphs"]);
+                const BOOL isRaster = [type isEqualToString:@"raster"];
+                if (![type isEqualToString:@"vector"] && !isRaster) {
+                    NSLog(@"source '%@' is type '%@' -- skipped", name, type);
+                    continue;
+                }
+                // Tiles may be listed inline, or behind a TileJSON document,
+                // which also carries the zoom range the source really has.
+                NSDictionary *tj = src;
+                NSString *tmpl = [src[@"tiles"] isKindOfClass:NSArray.class] && [src[@"tiles"] count]
+                                     ? resolveURL(src[@"tiles"][0], styleBase) : nil;
+                if (!tmpl && src[@"url"]) {
+                    NSString *tjurl = resolveURL(src[@"url"], styleBase);
+                    NSData *d = tjurl ? fetchURL(tjurl) : nil;
+                    NSDictionary *json = d ? [NSJSONSerialization JSONObjectWithData:d options:0
+                                                                               error:nil] : nil;
+                    if ([json[@"tiles"] isKindOfClass:NSArray.class] && [json[@"tiles"] count]) {
+                        tmpl = resolveURL(json[@"tiles"][0], tjurl);
+                        tj = json;
+                    }
+                }
+                if (tmpl) {
+                    g_tileURLs[name] = tmpl;
+                    charttable_provided_opts po = {
+                        .kind = isRaster ? 1u : 0u,
+                        .encoding = 0,
+                        .minzoom = tj[@"minzoom"] ? [tj[@"minzoom"] unsignedIntValue] : 0,
+                        .maxzoom = tj[@"maxzoom"] ? [tj[@"maxzoom"] unsignedIntValue] : 14,
+                    };
+                    if (charttable_add_source_provided_opts(map, name.UTF8String, &po) != CHARTTABLE_OK) {
+                        NSLog(@"cannot route source '%@'", name); return 1;
+                    }
+                    NSLog(@"source '%@' (%@ z%u-%u) -> %@", name, type, po.minzoom, po.maxzoom, tmpl);
+                } else {
+                    [localNames addObject:name];   // served from the local archive
+                }
+            }
+            if (g_tileURLs.count) {
+                g_map = map;
+                charttable_set_resource_provider(map, onHTTPTile, NULL);
+                loadRemoteAssets(map, sj, styleBase, NSScreen.mainScreen.backingScaleFactor);
+            }
+            [srcNames addObjectsFromArray:localNames];
+            if (srcNames.count == 0 && g_tileURLs.count == 0) {
+                NSLog(@"style declares no vector source"); return 1;
+            }
+            if (srcNames.count) {
+                if (!chart) { NSLog(@"source(s) %@ need a local chart argument",
+                                    [srcNames componentsJoinedByString:@", "]); return 1; }
+                NSLog(@"binding archives to source(s): %@", [srcNames componentsJoinedByString:@", "]);
+            }
         } else {
             [srcNames addObject:@"chart"];
         }
+        if (srcNames.count == 0) goto sources_done;
 
 #ifdef USE_TILE57_COMPOSE
         // QUILTING. charttable's own multi-archive source picks a cell per
@@ -954,7 +1135,11 @@ int main(int argc, const char *argv[]) {
             charttable_set_pixel_density(map, 1.0f);
             charttable_resize(map, W, H);
             for (int i = 0; i < 4000 && !charttable_idle(map); i++) {
-                charttable_tick(map, 16);
+                int rc = charttable_tick(map, 16);
+                if (rc != CHARTTABLE_OK) { NSLog(@"tick failed rc=%d", rc); break; }
+                if (getenv("CHARTTABLE_DEBUG_BUILD") && i % 300 == 0)
+                    NSLog(@"wait %d: pending %u, idle %d", i, charttable_pending_tiles(map),
+                          charttable_idle(map));
                 usleep(1000);
             }
             NSMutableData *rgba = [NSMutableData dataWithLength:W * H * 4];
