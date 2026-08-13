@@ -697,6 +697,36 @@ export fn charttable_set_sprite(
 }
 
 /// Add one fontstack range (a fontnik glyph PBF) to the SDF atlas.
+/// A host-baked SDF glyph sheet: RGBA atlas + an index of UVs and EM-unit
+/// metrics (see glyphs.addSdfSheet). For a host whose text engine already
+/// bakes one, so it need not also produce fontnik PBFs.
+export fn charttable_set_glyph_sheet(
+    h: ?*anyopaque,
+    index_json: [*]const u8,
+    json_len: usize,
+    rgba: [*]const u8,
+    w: u32,
+    h_px: u32,
+) callconv(.c) c_int {
+    const self = locked(h) orelse return ERR_HANDLE;
+    defer self.mu.unlock();
+    self.m.waitForBuild();
+    if (self.glyph_atlas == null) {
+        self.glyph_atlas = glyphs.GlyphAtlas.init(self.gpa, glyphs.default_width) catch
+            return ERR_MEMORY;
+    }
+    const n = @as(usize, w) * h_px * 4;
+    const added = self.glyph_atlas.?.addSdfSheet(index_json[0..json_len], rgba[0..n], w, h_px) catch
+        return ERR_ARG;
+    if (added == 0) return ERR_ARG;
+    self.glyphs_dirty = true;
+    self.m.setAssets(.{
+        .sprite = if (self.sprite) |*sp| sp else null,
+        .glyph_atlas = if (self.glyph_atlas) |*ga| ga else null,
+    });
+    return OK;
+}
+
 export fn charttable_add_glyphs(h: ?*anyopaque, pbf: [*]const u8, len: usize) callconv(.c) c_int {
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();

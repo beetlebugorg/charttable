@@ -759,7 +759,42 @@ int main(int argc, const char *argv[]) {
                 }
             }
         }
-        if (glyphDir) loadGlyphs(map, @(glyphDir)); else NSLog(@"no glyphs: text will not draw");
+        if (glyphDir) loadGlyphs(map, @(glyphDir));
+#ifdef USE_TILE57_COMPOSE
+        // No font files needed: the engine that draws the symbols bakes the
+        // label font too, as an SDF sheet charttable takes directly.
+        if (!glyphDir) {
+            tile57_assets ga = {0};
+            tile57_error ge = {0};
+            if (tile57_bake_glyph_sdf(&ga, &ge) == TILE57_OK) {
+                CGImageSourceRef src = CGImageSourceCreateWithData(
+                    (__bridge CFDataRef)[NSData dataWithBytes:ga.sprite_png length:ga.sprite_png_len],
+                    NULL);
+                CGImageRef img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
+                if (img) {
+                    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+                    NSMutableData *rgba = [NSMutableData dataWithLength:w * h * 4];
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    CGContextRef ctx = CGBitmapContextCreate(rgba.mutableBytes, w, h, 8, w * 4, cs,
+                                                             kCGImageAlphaPremultipliedLast);
+                    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+                    int rc = charttable_set_glyph_sheet(map, (const char *)ga.sprite_json,
+                                                        ga.sprite_json_len, rgba.bytes,
+                                                        (uint32_t)w, (uint32_t)h);
+                    NSLog(@"glyphs: tile57 SDF sheet %zux%zu -> rc=%d", w, h, rc);
+                    CGContextRelease(ctx);
+                    CGColorSpaceRelease(cs);
+                    CGImageRelease(img);
+                    glyphDir = "";  // handled
+                }
+                if (src) CFRelease(src);
+                tile57_assets_free(&ga);
+            } else {
+                NSLog(@"glyph bake failed: %s", ge.message);
+            }
+        }
+#endif
+        if (!glyphDir) NSLog(@"no glyphs: text will not draw");
 
         if (!stylePath) {
             NSString *assets = @"test/assets";

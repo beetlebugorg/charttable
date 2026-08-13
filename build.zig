@@ -84,6 +84,43 @@ pub fn build(b: *std.Build) void {
     ).step);
     b.getInstallStep().dependOn(lib_step);
 
+    // `zig build example -Dtile57=<path>` — the macOS demo.
+    //
+    // Built HERE rather than by hand-linking libcharttable.a: ld rejects the
+    // archive Zig writes ("64-bit mach-o not 8-byte aligned") once the
+    // objects reach certain sizes, and linkLibrary sidesteps the archive
+    // entirely by handing the linker Zig's own objects.
+    if (target.result.os.tag == .macos) {
+        const tile57_path = b.option([]const u8, "tile57", "Path to a tile57 checkout, for the chart demo");
+        const exe_mod = b.createModule(.{ .target = target, .optimize = optimize });
+        exe_mod.link_libc = true;
+        const exe = b.addExecutable(.{ .name = "chartview", .root_module = exe_mod });
+
+        var flags: std.ArrayListUnmanaged([]const u8) = .empty;
+        flags.appendSlice(b.allocator, &.{ "-O2", "-fobjc-arc" }) catch @panic("OOM");
+        if (tile57_path) |tp| {
+            flags.append(b.allocator, "-DUSE_TILE57_COMPOSE") catch @panic("OOM");
+            exe_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ tp, "include" }) });
+            exe_mod.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ tp, "zig-out/lib/libtile57.a" }) });
+        }
+        exe_mod.addCSourceFile(.{
+            .file = b.path("examples/macos/main.m"),
+            .flags = flags.items,
+        });
+        exe_mod.addIncludePath(b.path("include"));
+        exe_mod.linkLibrary(lib);
+        if (use_webp) exe_mod.linkSystemLibrary("webp", .{});
+        if (use_libpng) exe_mod.linkSystemLibrary("png", .{});
+        if (use_webp or use_libpng) {
+            exe_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        }
+        for ([_][]const u8{ "Cocoa", "Metal", "QuartzCore", "CoreGraphics", "ImageIO", "UniformTypeIdentifiers" }) |fw| {
+            exe_mod.linkFramework(fw, .{});
+        }
+        const example_step = b.step("example", "Build the macOS chart demo");
+        example_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     // `zig build test` — the gate. Every source module is referenced from
     // src/root.zig so its tests ride this one build.
     const tests = b.addTest(.{ .root_module = mod });

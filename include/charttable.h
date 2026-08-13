@@ -173,6 +173,17 @@ void charttable_resource_respond(charttable *, uint64_t req_id,
 int charttable_set_sprite(charttable *, const char *index_json,
                           size_t json_len, const uint8_t *png, size_t png_len);
 
+/* A host-baked SDF glyph sheet: an RGBA atlas plus an index naming each
+ * glyph's UVs and its metrics in EM units:
+ *
+ *   {"em_px": 32, "pad": 6,
+ *    "glyphs": {"65": [u0, v0, u1, v1, off_x, off_y, w, h, advance]}}
+ *
+ * For a host whose text engine bakes its own atlas (tile57_bake_glyph_sdf
+ * emits exactly this), so it need not also produce fontnik PBFs. */
+int charttable_set_glyph_sheet(charttable *, const char *index_json, size_t json_len,
+                               const uint8_t *rgba, uint32_t w, uint32_t h);
+
 /* One fontnik glyph-PBF range into the SDF text atlas. */
 int charttable_add_glyphs(charttable *, const uint8_t *pbf, size_t len);
 

@@ -271,6 +271,124 @@ pub const GlyphAtlas = struct {
         return added;
     }
 
+    /// Take a host-baked SDF atlas: an RGBA sheet plus an index describing
+    /// each glyph as UVs into it and metrics in EM units.
+    ///
+    ///   {"em_px": 32, "pad": 6,
+    ///    "glyphs": {"65": [u0, v0, u1, v1, off_x, off_y, w, h, advance]}}
+    ///
+    /// This is the shape tile57 bakes (tile57_bake_glyph_sdf), and it exists
+    /// so a host with a text engine of its own does not also have to produce
+    /// fontnik PBFs. Without some such path, a host that cannot supply PBFs
+    /// draws no text at all -- which reads as "text is broken" rather than
+    /// "nobody handed it a font".
+    ///
+    /// The sheet's red channel is the distance field; a cell is copied
+    /// verbatim, so the field's own scale rides along with it.
+    pub fn addSdfSheet(
+        self: *GlyphAtlas,
+        index_json: []const u8,
+        rgba: []const u8,
+        sheet_w: u32,
+        sheet_h: u32,
+    ) Error!usize {
+        if (sheet_w == 0 or sheet_h == 0) return error.Malformed;
+        if (rgba.len < @as(usize, sheet_w) * sheet_h * 4) return error.Malformed;
+
+        var tmp = std.heap.ArenaAllocator.init(self.alloc);
+        defer tmp.deinit();
+        const a = tmp.allocator();
+
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, index_json, .{}) catch
+            return error.Malformed;
+        if (parsed != .object) return error.Malformed;
+        const em_px: f64 = switch (parsed.object.get("em_px") orelse return error.Malformed) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => return error.Malformed,
+        };
+        if (em_px <= 0) return error.Malformed;
+        const glyphs_val = parsed.object.get("glyphs") orelse return error.Malformed;
+        if (glyphs_val != .object) return error.Malformed;
+
+        var added: usize = 0;
+        var it = glyphs_val.object.iterator();
+        while (it.next()) |kv| {
+            const cp_int = std.fmt.parseInt(u21, kv.key_ptr.*, 10) catch continue;
+            const arr = switch (kv.value_ptr.*) {
+                .array => |ar| ar.items,
+                else => continue,
+            };
+            if (arr.len < 9) continue;
+            var f: [9]f64 = undefined;
+            for (arr[0..9], 0..) |v, i| f[i] = switch (v) {
+                .integer => |n| @floatFromInt(n),
+                .float => |n| n,
+                else => return error.Malformed,
+            };
+
+            const gop = try self.glyphs.getOrPut(self.alloc, cp_int);
+            if (gop.found_existing) continue;
+            errdefer _ = self.glyphs.remove(cp_int);
+
+            // The cell, in sheet pixels. UVs are normalized.
+            const px0: u32 = @intFromFloat(@round(f[0] * @as(f64, @floatFromInt(sheet_w))));
+            const py0: u32 = @intFromFloat(@round(f[1] * @as(f64, @floatFromInt(sheet_h))));
+            const px1: u32 = @intFromFloat(@round(f[2] * @as(f64, @floatFromInt(sheet_w))));
+            const py1: u32 = @intFromFloat(@round(f[3] * @as(f64, @floatFromInt(sheet_h))));
+            const degenerate = px1 <= px0 or py1 <= py0 or px1 > sheet_w or py1 > sheet_h;
+            const cw = if (degenerate) 0 else px1 - px0;
+            const chh = if (degenerate) 0 else py1 - py0;
+
+            // A glyph with no ink -- the space, above all -- still carries an
+            // advance, and dropping it runs every word into the next.
+            if (degenerate or cw <= 2 * buffer_px or chh <= 2 * buffer_px) {
+                gop.value_ptr.* = try self.pack(.{
+                    .id = cp_int,
+                    .bitmap = &.{},
+                    .width = 0,
+                    .height = 0,
+                    .left = 0,
+                    .top = 0,
+                    .advance = @intFromFloat(@max(0, @round(f[8] * em_px))),
+                });
+                added += 1;
+                continue;
+            }
+            const cell = try a.alloc(u8, @as(usize, cw) * chh);
+            for (0..chh) |row| {
+                for (0..cw) |col| {
+                    const si = ((@as(usize, py0) + row) * sheet_w + @as(usize, px0) + col) * 4;
+                    // Rebase the field onto OUR edge. A distance field only
+                    // means anything against the threshold it was made for:
+                    // ours is at 191/255 (fontnik's 0.75), while a sheet
+                    // baked at the usual 0.5 puts its edge at 128 and never
+                    // reaches 191 at all -- every glyph tests as outside and
+                    // the text is invisible while the atlas looks perfectly
+                    // healthy. Shift the edge and widen the ramp to match.
+                    const v: f32 = @floatFromInt(rgba[si]); // red is the field
+                    const rebased = 191.0 + (v - 128.0) * 1.5;
+                    cell[row * cw + col] = @intFromFloat(std.math.clamp(rebased, 0, 255));
+                }
+            }
+
+            gop.value_ptr.* = try self.pack(.{
+                .id = cp_int,
+                .bitmap = cell,
+                .width = cw - 2 * buffer_px,
+                .height = chh - 2 * buffer_px,
+                // EM units to pixels. off_y is measured downward from the
+                // baseline; `top` is y-up, hence the negation.
+                .left = @intFromFloat(@round(f[4] * em_px)),
+                .top = @intFromFloat(@round(-f[5] * em_px)),
+                .advance = @intFromFloat(@max(0, @round(f[8] * em_px))),
+            });
+            added += 1;
+        }
+        if (added > 0) self.generation +%= 1;
+        return added;
+    }
+
     /// Resolve a codepoint. UVs are computed against the current atlas
     /// dimensions, so they stay valid across growth.
     pub fn get(self: *const GlyphAtlas, cp: u21) ?GlyphMetrics {
