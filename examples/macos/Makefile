@@ -15,12 +15,17 @@ ZIG        ?= zig
 OPT        ?= ReleaseFast
 # WebP tiles (elevation sources commonly serve them) need libwebp.
 WEBP       ?= true
+# libpng decodes about 1.6x faster than the built-in reader on a real tile.
+LIBPNG     ?= true
 
 CFLAGS  := -O2 -fobjc-arc -I$(CHARTTABLE)/include
 LDFLAGS := -framework Cocoa -framework Metal -framework QuartzCore \
            -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 ifeq ($(WEBP),true)
 LDFLAGS += -L/opt/homebrew/lib -lwebp
+endif
+ifeq ($(LIBPNG),true)
+LDFLAGS += -L/opt/homebrew/lib -lpng
 endif
 LIBS    := $(CHARTTABLE)/zig-out/lib/libcharttable.a
 
@@ -35,7 +40,7 @@ all: chartview
 # The static library the app links. Built here so `make` in this directory
 # is the whole story.
 lib:
-	$(ZIG) build -Doptimize=$(OPT) -Dwebp=$(WEBP) --build-file $(CHARTTABLE)/build.zig
+	$(ZIG) build -Doptimize=$(OPT) -Dwebp=$(WEBP) -Dlibpng=$(LIBPNG) --build-file $(CHARTTABLE)/build.zig
 
 chartview: main.m lib
 	clang $(CFLAGS) main.m $(LIBS) $(LDFLAGS) -o $@

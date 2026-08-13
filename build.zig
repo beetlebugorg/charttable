@@ -44,8 +44,13 @@ pub fn build(b: *std.Build) void {
     // dependency would land on every embedder. Tile servers that serve WebP
     // (elevation tiles especially) need this.
     const use_webp = b.option(bool, "webp", "Decode WebP tiles with libwebp") orelse false;
-    if (use_webp) {
-        mod.linkSystemLibrary("webp", .{});
+    // libpng, likewise optional. Ours reads what tile servers send; libpng
+    // reads the shapes ours declines (interlaced, 16-bit) and is the
+    // reference for correctness.
+    const use_libpng = b.option(bool, "libpng", "Decode PNG with libpng instead of the built-in reader") orelse false;
+    if (use_webp or use_libpng) {
+        if (use_webp) mod.linkSystemLibrary("webp", .{});
+        if (use_libpng) mod.linkSystemLibrary("png", .{});
         // Homebrew's prefix is not on the default search path.
         if (target.result.os.tag == .macos) {
             mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -55,6 +60,7 @@ pub fn build(b: *std.Build) void {
 
     const ct_opts = b.addOptions();
     ct_opts.addOption(bool, "webp", use_webp);
+    ct_opts.addOption(bool, "libpng", use_libpng);
     ct_opts.addOption([]const u8, "spec_fixture_dir", b.pathFromRoot("test/spec/expression"));
     ct_opts.addOption([]const u8, "report_path", b.pathFromRoot("test/spec/conformance-failures.txt"));
     ct_opts.addOption([]const u8, "assets_dir", b.pathFromRoot("test/assets"));

@@ -32,6 +32,7 @@ const mlt = @import("mlt.zig");
 const pmtiles = @import("pmtiles.zig");
 const png = @import("../util/png.zig");
 const webp = @import("../util/webp.zig");
+const libpng = @import("../util/libpng.zig");
 const Lock = @import("../util/lock.zig").Lock;
 const sleepMs = @import("../util/lock.zig").sleepMs;
 
@@ -749,6 +750,12 @@ pub const Cache = struct {
                 const wi = webp.decode(a, got.bytes) catch
                     return .{ .key = k, .state = .failed };
                 break :blk .{ .w = wi.w, .h = wi.h, .rgba = wi.rgba };
+            } else if (libpng.have) blk: {
+                // Measured about 1.6x our own reader on a real palette tile,
+                // and it reads the shapes ours declines.
+                const pi = libpng.decode(a, got.bytes) catch
+                    return .{ .key = k, .state = .failed };
+                break :blk .{ .w = pi.w, .h = pi.h, .rgba = pi.rgba };
             } else png.read(a, got.bytes) catch return .{ .key = k, .state = .failed };
             keep = true;
             return .{
