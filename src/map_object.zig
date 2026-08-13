@@ -508,6 +508,7 @@ pub const Map = struct {
                 .raster => |r| {
                     p.kind = .raster;
                     p.maxzoom = @intFromFloat(std.math.clamp(r.maxzoom, 0, 22));
+                    p.tile_size = @intFromFloat(std.math.clamp(r.tile_size, 64, 4096));
                 },
             };
         }
@@ -1078,8 +1079,10 @@ pub const Map = struct {
         const cy = self.cam.center.y;
 
         for (self.cache.sources.items, 0..) |src, si| {
+            // A 256-px source is sampled a level deeper so its pixels land
+            // at the same density as a 512-px one (see Source.tile_size).
             const tz: u8 = @intCast(std.math.clamp(
-                @as(i64, @intFromFloat(@round(zoom))),
+                @as(i64, @intFromFloat(@round(zoom))) + src.zoomOffset(),
                 @as(i64, src.minzoom),
                 @as(i64, src.maxzoom),
             ));

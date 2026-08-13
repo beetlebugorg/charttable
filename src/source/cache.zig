@@ -75,6 +75,25 @@ pub const Source = struct {
     encoding: Encoding = .mvt,
     minzoom: u8 = 0,
     maxzoom: u8 = 22,
+    /// Pixels per tile, as the style's `tileSize` declares.
+    ///
+    /// charttable's world is 512 px per tile, so a 256-px source covers the
+    /// same ground in half the pixels and has to be sampled one zoom level
+    /// deeper to look the same. Ignoring this draws those tiles at half
+    /// resolution -- visibly soft, and worse the further out you go.
+    tile_size: u32 = 512,
+
+    /// How many zoom levels deeper than the build zoom this source is
+    /// sampled: 1 for a 256-px source, 0 for 512.
+    pub fn zoomOffset(self: Source) i32 {
+        return switch (self.tile_size) {
+            0, 512 => 0,
+            256 => 1,
+            128 => 2,
+            1024 => -1,
+            else => 0,
+        };
+    }
 };
 
 /// A decoded raster tile: RGBA8, w*h*4, owned by the slot's arena and valid

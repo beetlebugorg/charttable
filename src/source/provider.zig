@@ -44,6 +44,8 @@ pub const Provider = struct {
     kind: caches.Kind = .vector,
     minzoom: u8 = 0,
     maxzoom: u8 = 22,
+    /// The style's `tileSize`; see caches.Source.tile_size.
+    tile_size: u32 = 512,
 
     mu: Lock = .{},
     next_id: u64 = 1,
@@ -91,6 +93,7 @@ pub const Provider = struct {
             .encoding = self.encoding,
             .minzoom = self.minzoom,
             .maxzoom = self.maxzoom,
+            .tile_size = self.tile_size,
         };
     }
 
