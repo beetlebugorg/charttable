@@ -766,19 +766,18 @@ pub const Map = struct {
     /// The zoom a scene is built for: QUANTIZED, and clamped to the deepest
     /// zoom any bound source serves.
     ///
-    /// The eased TARGET while the camera animates, not where it is now. A
-    /// build takes longer than a quantum of a real gesture and only one runs
-    /// at a time, so building for the current zoom lets the camera outrun
-    /// every build and each one lands stale: the chart holds one layout the
-    /// whole way and snaps when the gesture stops. Labels collide at the zoom
-    /// they were laid out for, so they pile up as the view shrinks and only
-    /// declutter at the end, and tiles arrive for a zoom already left behind.
+    /// While the camera eases OUTWARD this is the target, not where the camera
+    /// is now. A build takes longer than a quantum of a real gesture and only
+    /// one runs at a time, so building for the current zoom lets the camera
+    /// outrun every build and each one lands stale: the chart holds one layout
+    /// the whole way and snaps when the gesture stops. Labels collide at the
+    /// zoom they were laid out for, so they pile up as the view grows and only
+    /// declutter at the end.
     ///
-    /// Leading costs no coverage. `visibleTiles` takes only the tile LEVEL
-    /// from here; the ground extent comes from the camera's own rect, so a
-    /// scene built for the destination still spans what is on screen now. It
-    /// does cost tiles on the way IN, where a level of lead is four times as
-    /// many over the current wider extent, bounded by MAX_TILES.
+    /// Only outward, because `buildExtents` derives the ground extent from
+    /// this. Outward the destination extent contains what is on screen, so the
+    /// scene is safe to show at any point in the ease. Inward it is contained
+    /// BY it, and showing it early leaves the margins blank.
     ///
     /// Quantized because it is the rebuild trigger AND the bucket key. A
     /// continuously varying build zoom invalidates every cached tile on
@@ -797,7 +796,18 @@ pub const Map = struct {
         for (self.cache.sources.items) |s| maxz = @max(maxz, @as(f64, @floatFromInt(s.maxzoom)));
         if (self.cache.sources.items.len == 0) maxz = 24;
         const q = self.opts.zoom_quantum;
-        const lead = if (self.cam.animating()) self.cam.target_zoom else self.cam.zoom;
+        // Lead the eased target only OUTWARD. `buildExtents` derives the
+        // ground extent from this zoom, so a lead outward builds a WIDER
+        // extent -- a superset of what is on screen, which is safe to show at
+        // any point in the ease and is what stops the blank edges as the view
+        // grows past its coverage.
+        //
+        // Inward, the destination extent is a SUBSET: showing it while the
+        // camera is still wide leaves the margins empty. So the build tracks
+        // the camera in, one quantum at a time, and the picture sharpens as it
+        // goes rather than arriving all at once at the end.
+        const target = self.cam.target_zoom;
+        const lead = if (self.cam.animating() and target < self.cam.zoom) target else self.cam.zoom;
         const quantized = @round(lead / q) * q;
         return @min(quantized, maxz);
     }
