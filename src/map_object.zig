@@ -640,28 +640,18 @@ pub const Map = struct {
             return tick;
         }
 
-        // Never trade a scene that covers the screen for one that covers
-        // less of it. Crossing a zoom level makes every tile a miss at once,
-        // and the replacements arrive over the following frames -- so
-        // rebuilding the moment the level changes swaps a whole chart for
-        // whichever two tiles happened to be back, which is what "it blanks
-        // out on zoom" is. The old scene still projects correctly at the new
-        // camera; keep drawing it until the new set can stand in for it.
+        // Build only when the whole tile set is in hand.
         //
-        // Guarded on tiles still being in flight, so a view that genuinely
-        // has less to draw (open water, a failed tile) is never held back.
+        // Rebuilding through a gesture is what keeps the chart sharp, but
+        // the tiles for a new level arrive over many frames, and adopting a
+        // scene at each arrival shows the chart assembling itself: a few
+        // tiles, then more, then more. That is the flicker. Waiting for a
+        // complete set means one swap per level instead of a dozen, and the
+        // scene already on screen keeps projecting correctly meanwhile.
         //
-        // Zooming OUT cannot use the same test: the view grows past the
-        // built box, coverage stops holding, and blank edges are then
-        // honest. But an EMPTY scene never is, in either direction, so long
-        // as tiles are still coming.
-        if (self.built != null and self.pendingWanted() > 0) {
-            const worse = if (self.coverageHolds())
-                have.items.len < self.resident.items.len
-            else
-                have.items.len == 0;
-            if (worse) return tick;
-        }
+        // A tile that came back empty or failed is ANSWERED and is not
+        // pending, so a view over open water is never held back.
+        if (self.built != null and self.pendingWanted() > 0) return tick;
 
         // &self.style.?, NOT &style: the local is a COPY of the optional's
         // payload living on update's stack, and a worker outlives the frame
