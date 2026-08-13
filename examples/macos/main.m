@@ -572,7 +572,14 @@ int main(int argc, const char *argv[]) {
         NSString *chart = argc > 1 ? @(argv[1])
                                    : [home stringByAppendingPathComponent:
                                               @"Charts/ENC_ROOT/US5MD1MC/US5MD1MC.pmtiles"];
+        // argv[2] or CHARTTABLE_STYLE: any MapLibre style JSON, used
+        // VERBATIM. No mariner surgery, no tile57 style build, no S-52
+        // assumptions -- the point is to test charttable against an ordinary
+        // style, so nothing here may quietly rewrite it. Sources are bound
+        // under the names the style itself declares.
         NSString *stylePath = argc > 2 ? @(argv[2]) : nil;
+        if (!stylePath && getenv("CHARTTABLE_STYLE")) stylePath = @(getenv("CHARTTABLE_STYLE"));
+        const BOOL customStyle = stylePath != nil;
 
         charttable_options opts = { .workers = 4 };
         charttable *map = charttable_open(&opts);
@@ -614,7 +621,10 @@ int main(int argc, const char *argv[]) {
         {
             BOOL d = NO;
             [NSFileManager.defaultManager fileExistsAtPath:chart isDirectory:&d];
-            composing = d;
+            // A supplied style is not the chart schema, so the compositor --
+            // which serves S-52 layers as MLT -- has nothing it can say to
+            // it. Read the archives directly instead.
+            composing = d && !customStyle;
         }
 #endif
 
@@ -632,6 +642,7 @@ int main(int argc, const char *argv[]) {
 
         NSData *style = nil;
         BOOL builtStyle = NO;
+        if (customStyle) NSLog(@"style: %@ (used verbatim)", stylePath);
 #ifdef USE_TILE57_COMPOSE
         if (composing) {
             // The mariner settings this session runs with, straight into the
@@ -680,7 +691,7 @@ int main(int argc, const char *argv[]) {
             .safety = 7,
             .deep = 12,
         };
-        if (!builtStyle) style = applyMariner(style, mariner);
+        if (!builtStyle && !customStyle) style = applyMariner(style, mariner);
         // Whichever path built it, the source must declare what the tiles
         // ARE. The compositor serves raw MLT; a vector source that omits
         // `encoding` means MVT, and every tile fails to decode -- a clean
@@ -735,6 +746,33 @@ int main(int argc, const char *argv[]) {
                     if ([ls[i] length]) NSLog(@"   %@", ls[i]);
             }
         }
+        // Which source names to bind the archives under. A chart style calls
+        // it "chart"; an arbitrary MapLibre style calls it whatever it likes,
+        // and a source charttable never binds is simply a layer that draws
+        // nothing -- silently. So take the names from the style.
+        NSMutableArray<NSString *> *srcNames = [NSMutableArray array];
+        if (customStyle) {
+            NSDictionary *sj = [NSJSONSerialization JSONObjectWithData:style options:0 error:nil];
+            [sj[@"sources"] enumerateKeysAndObjectsUsingBlock:^(NSString *name, NSDictionary *src, BOOL *stop) {
+                NSString *type = src[@"type"];
+                if ([type isEqualToString:@"vector"]) [srcNames addObject:name];
+                else NSLog(@"source '%@' is type '%@' -- not bound (no fetching here)", name, type);
+            }];
+            if (srcNames.count == 0) { NSLog(@"style declares no vector source"); return 1; }
+            if (srcNames.count > 1)
+                NSLog(@"style declares %lu vector sources; binding the chart to each",
+                      (unsigned long)srcNames.count);
+            NSLog(@"binding archives to source(s): %@", [srcNames componentsJoinedByString:@", "]);
+            if (sj[@"sprite"] && !haveSprite)
+                NSLog(@"style asks for sprite %@ -- charttable does not fetch; "
+                      @"set CHARTTABLE_SPRITE_DIR or icons will be missing", sj[@"sprite"]);
+            if (sj[@"glyphs"] && !glyphDir)
+                NSLog(@"style asks for glyphs %@ -- set CHARTTABLE_GLYPHS_DIR or text "
+                      @"will be missing", sj[@"glyphs"]);
+        } else {
+            [srcNames addObject:@"chart"];
+        }
+
 #ifdef USE_TILE57_COMPOSE
         // QUILTING. charttable's own multi-archive source picks a cell per
         // tile by bounds and compilation scale, which is a heuristic and
@@ -779,15 +817,21 @@ int main(int argc, const char *argv[]) {
             for (NSString *rel in walk) {
                 if (![rel.pathExtension isEqualToString:@"pmtiles"]) continue;
                 NSString *full = [chart stringByAppendingPathComponent:rel];
-                if (charttable_add_source_pmtiles(map, "chart", full.UTF8String) == CHARTTABLE_OK)
-                    opened++;
-                else
-                    failed++;
+                BOOL ok = YES;
+                for (NSString *nm in srcNames)
+                    ok = ok && charttable_add_source_pmtiles(map, nm.UTF8String,
+                                                             full.UTF8String) == CHARTTABLE_OK;
+                if (ok) opened++; else failed++;
             }
             NSLog(@"library: %d archives opened from %@ (%d failed)", opened, chart, failed);
             if (opened == 0) { NSLog(@"no .pmtiles under %@", chart); return 1; }
-        } else if (charttable_add_source_pmtiles(map, "chart", chart.UTF8String) != CHARTTABLE_OK) {
-            NSLog(@"cannot open chart %@", chart); return 1;
+        } else {
+            for (NSString *nm in srcNames) {
+                if (charttable_add_source_pmtiles(map, nm.UTF8String,
+                                                  chart.UTF8String) != CHARTTABLE_OK) {
+                    NSLog(@"cannot open chart %@ as source '%@'", chart, nm); return 1;
+                }
+            }
         }
     sources_done:;
 
