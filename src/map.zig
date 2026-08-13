@@ -1179,7 +1179,22 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
         try quad_paint.appendSlice(arena, b.quad_paint);
         try indices.ensureUnusedCapacity(arena, b.indices.len);
         for (b.indices) |ix| indices.appendAssumeCapacity(ix + vbase);
-        try patterns.appendSlice(arena, b.patterns);
+        // The cell's PIXELS are copied, not borrowed. A part's pattern
+        // cells live in that tile's bucket arena, and a bucket is freed the
+        // moment its geometry goes stale -- while the scene built from it
+        // may still be the one on screen, waiting for its replacement to be
+        // complete. Borrowing here is a use-after-free the GPU finds first,
+        // inside replaceRegion, which is a crash with no Zig frame in it.
+        // Cells are a few KB at most; copying them is not worth being clever
+        // about.
+        try patterns.ensureUnusedCapacity(arena, b.patterns.len);
+        for (b.patterns) |cell| {
+            patterns.appendAssumeCapacity(.{
+                .w = cell.w,
+                .h = cell.h,
+                .rgba = try arena.dupe(u8, cell.rgba),
+            });
+        }
 
         try ranges.ensureUnusedCapacity(arena, b.ranges.len);
         for (b.ranges) |r| {
