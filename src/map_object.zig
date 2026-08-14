@@ -38,6 +38,7 @@ const providers = @import("source/provider.zig");
 const coord = @import("source/coord.zig");
 const cameras = @import("camera.zig");
 const types = @import("scene/types.zig");
+const clock = @import("util/clock.zig");
 const gpu = @import("gpu/gpu.zig");
 
 pub const Built = map.Built;
@@ -100,6 +101,21 @@ pub const Tick = struct {
     pending: usize = 0,
     /// Stream B was refilled for a zoom-only paint change (no re-layout).
     paint_refilled: bool = false,
+
+    // Where this tick's time went, µs. A host frame profiler reads these to
+    // tell a build landing from a paint refill from cache adoption — the
+    // three costs that share one "update" span from the outside.
+    /// Adopting a finished build (join, adopt, bucket eviction).
+    finish_us: i64 = 0,
+    /// Adopting decoded tiles and evicting over budget (cache.tick).
+    cache_us: i64 = 0,
+    /// Choosing and holding the wanted set, and counting what is resident.
+    want_us: i64 = 0,
+    /// Refilling stream B for a zoom-only paint change.
+    refill_us: i64 = 0,
+    /// Starting a build (staging its inputs; the build itself is off-thread,
+    /// so anything large here is the inline no-thread fallback).
+    start_us: i64 = 0,
 };
 
 /// One tile's cached geometry: everything the tile contributes to a scene
@@ -117,7 +133,7 @@ const Bucket = struct {
 /// actually matters during load — a tile lands, `update` rebuilds, and the
 /// camera has not moved, so a host that draws on damage never draws the new
 /// scene and the map stops half-loaded.
-const DrawnView = struct {
+pub const DrawnView = struct {
     center: cameras.Vec2,
     zoom: f64,
     rotation: f64,
@@ -580,12 +596,16 @@ pub const Map = struct {
         // which the worker never touches.
         if (self.building) {
             if (!self.build_done.load(.acquire)) return tick;
+            const t0 = clock.ticksUs();
             try self.finishBuild();
+            tick.finish_us = clock.ticksUs() - t0;
             tick.rebuilt = true;
             return tick;
         }
 
+        var t = clock.ticksUs();
         tick.tiles_landed = self.cache.tick();
+        tick.cache_us = clock.ticksUs() - t;
 
         // A style with no bound source still builds: its background layer is
         // a real scene, and a map that never builds never reports idle.
@@ -594,6 +614,7 @@ pub const Map = struct {
         // The tile set is re-chosen only when the view has left the built
         // coverage (or something forced a rebuild). Inside coverage the set
         // is frozen, which is what makes a pan cost nothing.
+        t = clock.ticksUs();
         const coverage_broke = self.dirty or self.needsRebuild();
         if (coverage_broke) {
             self.wanted.clearRetainingCapacity();
@@ -639,12 +660,15 @@ pub const Map = struct {
         for (self.wanted.items) |k| {
             if (self.cache.isResident(@bitCast(k))) try have.append(self.gpa, k);
         }
+        tick.want_us = clock.ticksUs() - t;
 
         // A partial scene rebuilds even when nothing else changed -- that is
         // the budget's next batch -- but against the SAME wanted set, which
         // `coverage_broke` being false leaves untouched.
         if (!coverage_broke and !self.partial and self.sameResident(have.items)) {
+            t = clock.ticksUs();
             tick.paint_refilled = self.refillPaintIfMoved(&style);
+            tick.refill_us = clock.ticksUs() - t;
             return tick;
         }
 
@@ -664,7 +688,9 @@ pub const Map = struct {
         // &self.style.?, NOT &style: the local is a COPY of the optional's
         // payload living on update's stack, and a worker outlives the frame
         // that started it.
+        t = clock.ticksUs();
         try self.startBuild(&self.style.?, have.items);
+        tick.start_us = clock.ticksUs() - t;
         tick.rebuilt = !self.building; // an inline fallback build is already done
         return tick;
     }
@@ -878,6 +904,21 @@ pub const Map = struct {
     /// next `needsRedraw` can tell a moved camera from a still one.
     pub fn markDrawn(self: *Map) void {
         self.drawn = DrawnView.of(self);
+    }
+
+    /// What the frame ABOUT to present depends on. A host that presents
+    /// without its own lock held captures this while it still holds the lock
+    /// and hands it back to `markDrawnAs` after the present — so a camera
+    /// move landing mid-present still reads as stale, instead of being
+    /// stamped "drawn" by a frame that never showed it.
+    pub fn drawnView(self: *const Map) DrawnView {
+        return DrawnView.of(self);
+    }
+
+    /// `markDrawn`, for the view captured at prepare time rather than the
+    /// state now. See `drawnView`.
+    pub fn markDrawnAs(self: *Map, v: DrawnView) void {
+        self.drawn = v;
     }
 
     /// The zoom band the camera may move in. A chart library has a natural
@@ -2153,7 +2194,6 @@ test "Map: the cost of a zoom sweep" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const pmtiles = @import("source/pmtiles.zig");
     const ct_build = @import("ct_build");
-    const clock = @import("util/clock.zig");
     const io = std.Io.Threaded.global_single_threaded.io();
     const gpa = testing.allocator;
 
@@ -2241,7 +2281,6 @@ test "Map: rebuild phase profile" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const pmtiles = @import("source/pmtiles.zig");
     const ct_build = @import("ct_build");
-    const clock = @import("util/clock.zig");
     const io = std.Io.Threaded.global_single_threaded.io();
     const gpa = testing.allocator;
 
