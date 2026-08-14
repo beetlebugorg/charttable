@@ -22,12 +22,12 @@
 //! concatenated with the cached geometry (DESIGN.md: "lay out per tile but
 //! PLACE globally").
 //!
-//! Still on the owner thread: the build does not yet run on a worker with a
-//! pointer-swap adopt, so a coverage break costs a frame. Per-tile caching
-//! shrinks that cost; it does not remove it.
-//!
-//! THREADING. Everything here runs on the owner thread. The only work that
-//! leaves it is tile fetch + decode, inside source/cache.zig.
+//! THREADING. The owner thread drives everything through update(). Two kinds
+//! of work leave it: tile fetch + decode (source/cache.zig), and the scene
+//! build (startBuild / buildWorker), which writes the spare arena. With a
+//! staging Gpu registered (setStagingGpu) the build worker also copies its
+//! result into GPU buffers, so uploadIfChanged lands a finished build with a
+//! pointer swap instead of an upload.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -275,6 +275,16 @@ pub const Map = struct {
     build_in: BuildInputs = .{ .origin = .{ .x = 0, .y = 0 }, .zoom = 0, .budget = 0, .blank = true },
     staged: Staged = .{},
 
+    /// The Gpu the build worker stages GPU scenes against (setStagingGpu).
+    /// Read by the worker for the length of a build. Only mutated with no
+    /// build in flight, so the worker's read cannot race.
+    staging_gpu: ?*gpu.Gpu = null,
+    /// A GPU scene the worker made for the CURRENT built scene, waiting for
+    /// uploadIfChanged to adopt it. Always made against `staging_gpu`, and
+    /// owned here until taken or superseded.
+    pending_scene: ?gpu.Gpu.Scene = null,
+    pending_scene_gen: u64 = 0,
+
     /// Compiled property programs, shared by every build. Reset lazily when
     /// the style generation moves rather than at each mutation site, so no
     /// future setter can forget to invalidate it.
@@ -324,6 +334,9 @@ pub const Map = struct {
 
     pub fn deinit(self: *Map) void {
         self.waitForBuild();
+        // waitForBuild may have staged one more scene. The staging Gpu must
+        // still be alive here (see setStagingGpu).
+        self.clearPendingScene();
         self.build_have.deinit(self.gpa);
         self.ahead.deinit(self.gpa);
         self.progs.deinit(self.gpa);
@@ -1026,6 +1039,43 @@ pub const Map = struct {
         paint: u64 = 0,
     };
 
+    /// Register the Gpu the build worker stages GPU scenes against. With one
+    /// registered, a finished build lands in uploadIfChanged as adoptScene, a
+    /// pointer swap, instead of uploadScene copying every buffer inside the
+    /// frame. Owner thread.
+    ///
+    /// Pass null BEFORE destroying the device: it joins any build in flight
+    /// (the worker may be inside makeScene on that device) and frees the
+    /// staged scene made against it. The same contract holds at deinit: the
+    /// staging Gpu must outlive the Map, or be unregistered first.
+    pub fn setStagingGpu(self: *Map, g: ?*gpu.Gpu) void {
+        if (self.staging_gpu == g) return;
+        self.waitForBuild();
+        self.clearPendingScene();
+        self.staging_gpu = g;
+    }
+
+    fn clearPendingScene(self: *Map) void {
+        if (self.pending_scene) |*sc| {
+            if (self.staging_gpu) |g| g.freeStagedScene(sc);
+            self.pending_scene = null;
+        }
+    }
+
+    /// The staged GPU scene for the live built scene, if the worker made one
+    /// against THIS Gpu. Taking it transfers ownership to the caller.
+    fn takePendingScene(self: *Map, g: *gpu.Gpu) ?gpu.Gpu.Scene {
+        if (self.staging_gpu != g) return null;
+        const sc = self.pending_scene orelse return null;
+        if (self.pending_scene_gen != self.scene_generation) {
+            // Stale: the scene no longer matches the generation on screen.
+            self.clearPendingScene();
+            return null;
+        }
+        self.pending_scene = null;
+        return sc;
+    }
+
     /// Bring `g` up to date with the current scene and report whether
     /// anything was sent. Split from drawing so a host can upload on a
     /// worker-fed frame boundary and draw whenever it likes.
@@ -1044,7 +1094,11 @@ pub const Map = struct {
             return true;
         }
         g.clear = .{ .r = b.background.r, .g = b.background.g, .b = b.background.b, .a = b.background.a };
-        try g.uploadScene(self.gpa, .{
+        if (self.takePendingScene(g)) |sc| {
+            // The worker already copied this scene into GPU buffers; landing
+            // it is a swap.
+            g.adoptScene(sc);
+        } else try g.uploadScene(self.gpa, .{
             .vertices = b.vertices,
             .paint = b.paint,
             .paint_hi = b.paint_hi,
@@ -1231,7 +1285,28 @@ pub const Map = struct {
     fn buildWorker(self: *Map) void {
         self.staged = self.buildStaged(self.build_style.?, self.build_have.items, self.build_in) catch
             Staged{ .failed = true };
+        self.stageGpuScene();
         self.build_done.store(true, .release);
+    }
+
+    /// Copy the staged build into GPU buffers, still on the worker; the gpu
+    /// backends allow resource creation from any thread (makeScene). Failure
+    /// is not an error: the staged scene is an optimization, and
+    /// uploadIfChanged falls back to uploadScene without one.
+    fn stageGpuScene(self: *Map) void {
+        const g = self.staging_gpu orelse return;
+        if (self.staged.held or self.staged.failed) return;
+        const b = if (self.staged.built) |*bb| bb else return;
+        self.staged.gpu_scene = g.makeScene(self.gpa, .{
+            .vertices = b.vertices,
+            .paint = b.paint,
+            .paint_hi = b.paint_hi,
+            .indices = b.indices,
+            .quads = b.quads,
+            .quad_paint = b.quad_paint,
+            .ranges = b.ranges,
+            .patterns = b.patterns,
+        }) catch null;
     }
 
     /// Adopt a finished build. Owner thread.
@@ -1273,6 +1348,9 @@ pub const Map = struct {
     /// off-thread at all.
     const Staged = struct {
         built: ?Built = null,
+        /// `built` copied into GPU buffers by the worker (stageGpuScene),
+        /// when a staging Gpu is registered and the copy succeeded.
+        gpu_scene: ?gpu.Gpu.Scene = null,
         arena: usize = 0,
         scene_tiles: usize = 0,
         partial: bool = false,
@@ -1447,6 +1525,10 @@ pub const Map = struct {
     /// Put a staged scene on screen. Owner thread only: everything here is
     /// read by drawing.
     fn adopt(self: *Map, st: Staged, have: []const u64) !void {
+        errdefer if (st.gpu_scene) |sc| {
+            var s = sc;
+            if (self.staging_gpu) |g| g.freeStagedScene(&s);
+        };
         self.dirty = false;
         if (st.held) {
             self.partial = true;
@@ -1474,6 +1556,13 @@ pub const Map = struct {
         try self.resident.appendSlice(self.gpa, have);
         self.evictBuckets(self.wanted.items);
         self.recordCoverage(st.origin, st.zoom);
+        // Pair the staged GPU copy with the generation it is for, freeing
+        // any unclaimed predecessor.
+        self.clearPendingScene();
+        if (st.gpu_scene) |sc| {
+            self.pending_scene = sc;
+            self.pending_scene_gen = self.scene_generation;
+        }
     }
 
     /// Record what the scene just built actually covers, so needsRebuild can
@@ -1697,6 +1786,82 @@ test "Map: a style swap rebuilds without refetching tiles" {
     try testing.expectApproxEqAbs(@as(f32, 1), m.scene().?.background.r, 1e-3);
     // Decoded tiles do not depend on the style, so nothing was re-fetched.
     try testing.expectEqual(fetched, stub.asked.load(.monotonic));
+}
+
+test "Map: a staging Gpu turns the scene landing into a pointer swap" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos and builtin.os.tag != .ios) return error.SkipZigTest;
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var g = gpu.Gpu.init(.{ .width = 512, .height = 512 }) catch return error.SkipZigTest;
+    defer g.deinit();
+    var plain = gpu.Gpu.init(.{ .width = 512, .height = 512 }) catch return error.SkipZigTest;
+    defer plain.deinit();
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setStagingGpu(&g);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    // The worker staged the GPU copy of the scene it built.
+    try testing.expect(m.pending_scene != null);
+    try testing.expectEqual(m.scene_generation, m.pending_scene_gen);
+
+    // The landing takes it, and a second call has nothing left to do.
+    var st: Map.Uploaded = .{};
+    try testing.expect(try m.uploadIfChanged(&g, &st));
+    try testing.expect(m.pending_scene == null);
+    try testing.expect(!try m.uploadIfChanged(&g, &st));
+
+    // A Gpu the scene was NOT staged for still gets the plain upload, and
+    // the two draw the same picture.
+    var st2: Map.Uploaded = .{};
+    try testing.expect(try m.uploadIfChanged(&plain, &st2));
+    const swapped = try g.renderOffscreen(a, m.uniforms());
+    defer a.free(swapped);
+    const uploaded = try plain.renderOffscreen(a, m.uniforms());
+    defer a.free(uploaded);
+    try testing.expectEqualSlices(u8, uploaded, swapped);
+}
+
+test "Map: a superseding build replaces the staged scene; unregistering frees it" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .macos and builtin.os.tag != .ios) return error.SkipZigTest;
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var g = gpu.Gpu.init(.{ .width = 512, .height = 512 }) catch return error.SkipZigTest;
+    defer g.deinit();
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", stub.source(14));
+    m.setViewport(512, 512);
+    m.setStagingGpu(&g);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+    try testing.expect(m.pending_scene != null);
+
+    // Never claimed. The next build's adopt frees it and stages its own.
+    m.cam.panPx(700, 0);
+    try settle(&m);
+    try testing.expect(m.pending_scene != null);
+    try testing.expectEqual(m.scene_generation, m.pending_scene_gen);
+
+    // Unregistering (what a host does before destroying the device) leaves
+    // nothing staged against it.
+    m.setStagingGpu(null);
+    try testing.expect(m.pending_scene == null);
 }
 
 // The acceptance run: a real archive behind a real Map, panned across
