@@ -73,6 +73,11 @@ pub const Sprite = struct {
     pen_x: u32 = 0,
     pen_y: u32 = 0,
     row_h: u32 = 0,
+    /// The band of rows addImage has touched since the host last uploaded —
+    /// see dirtyRows. y0 >= y1 means clean. Uploading only this band is what
+    /// keeps a missing-symbol batch from re-sending the whole sheet.
+    dirty_y0: u32 = 0,
+    dirty_y1: u32 = 0,
 
     /// Parse the sprite index JSON + sheet PNG. The sheet becomes the atlas
     /// verbatim. Entry names are copied; `index_json` and `sheet_png` may be
@@ -198,8 +203,34 @@ pub const Sprite = struct {
         self.pen_x += w + pad;
         self.row_h = @max(self.row_h, h);
         self.generation +%= 1;
+        self.touchRows(y, y + h);
 
         try self.putEntry(name, .{ .x = x, .y = y, .w = w, .h = h, .pixel_ratio = pixel_ratio });
+    }
+
+    fn touchRows(self: *Sprite, y0: u32, y1: u32) void {
+        if (self.dirty_y1 <= self.dirty_y0) {
+            self.dirty_y0 = y0;
+            self.dirty_y1 = y1;
+        } else {
+            self.dirty_y0 = @min(self.dirty_y0, y0);
+            self.dirty_y1 = @max(self.dirty_y1, y1);
+        }
+    }
+
+    /// The rows a host must re-upload, [y0, y1), or null when the resident
+    /// texture is already current. The band can span rows that also hold
+    /// OLDER cells (shelf packing places a new cell beside them), whose bytes
+    /// are unchanged — so re-sending the band never alters what an in-flight
+    /// frame samples. Call clearDirty once the upload has happened.
+    pub fn dirtyRows(self: *const Sprite) ?[2]u32 {
+        if (self.dirty_y1 <= self.dirty_y0) return null;
+        return .{ self.dirty_y0, self.dirty_y1 };
+    }
+
+    pub fn clearDirty(self: *Sprite) void {
+        self.dirty_y0 = 0;
+        self.dirty_y1 = 0;
     }
 
     /// Drop an image name. The cell's pixels are NOT reclaimed (documented
@@ -229,6 +260,9 @@ pub const Sprite = struct {
         self.alloc.free(self.rgba);
         self.rgba = plane;
         self.height = new_h;
+        // A grown plane is a different texture shape: everything is dirty,
+        // whether or not the host also compares dimensions.
+        self.touchRows(0, new_h);
     }
 };
 

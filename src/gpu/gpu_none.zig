@@ -76,6 +76,15 @@ pub const Gpu = struct {
     pub const uploadGlyphAtlas = uploadSpriteAtlas;
     pub const uploadGlyphAtlasBold = uploadSpriteAtlas;
     pub const uploadGlyphAtlasItalic = uploadSpriteAtlas;
+    pub fn updateSpriteAtlasRows(self: *Gpu, rgba: []const u8, w: u32, h: u32, y0: u32, rows: u32) bool {
+        _ = self;
+        _ = rgba;
+        _ = w;
+        _ = h;
+        _ = y0;
+        _ = rows;
+        return false;
+    }
     pub fn uploadScene(self: *Gpu, alloc: std.mem.Allocator, data: SceneData) error{Unsupported}!void {
         _ = self;
         _ = alloc;

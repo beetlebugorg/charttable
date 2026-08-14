@@ -91,6 +91,10 @@ pub const Gpu = struct {
     scene: ?Scene = null,
 
     sprite_tex: ?*mc.ctm_tex = null,
+    /// The resident sprite texture's shape, so a row update can refuse a
+    /// sheet that no longer matches it.
+    sprite_w: u32 = 0,
+    sprite_h: u32 = 0,
     glyph_tex: ?*mc.ctm_tex = null,
     glyph_bold_tex: ?*mc.ctm_tex = null,
     glyph_italic_tex: ?*mc.ctm_tex = null,
@@ -228,6 +232,27 @@ pub const Gpu = struct {
     pub fn uploadSpriteAtlas(self: *Gpu, rgba: []const u8, w: u32, h: u32) !void {
         if (self.sprite_tex) |t| mc.ctm_free_texture(t);
         self.sprite_tex = try self.makeAtlasTexture(rgba, w, h);
+        self.sprite_w = w;
+        self.sprite_h = h;
+    }
+
+    /// Rewrite rows [y0, y0+rows) of the resident sprite atlas in place —
+    /// what a missing-symbol batch costs, instead of re-sending the sheet.
+    /// `rgba` is the WHOLE sheet; the band is read at its offset. False when
+    /// there is no resident texture of this exact shape (fresh device, grown
+    /// sheet, scheme swap): the caller falls back to uploadSpriteAtlas.
+    ///
+    /// In-flight frames may be sampling the texture. That is safe under the
+    /// sprite's contract (sprite.zig dirtyRows): every byte in the band an
+    /// older scene can sample is unchanged — the band only adds cells.
+    pub fn updateSpriteAtlasRows(self: *Gpu, rgba: []const u8, w: u32, h: u32, y0: u32, rows: u32) bool {
+        const t = self.sprite_tex orelse return false;
+        if (w != self.sprite_w or h != self.sprite_h) return false;
+        if (rows == 0 or y0 + rows > h) return false;
+        const off = @as(usize, y0) * w * 4;
+        const need = @as(usize, rows) * w * 4;
+        if (rgba.len < off + need) return false;
+        return mc.ctm_texture_update_rows(t, rgba.ptr + off, w, y0, rows) != 0;
     }
     pub fn uploadGlyphAtlas(self: *Gpu, rgba: []const u8, w: u32, h: u32) !void {
         if (self.glyph_tex) |t| mc.ctm_free_texture(t);

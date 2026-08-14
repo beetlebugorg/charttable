@@ -68,6 +68,11 @@ void ctm_free_buffer(ctm_buf *b);
  * geometry or rebuilding the scene. */
 int ctm_write_buffer(ctm_buf *b, const void *bytes, size_t len);
 ctm_tex *ctm_new_texture_rgba(ctm_ctx *c, const void *rgba, uint32_t w, uint32_t h);
+/* Rewrite rows [y0, y0+rows) of an existing texture in place; `rgba` points
+ * at the band's first byte, full-width rows. 0 when the shape does not match
+ * (caller falls back to a full upload). Safe against in-flight frames only
+ * under the caller's unchanged-bytes contract — see the definition. */
+int ctm_texture_update_rows(ctm_tex *t, const void *rgba, uint32_t w, uint32_t y0, uint32_t rows);
 void ctm_free_texture(ctm_tex *t);
 
 /* One frame = one render pass, cleared to `clear` (rgba 0..1). The window

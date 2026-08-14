@@ -280,6 +280,24 @@ ctm_tex *ctm_new_texture_rgba(ctm_ctx *c, const void *rgba, uint32_t w, uint32_t
     }
 }
 
+// Rewrite rows [y0, y0+rows) of an existing texture in place. `rgba` points
+// at the BAND's first byte, full-width rows. Answers 0 when the texture's
+// shape does not match, so the caller can fall back to a full upload.
+//
+// The texture may be bound by an in-flight frame. That is tolerated, not an
+// oversight: the caller's contract (sprite.zig dirtyRows) is that every byte
+// in the band that an older scene can sample is unchanged — the band only
+// ADDS cells beside them — so a racing read sees the same values either way.
+int ctm_texture_update_rows(ctm_tex *t, const void *rgba, uint32_t w, uint32_t y0, uint32_t rows) {
+    if (!t || !rgba || w == 0 || rows == 0) return 0;
+    if (w != t->tex.width || y0 + rows > t->tex.height) return 0;
+    [t->tex replaceRegion:MTLRegionMake2D(0, y0, w, rows)
+              mipmapLevel:0
+                withBytes:rgba
+              bytesPerRow:(NSUInteger)w * 4];
+    return 1;
+}
+
 void ctm_free_texture(ctm_tex *t) {
     if (!t) return;
     [t->tex release];
