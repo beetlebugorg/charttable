@@ -151,6 +151,11 @@ pub const Camera = struct {
         self.center.x = wrapX(self.center.x + wrapDx(before.x, after.x));
         self.center.y += before.y - after.y;
         self.clampY();
+        // This is the INSTANT zoom, so the target moves with it. Left behind,
+        // `animating()` is `|target_zoom - zoom| > 1e-4` forever after the
+        // first zoom, `busy()` reports it, and the map never goes idle again
+        // for the life of the session.
+        self.setTarget();
     }
 
     /// Move the centre so world point `w` sits at screen (px,py). Rotation-aware;
