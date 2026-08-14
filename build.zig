@@ -43,18 +43,28 @@ pub fn build(b: *std.Build) void {
     // PNG reader covers what tile servers usually send, and a hard
     // dependency would land on every embedder. Tile servers that serve WebP
     // (elevation tiles especially) need this.
-    const use_webp = b.option(bool, "webp", "Decode WebP tiles with libwebp") orelse false;
-    // libpng, likewise optional. Ours reads what tile servers send; libpng
+    const use_webp = b.option(bool, "webp", "Decode WebP tiles with libwebp") orelse true;
+    // libpng, likewise. Ours reads what tile servers send; libpng
     // reads the shapes ours declines (interlaced, 16-bit) and is the
     // reference for correctness.
-    const use_libpng = b.option(bool, "libpng", "Decode PNG with libpng instead of the built-in reader") orelse false;
+    const use_libpng = b.option(bool, "libpng", "Decode PNG with libpng instead of the built-in reader") orelse true;
+    // Under a sysroot the SDK's own headers are not on the search path for
+    // this module's C sources, and a framework header that includes a plain
+    // one (Security.h -> libDER/DERItem.h) stops resolving. The host build
+    // passes a sysroot on every Xcode cross build.
+    if (b.sysroot) |sr| {
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sr, "usr/include" }) });
+    }
     if (use_webp or use_libpng) {
-        if (use_webp) mod.linkSystemLibrary("webp", .{});
-        if (use_libpng) mod.linkSystemLibrary("png", .{});
-        // Homebrew's prefix is not on the default search path.
         if (target.result.os.tag == .macos) {
             mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-            mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        }
+        if (use_webp) linkCodec(b, mod, target, "webp");
+        if (use_libpng) {
+            linkCodec(b, mod, target, "png16");
+            // libpng's objects arrive with their zlib symbols undefined, so
+            // zlib has to resolve here as well as in whatever links this.
+            linkZlib(b, mod);
         }
     }
 
@@ -109,10 +119,10 @@ pub fn build(b: *std.Build) void {
         });
         exe_mod.addIncludePath(b.path("include"));
         exe_mod.linkLibrary(lib);
-        if (use_webp) exe_mod.linkSystemLibrary("webp", .{});
-        if (use_libpng) exe_mod.linkSystemLibrary("png", .{});
-        if (use_webp or use_libpng) {
-            exe_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        if (use_webp) linkCodec(b, exe_mod, target, "webp");
+        if (use_libpng) {
+            linkCodec(b, exe_mod, target, "png16");
+            linkZlib(b, exe_mod);
         }
         for ([_][]const u8{ "Cocoa", "Metal", "QuartzCore", "CoreGraphics", "ImageIO", "UniformTypeIdentifiers" }) |fw| {
             exe_mod.linkFramework(fw, .{});
@@ -126,4 +136,45 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+/// Link an image codec by ABSOLUTE PATH rather than by name.
+///
+/// `linkSystemLibrary` cannot find Homebrew under a sysroot, and every Xcode
+/// cross build passes one: zig resolves library search paths beneath the
+/// sysroot, where Homebrew is not. An object file handed over by path is not
+/// searched for at all. Adding Homebrew's directory to the search path is not
+/// the fix either, because one unopenable directory takes the whole search
+/// down and the SDK's own libz stops resolving with it.
+///
+/// The static archive is also what a shipped app needs. A dynamic link against
+/// Homebrew's dylib would require Homebrew on the user's machine.
+///
+/// Falls back to the plain system link off macOS, where Homebrew is not the
+/// source of these libraries.
+fn linkCodec(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    name: []const u8,
+) void {
+    if (target.result.os.tag != .macos) {
+        mod.linkSystemLibrary(name, .{});
+        return;
+    }
+    mod.addObjectFile(.{ .cwd_relative = b.fmt("/opt/homebrew/lib/lib{s}.a", .{name}) });
+}
+
+/// Link zlib, which libpng needs and does not carry.
+///
+/// Under a sysroot `linkSystemLibrary("z")` fails with "searched paths: none",
+/// because the search is rooted beneath the SDK and finds nothing there. Name
+/// the SDK's own stub outright instead. Without a sysroot the plain system
+/// link is correct.
+fn linkZlib(b: *std.Build, mod: *std.Build.Module) void {
+    if (b.sysroot) |sr| {
+        mod.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ sr, "usr/lib/libz.tbd" }) });
+    } else {
+        mod.linkSystemLibrary("z", .{});
+    }
 }
