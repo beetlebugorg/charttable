@@ -1,7 +1,7 @@
 //! Renderer backend selector. Every backend implements the same `Gpu` API
 //! behind this file, so the rest of the library imports `gpu` and never names
 //! a backend (ported from lookout-marine src/gpu.zig):
-//!   * Apple (macOS / iOS) -> gpu_metal.zig (direct Metal)
+//!   * Apple (macOS / iOS / visionOS) -> gpu_metal.zig (direct Metal)
 //!   * everything else     -> gpu_none.zig (stub; Vulkan / D3D12 / SDL ports
 //!                            land here per DESIGN.md's module map)
 //! lookout selects via -Dbackend build options; charttable has one real
@@ -9,10 +9,10 @@
 //! Scene/SceneData), Uniforms, Options, NativeKind, Color.
 const builtin = @import("builtin");
 
-const impl = if (builtin.os.tag == .macos or builtin.os.tag == .ios)
-    @import("gpu_metal.zig")
-else
-    @import("gpu_none.zig");
+const impl = switch (builtin.os.tag) {
+    .macos, .ios, .visionos => @import("gpu_metal.zig"),
+    else => @import("gpu_none.zig"),
+};
 
 pub const Gpu = impl.Gpu;
 pub const Uniforms = impl.Uniforms;

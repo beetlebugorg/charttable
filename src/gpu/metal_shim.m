@@ -298,6 +298,42 @@ int ctm_texture_update_rows(ctm_tex *t, const void *rgba, uint32_t w, uint32_t y
     return 1;
 }
 
+ctm_tex *ctm_new_render_target(ctm_ctx *c, uint32_t w, uint32_t h) {
+    if (!c || w == 0 || h == 0) return NULL;
+    @autoreleasepool {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:w
+                                                                                    height:h
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        // Shared: the caller may read it back, and on Apple Silicon a shared
+        // render target costs nothing.
+        d.storageMode = MTLStorageModeShared;
+        id<MTLTexture> t = [c->device newTextureWithDescriptor:d]; // +1
+        if (!t) return NULL;
+        ctm_tex *out = calloc(1, sizeof(*out));
+        out->tex = t;
+        return out;
+    }
+}
+
+void *ctm_texture_mtl(ctm_tex *t) {
+    return t ? (void *)t->tex : NULL;
+}
+
+int ctm_texture_read(ctm_tex *t, void *out_bgra) {
+    if (!t || !out_bgra) return 0;
+    @autoreleasepool {
+        id<MTLTexture> tex = t->tex;
+        if (tex.storageMode != MTLStorageModeShared) return 0;
+        [tex getBytes:out_bgra
+          bytesPerRow:tex.width * 4
+           fromRegion:MTLRegionMake2D(0, 0, tex.width, tex.height)
+          mipmapLevel:0];
+        return 1;
+    }
+}
+
 void ctm_free_texture(ctm_tex *t) {
     if (!t) return;
     [t->tex release];
@@ -444,6 +480,25 @@ ctm_frame *ctm_begin_offscreen(ctm_ctx *c, uint32_t w, uint32_t h, const float c
     }
 }
 
+ctm_frame *ctm_begin_frame_tex(ctm_ctx *c, void *mtl_texture, const float clear[4],
+                               uint32_t *w_px, uint32_t *h_px) {
+    if (w_px) *w_px = 0;
+    if (h_px) *h_px = 0;
+    if (!c || !mtl_texture) return NULL;
+    @autoreleasepool {
+        id<MTLTexture> t = (id<MTLTexture>)mtl_texture;
+        // The pipelines are built for BGRA8Unorm. A mismatched attachment
+        // raises an uncatchable Metal validation error, so refuse here.
+        if (t.pixelFormat != MTLPixelFormatBGRA8Unorm) return NULL;
+        if (!(t.usage & MTLTextureUsageRenderTarget)) return NULL;
+        uint32_t w = (uint32_t)t.width, h = (uint32_t)t.height;
+        if (w == 0 || h == 0) return NULL;
+        if (w_px) *w_px = w;
+        if (h_px) *h_px = h;
+        return begin_pass(c, t, nil, nil, w, h, clear);
+    }
+}
+
 void ctm_set_depth_mode(ctm_frame *f, int opaque) {
     if (!f) return;
     [f->enc setDepthStencilState:opaque ? f->ctx->ds_opaque : f->ctx->ds_blend];
@@ -508,6 +563,10 @@ void ctm_draw_indexed(ctm_frame *f, ctm_buf *ib, uint32_t first, uint32_t count)
 }
 
 void ctm_end_frame(ctm_frame *f) {
+    ctm_end_frame_cb(f, NULL, NULL);
+}
+
+void ctm_end_frame_cb(ctm_frame *f, void (*on_done)(void *user), void *user) {
     if (!f) return;
     @autoreleasepool {
         [f->enc endEncoding];
@@ -536,6 +595,7 @@ void ctm_end_frame(ctm_frame *f) {
             // spent on the frame — the CPU-vs-GPU-bound discriminator.
             c->last_gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
             if (gated_on_complete) ctm_inflight_return(c);
+            if (on_done) on_done(user);
         }];
         [f->cmd commit];
         [f->enc release];

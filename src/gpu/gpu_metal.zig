@@ -23,6 +23,7 @@ const mc = @import("c_metal.zig").c;
 const scene = @import("../scene/types.zig");
 const batch = @import("../scene/batch.zig");
 const png = @import("../util/png.zig");
+const lock = @import("../util/lock.zig");
 const msl_source = @embedFile("metal_msl");
 
 /// The per-draw uniform block (128 bytes). THE SCENE CONTRACT OWNS THIS
@@ -662,6 +663,38 @@ pub const Gpu = struct {
         return true;
     }
 
+    /// Render one frame into a texture the host owns and keeps, such as a
+    /// RealityKit drawable's. The texture must be BGRA8Unorm with the
+    /// render-target usage; it decides the frame's size, exactly as a
+    /// swapchain drawable does on the window path. `done` runs on Metal's
+    /// completion thread when the pixels exist, which is when the host may
+    /// present them. Returns false when the texture cannot be a target.
+    pub fn renderTexture(
+        self: *Gpu,
+        u: Uniforms,
+        tex: ?*anyopaque,
+        done: ?*const fn (?*anyopaque) callconv(.c) void,
+        user: ?*anyopaque,
+    ) bool {
+        const clear = [4]f32{ self.clear.r, self.clear.g, self.clear.b, self.clear.a };
+        var w: u32 = 0;
+        var h: u32 = 0;
+        const f = mc.ctm_begin_frame_tex(self.ctx, tex, &clear, &w, &h) orelse return false;
+        if (w != self.width or h != self.height) {
+            self.size_changed_ms = ticksMs();
+            self.width = w;
+            self.height = h;
+        }
+        if (self.host_density == 0 and self.host_pt_w > 0) {
+            const d = @as(f32, @floatFromInt(w)) / self.host_pt_w;
+            if (d > 0.25 and d < 8) self.pixel_density = d;
+        }
+        self.recordScene(f, u);
+        self.recordOverlay(f);
+        mc.ctm_end_frame_cb(f, done, user);
+        return true;
+    }
+
     /// GPU time (ms) of the most recently completed window frame.
     pub fn lastGpuMs(self: *const Gpu) f64 {
         return mc.ctm_last_gpu_ms(self.ctx);
@@ -777,6 +810,78 @@ test "metal offscreen smoke: paint stream draws, zoom gate culls" {
     try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, P.at(px, 230, 128));
     // Outside everything: the clear color.
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, P.at(px, 5, 5));
+}
+
+// The texture path: the same scene into a target the HOST owns, which is how a
+// RealityKit host takes the chart. It proves three things the window path
+// cannot: the frame draws into a texture nobody in here allocated, the
+// completion callback fires, and a target of the wrong pixel format is refused
+// instead of raising a Metal validation error.
+test "metal texture path: a host-owned target draws, and a bad one is refused" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var g = try Gpu.init(.{ .width = 64, .height = 64 });
+    defer g.deinit();
+    g.clear = .{ .r = 0, .g = 0, .b = 0, .a = 1 };
+
+    const verts = [_]scene.Vertex{
+        .{ .x = -0.9, .y = -0.9, .ox = 0, .oy = 0, .zmin = 0, .zmax = scene.ZMAX_ALL, .flags = 0, .depth = 0.5 },
+        .{ .x = 0.9, .y = -0.9, .ox = 0, .oy = 0, .zmin = 0, .zmax = scene.ZMAX_ALL, .flags = 0, .depth = 0.5 },
+        .{ .x = 0.0, .y = 0.9, .ox = 0, .oy = 0, .zmin = 0, .zmax = scene.ZMAX_ALL, .flags = 0, .depth = 0.5 },
+    };
+    const red = scene.PaintVertex{ .color = .{ 255, 0, 0, 255 } };
+    try g.uploadScene(alloc, .{
+        .vertices = &verts,
+        .paint = &.{ red, red, red },
+        .indices = &.{ 0, 1, 2 },
+        .ranges = &.{.{ .first = 0, .count = 3, .paint_key = 0, .kind = .area, .prim = .triangles }},
+    });
+
+    var u = std.mem.zeroes(Uniforms);
+    u.mvp[0] = 1;
+    u.mvp[5] = 1;
+    u.mvp[15] = 1;
+    u.px_to_clip = .{ 2.0 / 64.0, -2.0 / 64.0 };
+    u.size_scale = 1;
+    u.rot_cos = 1;
+
+    const rt = mc.ctm_new_render_target(g.ctx, 64, 64) orelse return error.MetalFailure;
+    defer mc.ctm_free_texture(rt);
+
+    const Done = struct {
+        var flag: std.atomic.Value(bool) = .init(false);
+        fn cb(_: ?*anyopaque) callconv(.c) void {
+            flag.store(true, .release);
+        }
+    };
+    Done.flag.store(false, .release);
+    try std.testing.expect(g.renderTexture(u, mc.ctm_texture_mtl(rt), Done.cb, null));
+
+    // The callback runs on Metal's completion thread. A frame this small lands
+    // in single-digit milliseconds; the wait is a bound, not a delay.
+    var waited: usize = 0;
+    while (!Done.flag.load(.acquire) and waited < 2000) : (waited += 1) {
+        lock.sleepMs(1);
+    }
+    try std.testing.expect(Done.flag.load(.acquire));
+
+    const px = try alloc.alloc(u8, 64 * 64 * 4);
+    defer alloc.free(px);
+    try std.testing.expect(mc.ctm_texture_read(rt, px.ptr) == 1);
+    // BGRA out of the target: the triangle's paint color in the middle, the
+    // clear color in the top left corner it does not reach.
+    const mid = (32 * 64 + 32) * 4;
+    try std.testing.expectEqual([4]u8{ 0, 0, 255, 255 }, [4]u8{ px[mid], px[mid + 1], px[mid + 2], px[mid + 3] });
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, [4]u8{ px[0], px[1], px[2], px[3] });
+
+    // A sampler texture is RGBA8 and carries no render-target usage, so it is
+    // refused rather than turned into a Metal validation failure.
+    const not_a_target = mc.ctm_new_texture_rgba(g.ctx, &[_]u8{ 255, 255, 255, 255 }, 1, 1) orelse
+        return error.MetalFailure;
+    defer mc.ctm_free_texture(not_a_target);
+    try std.testing.expect(!g.renderTexture(u, mc.ctm_texture_mtl(not_a_target), null, null));
+    try std.testing.expect(!g.renderTexture(u, null, null, null));
 }
 
 // The other half of the offset contract: map_align. A rotated view turns a

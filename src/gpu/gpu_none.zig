@@ -113,6 +113,20 @@ pub const Gpu = struct {
         _ = u;
         return false;
     }
+    pub fn renderTexture(
+        self: *Gpu,
+        u: Uniforms,
+        tex: ?*anyopaque,
+        done: ?*const fn (?*anyopaque) callconv(.c) void,
+        user: ?*anyopaque,
+    ) bool {
+        _ = self;
+        _ = u;
+        _ = tex;
+        _ = done;
+        _ = user;
+        return false;
+    }
     pub fn renderOffscreen(self: *Gpu, alloc: std.mem.Allocator, u: Uniforms) error{Unsupported}![]u8 {
         _ = self;
         _ = alloc;

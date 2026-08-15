@@ -3,7 +3,10 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const apple = target.result.os.tag == .macos or target.result.os.tag == .ios;
+    const apple = switch (target.result.os.tag) {
+        .macos, .ios, .visionos => true,
+        else => false,
+    };
 
     // The library module every consumer imports (`@import("charttable")`).
     const mod = b.addModule("charttable", .{
@@ -48,6 +51,16 @@ pub fn build(b: *std.Build) void {
     // reads the shapes ours declines (interlaced, 16-bit) and is the
     // reference for correctness.
     const use_libpng = b.option(bool, "libpng", "Decode PNG with libpng instead of the built-in reader") orelse true;
+    // A directory holding cross-built codec archives: include/ plus
+    // lib/libwebp.a and lib/libpng16.a. Set it for a target that has no system
+    // package manager, such as an iOS or visionOS device. Left unset, the codecs
+    // come from Homebrew on macOS and from the system elsewhere.
+    // An empty value counts as unset, so an embedder can pass the option
+    // unconditionally.
+    const codec_dir: ?[]const u8 = blk: {
+        const d = b.option([]const u8, "codec-dir", "Directory of cross-built codec archives (include/ + lib/)") orelse break :blk null;
+        break :blk if (d.len == 0) null else d;
+    };
     // Under a sysroot the SDK's own headers are not on the search path for
     // this module's C sources, and a framework header that includes a plain
     // one (Security.h -> libDER/DERItem.h) stops resolving. The host build
@@ -56,12 +69,14 @@ pub fn build(b: *std.Build) void {
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sr, "usr/include" }) });
     }
     if (use_webp or use_libpng) {
-        if (target.result.os.tag == .macos) {
+        if (codec_dir) |dir| {
+            mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ dir, "include" }) });
+        } else if (target.result.os.tag == .macos) {
             mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
         }
-        if (use_webp) linkCodec(b, mod, target, "webp");
+        if (use_webp) linkCodec(b, mod, target, codec_dir, "webp");
         if (use_libpng) {
-            linkCodec(b, mod, target, "png16");
+            linkCodec(b, mod, target, codec_dir, "png16");
             // libpng's objects arrive with their zlib symbols undefined, so
             // zlib has to resolve here as well as in whatever links this.
             linkZlib(b, mod);
@@ -119,9 +134,9 @@ pub fn build(b: *std.Build) void {
         });
         exe_mod.addIncludePath(b.path("include"));
         exe_mod.linkLibrary(lib);
-        if (use_webp) linkCodec(b, exe_mod, target, "webp");
+        if (use_webp) linkCodec(b, exe_mod, target, codec_dir, "webp");
         if (use_libpng) {
-            linkCodec(b, exe_mod, target, "png16");
+            linkCodec(b, exe_mod, target, codec_dir, "png16");
             linkZlib(b, exe_mod);
         }
         for ([_][]const u8{ "Cocoa", "Metal", "QuartzCore", "CoreGraphics", "ImageIO", "UniformTypeIdentifiers" }) |fw| {
@@ -156,8 +171,13 @@ fn linkCodec(
     b: *std.Build,
     mod: *std.Build.Module,
     target: std.Build.ResolvedTarget,
+    codec_dir: ?[]const u8,
     name: []const u8,
 ) void {
+    if (codec_dir) |dir| {
+        mod.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ dir, b.fmt("lib/lib{s}.a", .{name}) }) });
+        return;
+    }
     if (target.result.os.tag != .macos) {
         mod.linkSystemLibrary(name, .{});
         return;
