@@ -2,8 +2,8 @@
 //! behind this file, so the rest of the library imports `gpu` and never names
 //! a backend (ported from lookout-marine src/gpu.zig):
 //!   * Apple (macOS / iOS / visionOS) -> gpu_metal.zig (direct Metal)
-//!   * everything else     -> gpu_none.zig (stub; Vulkan / D3D12 / SDL ports
-//!                            land here per DESIGN.md's module map)
+//!   * Linux / Windows / Android        -> gpu_vk.zig (raw Vulkan)
+//!   * freestanding / wasi              -> gpu_none.zig (stub)
 //! lookout selects via -Dbackend build options; charttable has one real
 //! backend so far, so the target OS decides. All backends expose: Gpu (+ its
 //! Scene/SceneData), Uniforms, Options, NativeKind, Color.
@@ -11,7 +11,10 @@ const builtin = @import("builtin");
 
 const impl = switch (builtin.os.tag) {
     .macos, .ios, .visionos => @import("gpu_metal.zig"),
-    else => @import("gpu_none.zig"),
+    // gpu_none.zig stays for a target with neither (a pure wasm or freestanding
+    // build); everything with a window system draws with Vulkan.
+    .freestanding, .wasi => @import("gpu_none.zig"),
+    else => @import("gpu_vk.zig"),
 };
 
 pub const Gpu = impl.Gpu;

@@ -26,6 +26,30 @@ pub fn build(b: *std.Build) void {
     // frameworks are Apple-gated (non-mac targets select gpu_none.zig and
     // never analyze the Metal backend).
     mod.addAnonymousImport("metal_msl", .{ .root_source_file = b.path("shaders/metal.metal") });
+
+    // The Vulkan backend (src/gpu/gpu_vk.zig). Everything off Apple draws with
+    // it. Unlike Metal there is no runtime shader compiler, so the programs
+    // ride in precompiled as SPIR-V; shaders/vk/README.md holds the command
+    // that regenerates them. The headers are vendored with no VK_USE_PLATFORM_*
+    // (those drag in the X11, Wayland and Windows SDKs) and the loader is
+    // linked by the consumer, which is what lets one build serve every window
+    // system.
+    if (!apple) {
+        const spv = [_][2][]const u8{
+            .{ "fill_vert_spv", "shaders/vk/fill.vert.spv" },
+            .{ "fill_frag_spv", "shaders/vk/fill.frag.spv" },
+            .{ "sprite_vert_spv", "shaders/vk/sprite.vert.spv" },
+            .{ "sprite_frag_spv", "shaders/vk/sprite.frag.spv" },
+            .{ "sdf_frag_spv", "shaders/vk/sdf.frag.spv" },
+            .{ "pattern_vert_spv", "shaders/vk/pattern.vert.spv" },
+            .{ "pattern_frag_spv", "shaders/vk/pattern.frag.spv" },
+            .{ "overlay_vert_spv", "shaders/vk/overlay.vert.spv" },
+            .{ "overlay_frag_spv", "shaders/vk/overlay.frag.spv" },
+        };
+        for (spv) |e| mod.addAnonymousImport(e[0], .{ .root_source_file = b.path(e[1]) });
+        mod.addIncludePath(b.path("vendor/vulkan/include"));
+    }
+
     if (apple) {
         mod.addIncludePath(b.path("src/gpu")); // metal_shim.h for the @cImport
         // Manual retain/release on purpose — objects live in C structs
@@ -149,6 +173,10 @@ pub fn build(b: *std.Build) void {
     // `zig build test` — the gate. Every source module is referenced from
     // src/root.zig so its tests ride this one build.
     const tests = b.addTest(.{ .root_module = mod });
+    // The library leaves the Vulkan loader to whoever links it (the shells do,
+    // through meson/gradle/MSBuild), but a test binary IS the consumer, so it
+    // has to name the loader itself.
+    if (!apple) tests.root_module.linkSystemLibrary("vulkan", .{});
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }

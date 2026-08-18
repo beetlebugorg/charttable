@@ -45,8 +45,12 @@ pub const ERR_MEMORY: c_int = -6;
 pub const ERR_UNSUPPORTED: c_int = -7;
 
 pub const NativeKind = enum(c_int) {
-    none = 0,
-    metal_layer = 1,
+    none = 0, // offscreen only (snapshot)
+    metal_layer = 1, // CAMetalLayer*        (metal backend)
+    win32_hwnd = 4, // charttable_win32_window*   (vk backend)
+    x11_window = 5, // charttable_x11_window*     (vk backend)
+    android_window = 7, // ANativeWindow*        (vk backend)
+    wayland_surface = 8, // charttable_wayland_surface* (vk backend)
 };
 
 pub const Options = extern struct {
