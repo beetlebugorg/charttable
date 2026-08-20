@@ -1257,16 +1257,99 @@ pub const Gpu = struct {
         if (data.patterns.len > 0) {
             out.patterns = try alloc.alloc(PatternTex, data.patterns.len);
             @memset(out.patterns, .{});
-            for (data.patterns, 0..) |cell, i| {
-                if (cell.w == 0 or cell.h == 0 or cell.rgba.len == 0) continue;
-                out.patterns[i] = .{
-                    .tex = try self.makeTexture(cell.rgba, cell.w, cell.h),
-                    .w = @floatFromInt(cell.w),
-                    .h = @floatFromInt(cell.h),
-                };
-            }
+            try self.makePatternTextures(alloc, data.patterns, out.patterns);
         }
         return out;
+    }
+
+    /// All of a scene's pattern-cell textures in ONE submission and ONE wait.
+    /// A raster view carries dozens of tile textures per rebuild, and a full
+    /// GPU round-trip each (makeTexture/oneShot) costs seconds per rebuild on
+    /// a software device — the map then never looks idle.
+    fn makePatternTextures(self: *Gpu, alloc: std.mem.Allocator, cells: []const scene.PatternCell, out: []PatternTex) !void {
+        const Job = struct { res: *d3d.ID3D12Resource, buf: Buffer, w: u32, rows: u32, pitch: u32, cell: usize };
+        var jobs: std.ArrayList(Job) = .empty;
+        defer jobs.deinit(alloc);
+        // On any failure the unconsumed jobs go; entries already landed in
+        // `out` are the caller's errdefer (freeSceneValue). destroyBuffer
+        // zeroes the buffer, so revisiting a consumed job's buf is harmless.
+        var done: usize = 0;
+        errdefer for (jobs.items[done..]) |*j| {
+            self.destroyBuffer(&j.buf);
+            _ = j.res.Release();
+        };
+
+        for (cells, 0..) |cell, i| {
+            if (cell.w == 0 or cell.h == 0 or cell.rgba.len == 0) continue;
+            var heap = d3d.D3D12_HEAP_PROPERTIES{ .Type = d3d.D3D12_HEAP_TYPE_DEFAULT };
+            var desc = d3d.D3D12_RESOURCE_DESC{
+                .Dimension = d3d.D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                .Width = cell.w,
+                .Height = cell.h,
+                .Format = d3d.DXGI_FORMAT_R8G8B8A8_UNORM,
+            };
+            var res: ?*d3d.ID3D12Resource = null;
+            try check(self.device.CreateCommittedResource(&heap, &desc, d3d.D3D12_RESOURCE_STATE_COPY_DEST, null, &res), "CreateCommittedResource texture");
+            errdefer _ = res.?.Release();
+
+            const src_pitch = cell.w * 4;
+            const dst_pitch = alignUp(src_pitch, d3d.D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            var staging = try self.createBuffer(@as(u64, dst_pitch) * cell.h, .upload);
+            errdefer self.destroyBuffer(&staging);
+            const dst = staging.mapped.?;
+            var r: u32 = 0;
+            while (r < cell.h) : (r += 1) {
+                const s = @as(usize, r) * src_pitch;
+                @memcpy(dst[r * dst_pitch ..][0..src_pitch], cell.rgba[s .. s + src_pitch]);
+            }
+            try jobs.append(alloc, .{ .res = res.?, .buf = staging, .w = cell.w, .rows = cell.h, .pitch = dst_pitch, .cell = i });
+        }
+        if (jobs.items.len == 0) return;
+
+        self.waitFence(self.frame_fence_value);
+        try check(self.up_alloc.Reset(), "reset upload allocator");
+        try check(self.up_cmd.Reset(self.up_alloc, null), "reset upload command list");
+        for (jobs.items) |j| {
+            const dst_loc = d3d.D3D12_TEXTURE_COPY_LOCATION{
+                .pResource = j.res,
+                .Type = d3d.D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                .u = .{ .SubresourceIndex = 0 },
+            };
+            const src_loc = d3d.D3D12_TEXTURE_COPY_LOCATION{
+                .pResource = j.buf.res.?,
+                .Type = d3d.D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                .u = .{ .PlacedFootprint = .{ .Footprint = .{
+                    .Format = d3d.DXGI_FORMAT_R8G8B8A8_UNORM,
+                    .Width = j.w,
+                    .Height = j.rows,
+                    .Depth = 1,
+                    .RowPitch = j.pitch,
+                } } },
+            };
+            self.up_cmd.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, null);
+            barrier(self.up_cmd, j.res, d3d.D3D12_RESOURCE_STATE_COPY_DEST, d3d.D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        try check(self.up_cmd.Close(), "close upload command list");
+        const lists = [_]*d3d.ID3D12GraphicsCommandList{self.up_cmd};
+        self.queue.ExecuteCommandLists(1, &lists);
+        self.waitForGpu();
+
+        for (jobs.items) |*j| {
+            self.destroyBuffer(&j.buf);
+            const slot = try self.takeSrvSlot();
+            var srv = d3d.D3D12_SHADER_RESOURCE_VIEW_DESC{
+                .Format = d3d.DXGI_FORMAT_R8G8B8A8_UNORM,
+                .ViewDimension = d3d.D3D12_SRV_DIMENSION_TEXTURE2D,
+                .u = .{ .Texture2D = .{ .MipLevels = 1 } },
+            };
+            self.device.CreateShaderResourceView(j.res, &srv, self.srv_cpu0 + slot * self.srv_size);
+            out[j.cell] = .{
+                .tex = .{ .res = j.res, .srv = slot, .gpu = self.srv_gpu0 + @as(u64, slot) * self.srv_size },
+                .w = @floatFromInt(j.w),
+                .h = @floatFromInt(j.rows),
+            };
+            done += 1;
+        }
     }
 
     pub fn adoptScene(self: *Gpu, sc: Scene) void {
@@ -1301,7 +1384,18 @@ pub const Gpu = struct {
         self.destroyBuffer(&s.phbuf);
         self.destroyBuffer(&s.qbuf);
         self.destroyBuffer(&s.qpbuf);
-        for (s.patterns) |*pt| if (pt.tex) |*t| self.destroyTexture(t);
+        // ONE wait for the lot: destroyTexture waits per texture, and a
+        // raster view's scene holds dozens.
+        for (s.patterns) |*pt| {
+            if (pt.tex == null) continue;
+            self.waitForGpu();
+            break;
+        }
+        for (s.patterns) |*pt| if (pt.tex) |*t| {
+            _ = t.res.?.Release();
+            self.giveSrvSlot(t.srv);
+            t.* = .{};
+        };
         if (s.patterns.len > 0) s.alloc.free(s.patterns);
         if (s.ranges.len > 0) s.alloc.free(s.ranges);
         if (s.draws.len > 0) s.alloc.free(s.draws);
