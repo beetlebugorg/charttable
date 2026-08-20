@@ -58,6 +58,11 @@ pub const Uniforms = scene.Uniforms;
 /// RGBA colour 0..1.
 pub const Color = extern struct { r: f32, g: f32, b: f32, a: f32 };
 
+/// This backend draws. A test that renders gates on this rather than on a list
+/// of operating systems; whether a device is actually there stays Gpu.init's
+/// answer to give.
+pub const renders = true;
+
 // Monotonic clock: the backends' shared timing ABI. Comptime-selected impl (as
 // with root.zig's Lock) so only one platform's externs ever link —
 // clock_gettime on Linux/Android (bionic), QueryPerformanceCounter on Windows
@@ -1419,6 +1424,12 @@ pub const Gpu = struct {
     /// The host's own scale factor (Android's DisplayMetrics.density), which is
     /// constant across rotations — unlike anything derivable from the swapchain.
     /// Set once at open; it then wins over the derived value above.
+    /// Only the D3D12 backend hands a swapchain to its host to compose.
+    pub fn swapchainPtr(self: *Gpu) ?*anyopaque {
+        _ = self;
+        return null;
+    }
+
     pub fn setPixelDensity(self: *Gpu, d: f32) void {
         if (d > 0.2 and d < 8.0) {
             self.host_density = d;

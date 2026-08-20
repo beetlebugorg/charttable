@@ -1821,12 +1821,11 @@ test "buildScene: background, filtered fill, data-driven color, line" {
 }
 
 // First light: the full pipeline — style JSON → filter/evaluate →
-// tessellate → two-stream upload → Metal offscreen → pixel assertions.
+// tessellate → two-stream upload → offscreen render → pixel assertions.
 // The synthetic tile is a deep-blue water square with a 2px green diagonal.
-test "first light: style to pixels through the Metal backend" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+test "first light: style to pixels through the GPU backend" {
     const gpu = @import("gpu/gpu.zig");
+    if (!gpu.renders) return error.SkipZigTest;
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1928,13 +1927,12 @@ fn loadTileNeighborhood(
 
 // The real thing: the Annapolis harbor chart (US5MD1MC) through the whole
 // stack — PMTiles → MLT decode → tile57's own day style → buildScene →
-// Metal — asserting the S-52 day palette's land and shallow-water fills
+// the GPU — asserting the S-52 day palette's land and shallow-water fills
 // dominate the frame exactly as tile57's reference render has them.
 // Skips when the chart library or a GPU is absent.
 test "real chart: Annapolis first light" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpu = @import("gpu/gpu.zig");
+    if (!gpu.renders) return error.SkipZigTest;
     const pmtiles = @import("source/pmtiles.zig");
     const ct_build = @import("ct_build");
     const io = std.Io.Threaded.global_single_threaded.io();

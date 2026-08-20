@@ -1,6 +1,8 @@
 zig-out/
 .zig-cache/
 zig-cache/
+# Where the package manager unpacks the fetched codec sources (build/codecs.zig)
+zig-pkg/
 test/spec/conformance-failures.txt
 specs/
 

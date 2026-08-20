@@ -1,14 +1,16 @@
-//! The `none` backend: the selector's fallback on platforms whose real
-//! backend has not been ported yet (Vulkan / D3D12 / SDL are on the roadmap —
-//! see DESIGN.md). It carries the same API surface as gpu_metal.zig so
-//! platform-independent code compiles everywhere; init reports Unsupported,
-//! so no Gpu value ever exists on these platforms.
+//! The `none` backend: the selector's fallback on a target with no window
+//! system to draw into (freestanding, wasi). It carries the same API surface
+//! as the real backends so platform-independent code compiles everywhere;
+//! init reports Unsupported, so no Gpu value ever exists on these platforms.
 const std = @import("std");
 const scene = @import("../scene/types.zig");
 
 pub const Uniforms = scene.Uniforms;
 
 pub const Color = extern struct { r: f32, g: f32, b: f32, a: f32 };
+
+/// Nothing here draws, so a test that renders skips outright.
+pub const renders = false;
 
 pub const NativeKind = enum(c_int) {
     none = 0,
@@ -58,6 +60,12 @@ pub const Gpu = struct {
         _ = paint;
         return error.Unsupported;
     }
+    /// Only the D3D12 backend hands a swapchain to its host to compose.
+    pub fn swapchainPtr(self: *Gpu) ?*anyopaque {
+        _ = self;
+        return null;
+    }
+
     pub fn setPixelDensity(self: *Gpu, d: f32) void {
         _ = self;
         _ = d;

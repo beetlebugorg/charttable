@@ -21,7 +21,6 @@
 //! ours.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const map_object = @import("map_object.zig");
 const caches = @import("source/cache.zig");
 const pmtiles = @import("source/pmtiles.zig");
@@ -47,10 +46,11 @@ pub const ERR_UNSUPPORTED: c_int = -7;
 pub const NativeKind = enum(c_int) {
     none = 0, // offscreen only (snapshot)
     metal_layer = 1, // CAMetalLayer*        (metal backend)
-    win32_hwnd = 4, // charttable_win32_window*   (vk backend)
+    win32_hwnd = 4, // charttable_win32_window*   (vk + d3d12 backends)
     x11_window = 5, // charttable_x11_window*     (vk backend)
     android_window = 7, // ANativeWindow*        (vk backend)
     wayland_surface = 8, // charttable_wayland_surface* (vk backend)
+    d3d12_panel = 10, // no handle (d3d12 backend); see charttable_d3d12_swapchain
 };
 
 pub const Options = extern struct {
@@ -274,6 +274,20 @@ export fn charttable_attach_surface(
     self.glyphs_dirty = self.glyph_atlas != null;
     self.m.setViewport(@floatFromInt(w_px), @floatFromInt(h_px));
     return OK;
+}
+
+/// The renderer-owned IDXGISwapChain* to compose, for a surface attached with
+/// kind d3d12_panel (ISwapChainPanelNative::SetSwapChain). NULL on every other
+/// kind and on every other backend.
+///
+/// The renderer keeps ownership: charttable_resize rebuilds its buffers and
+/// charttable_detach_surface releases it, so a host must drop its own
+/// reference before detaching.
+export fn charttable_d3d12_swapchain(h: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const self = locked(h) orelse return null;
+    defer self.mu.unlock();
+    const g = if (self.g) |*x| x else return null;
+    return g.swapchainPtr();
 }
 
 export fn charttable_detach_surface(h: ?*anyopaque) callconv(.c) void {
@@ -1097,7 +1111,7 @@ test "capi: a provided source parks, then lands when the host answers" {
 // map renders its fills and patterns and silently loses every icon and label
 // — which is exactly what the example app showed.
 test "capi: a loaded sprite and glyph atlas actually reach the surface" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!gpu.renders) return error.SkipZigTest;
     const ct_build = @import("ct_build");
     const io = std.Io.Threaded.global_single_threaded.io();
     const chart_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;
@@ -1180,7 +1194,7 @@ test "capi: a bad style is refused and the old one stands" {
 }
 
 test "capi: an archive binds by name and the map loads through it" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!gpu.renders) return error.SkipZigTest;
     const ct_build = @import("ct_build");
     const io = std.Io.Threaded.global_single_threaded.io();
     const chart_env = std.c.getenv("CHARTTABLE_TEST_CHART") orelse return error.SkipZigTest;

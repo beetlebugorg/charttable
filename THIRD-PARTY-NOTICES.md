@@ -113,6 +113,27 @@ repository is used. The repository's license (BSD-3-Clause, plus the
 additional notices it bundles) is reproduced in full at
 `test/spec/LICENSE.txt` and applies to the vendored fixtures.
 
+## Built from source: libwebp, libpng and zlib (Windows)
+
+On most targets `-Dwebp` and `-Dlibpng` link the platform's own copies of
+these libraries — Homebrew's static archives on macOS, the system packages
+elsewhere, or archives named by `-Dcodec-dir` — and nothing of theirs is
+redistributed by this repository. Windows has no such copies, so
+`build/codecs.zig` fetches the upstream releases through the Zig package
+manager (pinned in `build.zig.zon`) and compiles their decoders into the
+library. A Windows binary therefore CONTAINS this code, and each license's
+attribution requirement travels with it:
+
+| component | version | license |
+|---|---|---|
+| libwebp (webmproject/libwebp) | 1.4.0 | BSD-3-Clause (`COPYING`, `PATENTS`) |
+| libpng (pnggroup/libpng) | 1.6.44 | PNG Reference Library License v2 (`LICENSE`) |
+| zlib (madler/zlib) | 1.3.1 | zlib license (`LICENSE`) |
+
+Nothing is modified: the sources are compiled as published, and the license
+text ships inside each fetched package. An embedder redistributing a Windows
+build must carry those three notices.
+
 ## Ongoing policy
 
 Any future reading or use of MapLibre source code (maplibre-native,

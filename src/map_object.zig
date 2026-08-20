@@ -58,6 +58,16 @@ pub const ZOOM_REBUILD: f64 = 0.3;
 /// that fit, which is what a coarser zoom would have shown anyway.
 pub const MAX_TILES: usize = 256;
 
+/// CT_MAP_TRACE=1: one stderr line per update() decision while the map is
+/// busy. When the map never settles, the flag that re-raises work every
+/// update names the loop — measured, not reasoned about.
+var trace_state: enum { unknown, off, on } = .unknown;
+fn traceOn() bool {
+    if (trace_state == .unknown)
+        trace_state = if (std.c.getenv("CT_MAP_TRACE") != null) .on else .off;
+    return trace_state == .on;
+}
+
 /// How many updates after the host's last camera input the map still counts
 /// as mid-gesture. Long enough to bridge the gaps between pinch events (at
 /// 60 Hz this is a quarter second), short enough that letting go feels
@@ -598,9 +608,25 @@ pub const Map = struct {
     /// Never blocks. A tile that has not arrived is simply not in the scene;
     /// the frame draws what is resident, which is the whole point of the
     /// "never block a frame on layout" invariant.
+    /// The CT_MAP_TRACE line: every flag update() decides by, plus the exit
+    /// it took. `have` is -1 on exits that never counted residents.
+    fn traceLine(self: *Map, act: []const u8, have: isize) void {
+        std.debug.print(
+            "ct-trace: {s} dirty={} partial={} building={} covHolds={} bz={d:.2} cov={d:.2} cam={d:.2} tgt={d:.2} anim={} gest={} wanted={d} have={d} pend={d}\n",
+            .{
+                act,                  self.dirty,          self.partial,
+                self.building,        self.coverageHolds(), self.buildZoom(),
+                self.cov_zoom,        self.cam.zoom,       self.cam.target_zoom,
+                self.cam.animating(), self.gesturing(),    self.wanted.items.len,
+                have,                 self.pendingWanted(),
+            },
+        );
+    }
+
     pub fn update(self: *Map) !Tick {
         var tick = Tick{};
         if (self.updates_since_input < std.math.maxInt(u32)) self.updates_since_input += 1;
+        const tr = traceOn() and (self.building or self.busy());
 
         // A build in flight owns the tile cache, the bucket cache, the style
         // and the assets for its duration. cache.tick() adopts decoded tiles
@@ -608,11 +634,15 @@ pub const Map = struct {
         // this frame does nothing but wait -- and draw the scene already up,
         // which the worker never touches.
         if (self.building) {
-            if (!self.build_done.load(.acquire)) return tick;
+            if (!self.build_done.load(.acquire)) {
+                if (tr) self.traceLine("wait-build", -1);
+                return tick;
+            }
             const t0 = clock.ticksUs();
             try self.finishBuild();
             tick.finish_us = clock.ticksUs() - t0;
             tick.rebuilt = true;
+            if (tr) self.traceLine("finish-build", -1);
             return tick;
         }
 
@@ -682,6 +712,7 @@ pub const Map = struct {
             t = clock.ticksUs();
             tick.paint_refilled = self.refillPaintIfMoved(&style);
             tick.refill_us = clock.ticksUs() - t;
+            if (tr) self.traceLine("steady", @intCast(have.items.len));
             return tick;
         }
 
@@ -696,7 +727,10 @@ pub const Map = struct {
         //
         // A tile that came back empty or failed is ANSWERED and is not
         // pending, so a view over open water is never held back.
-        if (self.built != null and self.pendingWanted() > 0) return tick;
+        if (self.built != null and self.pendingWanted() > 0) {
+            if (tr) self.traceLine("await-tiles", @intCast(have.items.len));
+            return tick;
+        }
 
         // &self.style.?, NOT &style: the local is a COPY of the optional's
         // payload living on update's stack, and a worker outlives the frame
@@ -705,6 +739,7 @@ pub const Map = struct {
         try self.startBuild(&self.style.?, have.items);
         tick.start_us = clock.ticksUs() - t;
         tick.rebuilt = !self.building; // an inline fallback build is already done
+        if (tr) self.traceLine(if (coverage_broke) "start-build(broke)" else "start-build", @intCast(have.items.len));
         return tick;
     }
 
@@ -1407,8 +1442,18 @@ pub const Map = struct {
             // Pacing bought a shorter worst frame when the build ran on the
             // frame thread. It runs off-thread now, so a bigger build makes
             // the next scene land later and costs the frame nothing.
+            // `self.partial` joins the full-budget cases for the same reason
+            // the others are there: a deferred build is HELD, so pacing the
+            // REMAINDER of one buys nothing anybody can see. The first pass is
+            // still paced -- that is what keeps a quiet fill off the frame --
+            // but once a pass has deferred, the scene it would have shown is
+            // already being withheld, and draining two tiles per update turns
+            // a 256-tile set into ~128 rebuilds. Each one re-pays the global
+            // symbol pass (rebuilt every pass whatever the budget), and
+            // `partial` keeps idle() false the whole way, so the map sits
+            // there rebuilding instead of settling. Finish the batch at once.
             .budget = if (self.built == null or !self.coverageHolds() or
-                self.buildZoom() != self.cov_zoom)
+                self.buildZoom() != self.cov_zoom or self.partial)
                 MAX_TILES
             else
                 self.opts.tiles_per_build,
@@ -1532,6 +1577,7 @@ pub const Map = struct {
         self.dirty = false;
         if (st.held) {
             self.partial = true;
+            if (traceOn()) self.traceLine("adopt-held", -1);
             return;
         }
         self.built = st.built;
@@ -1563,6 +1609,7 @@ pub const Map = struct {
             self.pending_scene = sc;
             self.pending_scene_gen = self.scene_generation;
         }
+        if (traceOn()) self.traceLine(if (st.partial) "adopt-partial" else "adopt", @intCast(have.len));
     }
 
     /// Record what the scene just built actually covers, so needsRebuild can
@@ -1789,8 +1836,7 @@ test "Map: a style swap rebuilds without refetching tiles" {
 }
 
 test "Map: a staging Gpu turns the scene landing into a pointer swap" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .ios) return error.SkipZigTest;
+    if (!gpu.renders) return error.SkipZigTest;
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1832,8 +1878,7 @@ test "Map: a staging Gpu turns the scene landing into a pointer swap" {
 }
 
 test "Map: a superseding build replaces the staged scene; unregistering frees it" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .macos and builtin.os.tag != .ios) return error.SkipZigTest;
+    if (!gpu.renders) return error.SkipZigTest;
     const a = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -1870,8 +1915,7 @@ test "Map: a superseding build replaces the staged scene; unregistering frees it
 // no buffers, and idle() settles — and then checks the Map's picture against
 // a direct buildScene render of the same view, pixel for pixel.
 test "Map: pan across Annapolis rebuilds only on coverage breaks" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!gpu.renders) return error.SkipZigTest;
     const pmtiles = @import("source/pmtiles.zig");
     const mlt = @import("source/mlt.zig");
     const mvt = @import("source/mvt.zig");
@@ -2355,8 +2399,7 @@ test "Map: a raster source draws as world-space quads in style order" {
 // generator, but the COUNTS are stable and are what the optimization is
 // about — how many tiles get re-tessellated to move the camera.
 test "Map: the cost of a zoom sweep" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!gpu.renders) return error.SkipZigTest;
     const pmtiles = @import("source/pmtiles.zig");
     const ct_build = @import("ct_build");
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -2429,11 +2472,45 @@ test "Map: the cost of a zoom sweep" {
     try settle(&m);
     const step_ms = clock.wallMs() - t1;
 
+    // OUTWARD, which is the asymmetric direction: buildZoom leads to the eased
+    // target the moment a zoom-out starts, and growing the view breaks
+    // coverage as well. A wheel notch of one whole quantum lands one rebuild
+    // per notch, so a host whose wheel step IS the quantum rebuilds on every
+    // detent -- what a mouse wheel does and a trackpad pinch does not.
+    m.setView(-76.4767, 38.9763, 16);
+    try settle(&m);
+    const r2 = m.rebuilds;
+    const b2 = m.tiles_built;
+    const t2 = clock.wallMs();
+    // Eight detents of exactly one build quantum, a frame apart, the way a
+    // mouse wheel arrives.
+    var notch: usize = 0;
+    while (notch < 8) : (notch += 1) {
+        m.zoomToward(-m.opts.zoom_quantum, 512, 384);
+        m.cam.tick(1.0 / 60.0);
+        _ = try m.update();
+        m.markDrawn();
+    }
+    var out_frames: usize = 0;
+    while (out_frames < 400 and !m.idle()) : (out_frames += 1) {
+        m.cam.tick(1.0 / 60.0);
+        _ = try m.update();
+        m.markDrawn();
+        @import("util/lock.zig").sleepMs(1);
+    }
+    const out_ms = clock.wallMs() - t2;
+
     std.debug.print(
         "\nzoom z12->z16 EASED:   {d} ms, {d} rebuilds, {d} tiles tessellated ({d} frames)\n" ++
             "zoom z12->z16 STEPPED: {d} ms, {d} rebuilds, {d} tiles tessellated\n" ++
+            "zoom OUT z16->z14, 8 wheel notches of one quantum: {d} ms, {d} rebuilds, {d} tiles tessellated\n" ++
             "  buckets reused overall: {d}\n",
-        .{ eased_ms, eased_rebuilds, eased_built, frames, step_ms, m.rebuilds - r1, m.tiles_built - b1, m.tiles_reused - reused0 },
+        .{
+            eased_ms,       eased_rebuilds,        eased_built,
+            frames,         step_ms,               m.rebuilds - r1,
+            m.tiles_built - b1, out_ms,            m.rebuilds - r2,
+            m.tiles_built - b2, m.tiles_reused - reused0,
+        },
     );
     try testing.expect(m.rebuilds > rebuilds0);
 }
@@ -2442,8 +2519,7 @@ test "Map: the cost of a zoom sweep" {
 // per-tile geometry (cacheable), the global symbol + raster pass (not), and
 // the concatenation. Prints; asserts nothing but that it ran.
 test "Map: rebuild phase profile" {
-    const builtin = @import("builtin");
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (!gpu.renders) return error.SkipZigTest;
     const pmtiles = @import("source/pmtiles.zig");
     const ct_build = @import("ct_build");
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -2869,4 +2945,38 @@ test "Map: the scene builds off the owner thread" {
     // zoom it was STARTED at, so its coverage and its tiles agree.
     const before = m.cov_zoom;
     try testing.expectEqual(m.buildZoom(), before);
+}
+
+// A partial fill has to DRAIN, not trickle. When a pass defers tiles the scene
+// is held, so nothing of it is on screen; pacing the remainder two tiles at a
+// time then buys no smoother frame and costs one rebuild per update — each
+// re-paying the global symbol pass — while `partial` keeps idle() false the
+// whole way. That is the "rebuilding charts" spin. Pin the shape: a fill
+// settles in a handful of rebuilds, not one per pair of tiles.
+test "Map: a deferred batch drains in a few rebuilds, not one per pair of tiles" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    // tiles_per_build at its default, so the paced branch is the one under
+    // test: this is the steady-state fill, not a zoom or a pan.
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", stub.source(14));
+    // Wide enough that the overscan wants well more tiles than the paced
+    // budget of two.
+    m.setViewport(1024, 1024);
+    m.setView(-76.4767, 38.9763, 14);
+
+    try settle(&m);
+    try testing.expect(m.resident.items.len > 4);
+    try testing.expect(!m.partial);
+    try testing.expect(m.idle());
+
+    // The whole fill, from nothing to settled. One rebuild per two tiles would
+    // put this at resident/2 and climbing with the viewport; draining puts it
+    // in single figures.
+    try testing.expect(m.rebuilds < m.resident.items.len / 2);
 }

@@ -93,7 +93,7 @@ charttable/
       gpu.zig                     comptime backend selector (from lookout)
       gpu_metal.zig + metal_shim.m/.h
       gpu_vk.zig    + c_vk.zig
-      gpu_d3d12.zig + d3d12_shim.c/.h
+      gpu_d3d12.zig + c_d3d12.zig
       gpu_sdl.zig   + c_sdl.zig
     raster.zig                    raster sources/layers (rework of
                                   lookout raster.zig — spec "raster" type)

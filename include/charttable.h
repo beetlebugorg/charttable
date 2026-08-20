@@ -66,11 +66,33 @@ typedef void (*charttable_missing_image_fn)(const char *name, void *user);
 charttable *charttable_open(const charttable_options *opts);
 void charttable_close(charttable *);
 
+/* How to interpret the `native` handle passed to charttable_attach_surface. */
+typedef enum {
+    CHARTTABLE_NATIVE_NONE = 0,            /* offscreen only (snapshot) */
+    CHARTTABLE_NATIVE_METAL_LAYER = 1,     /* CAMetalLayer*  (metal backend) */
+    CHARTTABLE_NATIVE_WIN32_HWND = 4,      /* charttable_win32_window* (vk, d3d12) */
+    CHARTTABLE_NATIVE_X11_WINDOW = 5,      /* charttable_x11_window*     (vk) */
+    CHARTTABLE_NATIVE_ANDROID_WINDOW = 7,  /* ANativeWindow*             (vk) */
+    CHARTTABLE_NATIVE_WAYLAND_SURFACE = 8, /* charttable_wayland_surface* (vk) */
+    CHARTTABLE_NATIVE_D3D12_PANEL = 10     /* no handle (d3d12 backend): the
+                                            * renderer makes a composition
+                                            * swapchain and the host composes
+                                            * it; fetch it with
+                                            * charttable_d3d12_swapchain */
+} charttable_native_kind;
+
 /* Create the render surface. `native` is a CAMetalLayer* when kind is
- * CHARTTABLE_NATIVE_METAL_LAYER, or NULL for offscreen-only rendering. */
+ * CHARTTABLE_NATIVE_METAL_LAYER, NULL for CHARTTABLE_NATIVE_D3D12_PANEL and
+ * for offscreen-only rendering. */
 int charttable_attach_surface(charttable *, int kind, void *native,
                               uint32_t w_px, uint32_t h_px);
 void charttable_detach_surface(charttable *);
+
+/* D3D12-panel mode only. The renderer-owned IDXGISwapChain* for
+ * ISwapChainPanelNative::SetSwapChain; NULL on any other kind or backend. The
+ * renderer keeps ownership and rebuilds its buffers on charttable_resize, so
+ * drop your reference before charttable_detach_surface. */
+void *charttable_d3d12_swapchain(charttable *);
 int charttable_resize(charttable *, uint32_t w_pt, uint32_t h_pt);
 void charttable_set_pixel_density(charttable *, float density);
 

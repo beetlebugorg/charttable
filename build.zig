@@ -1,4 +1,5 @@
 const std = @import("std");
+const codecs = @import("build/codecs.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -7,6 +8,15 @@ pub fn build(b: *std.Build) void {
         .macos, .ios, .visionos => true,
         else => false,
     };
+    const windows = target.result.os.tag == .windows;
+
+    // Windows can draw with either backend: D3D12 is the default there, and
+    // the Vulkan backend has a win32 surface path for a host that would rather
+    // run on the loader. Everywhere else this option has nothing to choose.
+    const GpuBackend = enum { auto, vk, d3d12 };
+    const gpu_choice = b.option(GpuBackend, "gpu", "Windows renderer backend: d3d12 (default) or vk") orelse .auto;
+    const use_d3d12 = windows and gpu_choice != .vk;
+    const use_vk = !apple and !use_d3d12;
 
     // The library module every consumer imports (`@import("charttable")`).
     const mod = b.addModule("charttable", .{
@@ -34,7 +44,26 @@ pub fn build(b: *std.Build) void {
     // (those drag in the X11, Wayland and Windows SDKs) and the loader is
     // linked by the consumer, which is what lets one build serve every window
     // system.
-    if (!apple) {
+    // The D3D12 backend (src/gpu/gpu_d3d12.zig). The HLSL rides in as source
+    // and is compiled by d3dcompiler_47.dll at open, so there is no offline
+    // shader toolchain and no import library: d3d12.dll, dxgi.dll and the
+    // compiler are all loaded by name at runtime (src/gpu/c_d3d12.zig).
+    if (use_d3d12) {
+        const hlsl = [_][2][]const u8{
+            .{ "d3d12_fill_vert", "shaders/d3d12/fill.vert.hlsl" },
+            .{ "d3d12_fill_frag", "shaders/d3d12/fill.frag.hlsl" },
+            .{ "d3d12_pattern_vert", "shaders/d3d12/pattern.vert.hlsl" },
+            .{ "d3d12_pattern_frag", "shaders/d3d12/pattern.frag.hlsl" },
+            .{ "d3d12_sprite_vert", "shaders/d3d12/sprite.vert.hlsl" },
+            .{ "d3d12_sprite_frag", "shaders/d3d12/sprite.frag.hlsl" },
+            .{ "d3d12_sdf_frag", "shaders/d3d12/sdf.frag.hlsl" },
+            .{ "d3d12_overlay_vert", "shaders/d3d12/overlay.vert.hlsl" },
+            .{ "d3d12_overlay_frag", "shaders/d3d12/overlay.frag.hlsl" },
+        };
+        for (hlsl) |e| mod.addAnonymousImport(e[0], .{ .root_source_file = b.path(e[1]) });
+    }
+
+    if (use_vk) {
         const spv = [_][2][]const u8{
             .{ "fill_vert_spv", "shaders/vk/fill.vert.spv" },
             .{ "fill_frag_spv", "shaders/vk/fill.frag.spv" },
@@ -93,23 +122,33 @@ pub fn build(b: *std.Build) void {
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sr, "usr/include" }) });
     }
     if (use_webp or use_libpng) {
-        if (codec_dir) |dir| {
-            mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ dir, "include" }) });
-        } else if (target.result.os.tag == .macos) {
-            mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        }
-        if (use_webp) linkCodec(b, mod, target, codec_dir, "webp");
-        if (use_libpng) {
-            linkCodec(b, mod, target, codec_dir, "png16");
-            // libpng's objects arrive with their zlib symbols undefined, so
-            // zlib has to resolve here as well as in whatever links this.
-            linkZlib(b, mod);
+        // Windows carries neither Homebrew nor a system copy of these, and
+        // both options default to on, so the sources are fetched by the
+        // package manager and compiled in (build/codecs.zig). Naming a
+        // codec-dir still wins, for a build that wants its own archives.
+        if (windows and codec_dir == null) {
+            _ = codecs.addFromSource(b, mod, target, use_webp, use_libpng);
+        } else {
+            if (codec_dir) |dir| {
+                mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ dir, "include" }) });
+            } else if (target.result.os.tag == .macos) {
+                mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+            }
+            if (use_webp) linkCodec(b, mod, target, codec_dir, "webp");
+            if (use_libpng) {
+                linkCodec(b, mod, target, codec_dir, "png16");
+                // libpng's objects arrive with their zlib symbols undefined, so
+                // zlib has to resolve here as well as in whatever links this.
+                linkZlib(b, mod);
+            }
         }
     }
 
     const ct_opts = b.addOptions();
     ct_opts.addOption(bool, "webp", use_webp);
     ct_opts.addOption(bool, "libpng", use_libpng);
+    // Which renderer src/gpu/gpu.zig selects on Windows.
+    ct_opts.addOption(bool, "gpu_d3d12", use_d3d12);
     ct_opts.addOption([]const u8, "spec_fixture_dir", b.pathFromRoot("test/spec/expression"));
     ct_opts.addOption([]const u8, "report_path", b.pathFromRoot("test/spec/conformance-failures.txt"));
     ct_opts.addOption([]const u8, "assets_dir", b.pathFromRoot("test/assets"));
@@ -175,8 +214,8 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = mod });
     // The library leaves the Vulkan loader to whoever links it (the shells do,
     // through meson/gradle/MSBuild), but a test binary IS the consumer, so it
-    // has to name the loader itself.
-    if (!apple) tests.root_module.linkSystemLibrary("vulkan", .{});
+    // has to name the loader itself. The D3D12 backend links nothing.
+    if (use_vk) tests.root_module.linkSystemLibrary("vulkan", .{});
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }

@@ -34,6 +34,11 @@ pub const Uniforms = scene.Uniforms;
 /// RGBA color 0..1.
 pub const Color = extern struct { r: f32, g: f32, b: f32, a: f32 };
 
+/// This backend draws. A test that renders gates on this rather than on a list
+/// of operating systems; whether a device is actually there stays Gpu.init's
+/// answer to give.
+pub const renders = true;
+
 /// Monotonic milliseconds from an arbitrary epoch.
 pub fn ticksMs() i64 {
     var ts: std.c.timespec = undefined;
@@ -205,6 +210,12 @@ pub const Gpu = struct {
 
     /// The host's own scale factor, declared rather than derived. A declared
     /// value wins over the per-frame drawable/point ratio.
+    /// Only the D3D12 backend hands a swapchain to its host to compose.
+    pub fn swapchainPtr(self: *Gpu) ?*anyopaque {
+        _ = self;
+        return null;
+    }
+
     pub fn setPixelDensity(self: *Gpu, d: f32) void {
         if (d > 0.2 and d < 8.0) {
             self.host_density = d;
