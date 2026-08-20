@@ -1432,7 +1432,15 @@ pub const Gpu = struct {
                 }
             } else {
                 if (s.qbuf.res == null) continue;
-                const tex = self.atlasTexture(dr.atlas) orelse continue;
+                // A raster range samples the image the scene carries for it,
+                // not an atlas — but it still rides the sprite pipeline: a
+                // raster tile IS a textured world-space quad with the
+                // antimeridian wrap and paint-order depth the sprite shader
+                // already does.
+                const tex = if (dr.pipeline == .raster) blk: {
+                    if (dr.pattern >= s.patterns.len) continue;
+                    break :blk s.patterns[dr.pattern].tex orelse continue;
+                } else self.atlasTexture(dr.atlas) orelse continue;
                 pso = if (halo) self.pso_sdf else self.pso_sprite;
                 tex_gpu = tex.gpu;
             }
