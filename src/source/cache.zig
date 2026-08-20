@@ -82,6 +82,13 @@ pub const Source = struct {
     /// deeper to look the same. Ignoring this draws those tiles at half
     /// resolution -- visibly soft, and worse the further out you go.
     tile_size: u32 = 512,
+    /// The source's data coverage in world fractions {x0, y0, x1, y1}
+    /// (x0 < x1, y0 < y1), or null for the whole world. Bounds what the map
+    /// ASKS for: a view zoomed far outside a source's zoom band is clamped
+    /// into the band, and without bounds that means band-zoom tiles across
+    /// the entire viewport -- for a small raster sheet, hundreds of asks
+    /// that can only ever answer "no tile there".
+    bounds: ?[4]f64 = null,
 
     /// How many zoom levels deeper than the build zoom this source is
     /// sampled: 1 for a 256-px source, 0 for 512.

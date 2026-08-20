@@ -1274,8 +1274,22 @@ pub const Map = struct {
             const nf: f64 = @floatFromInt(n);
             const x0: i64 = @intFromFloat(@floor((cx - hw) * nf));
             const x1: i64 = @intFromFloat(@floor((cx + hw) * nf));
-            const y0: i64 = @max(0, @as(i64, @intFromFloat(@floor((cy - hh) * nf))));
-            const y1: i64 = @min(n - 1, @as(i64, @intFromFloat(@floor((cy + hh) * nf))));
+            var y0: i64 = @max(0, @as(i64, @intFromFloat(@floor((cy - hh) * nf))));
+            var y1: i64 = @min(n - 1, @as(i64, @intFromFloat(@floor((cy + hh) * nf))));
+
+            // The source's own coverage bounds the ask. This is what keeps a
+            // view outside a source's zoom band affordable: the ask zoom is
+            // clamped into the band, and a small source (a raster sheet)
+            // would otherwise be asked for band-zoom tiles across the whole
+            // viewport — hundreds of tiles with no data behind them.
+            var bx0: i64 = 0;
+            var bx1: i64 = n - 1;
+            if (src.bounds) |b| {
+                y0 = @max(y0, @as(i64, @intFromFloat(@floor(b[1] * nf))));
+                y1 = @min(y1, @as(i64, @intFromFloat(@floor(b[3] * nf))));
+                bx0 = @intFromFloat(@floor(b[0] * nf));
+                bx1 = @intFromFloat(@floor(b[2] * nf));
+            }
 
             var ty = y0;
             while (ty <= y1) : (ty += 1) {
@@ -1285,6 +1299,7 @@ pub const Map = struct {
                     // Longitude is cyclic: a view over the antimeridian asks
                     // for the wrapped column, not a negative one.
                     const wx = @mod(@mod(tx, n) + n, n);
+                    if (wx < bx0 or wx > bx1) continue;
                     try out.append(self.gpa, caches.Key.of(si, .{
                         .z = tz,
                         .x = @intCast(wx),

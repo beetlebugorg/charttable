@@ -46,6 +46,8 @@ pub const Provider = struct {
     maxzoom: u8 = 22,
     /// The style's `tileSize`; see caches.Source.tile_size.
     tile_size: u32 = 512,
+    /// Data coverage in world fractions; see caches.Source.bounds.
+    bounds: ?[4]f64 = null,
 
     mu: Lock = .{},
     next_id: u64 = 1,
@@ -94,6 +96,7 @@ pub const Provider = struct {
             .minzoom = self.minzoom,
             .maxzoom = self.maxzoom,
             .tile_size = self.tile_size,
+            .bounds = self.bounds,
         };
     }
 
