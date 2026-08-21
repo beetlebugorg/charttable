@@ -135,6 +135,27 @@ test "let/var with nested bindings (the fill-color idiom)" {
     , &ctx, 0.75);
 }
 
+test "get with a computed property name (the seamark idiom)" {
+    // ["get", ["concat", ...]] builds the name per feature: openwaters'
+    // seamap reads "seamark:<type>:restriction" this way, and a parser that
+    // refused it dropped whole filters.
+    const f = TestFeature{
+        .keys = &.{ "type", "seamark:restricted_area:restriction" },
+        .values = &.{ .{ .string = "restricted_area" }, .{ .string = "no_entry,no_anchoring" } },
+    };
+    var ctx = eval_mod.Context{ .feature = f.ref(.polygon) };
+    try expectStr(
+        \\["get", ["concat", "seamark:", ["get", "type"], ":restriction"]]
+    , &ctx, "no_entry,no_anchoring");
+    try expectBool(
+        \\["in", "no_entry", ["coalesce", ["get", ["concat", "seamark:", ["get", "type"], ":restriction"]], ""]]
+    , &ctx, true);
+    // A computed name that folds to a constant takes the literal path.
+    try expectStr(
+        \\["get", ["concat", "ty", "pe"]]
+    , &ctx, "restricted_area");
+}
+
 test "string ops: concat coerces, slice and index-of count codepoints" {
     var ctx = eval_mod.Context{};
     try expectStr("[\"concat\", \"pat:\", [\"coalesce\", [\"get\", \"x\"], \"\"]]", &ctx, "pat:");

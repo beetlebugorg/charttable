@@ -552,11 +552,12 @@ fn compileInto(b: *Builder, e: *const Expr, dst: Reg) Error!void {
         .geometry_type => _ = try b.emit(.{ .load_geom = .{ .dst = dst } }),
         .id => _ = try b.emit(.{ .load_id = .{ .dst = dst } }),
         .get => |prop| {
-            if (prop.obj != null) return error.Unsupported; // object reads: interpreter
+            // Object reads and computed names: interpreter.
+            if (prop.obj != null or prop.key_expr != null) return error.Unsupported;
             _ = try b.emit(.{ .load_prop = .{ .dst = dst, .slot = try b.keySlot(prop.key) } });
         },
         .has => |prop| {
-            if (prop.obj != null) return error.Unsupported;
+            if (prop.obj != null or prop.key_expr != null) return error.Unsupported;
             _ = try b.emit(.{ .load_has = .{ .dst = dst, .slot = try b.keySlot(prop.key) } });
         },
         .var_ref => |idx| {

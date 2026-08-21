@@ -68,10 +68,21 @@ pub const Context = struct {
 
 pub const Error = error{ Eval, OutOfMemory };
 
+/// A property's name for this feature: the literal key, or the computed one
+/// (["get", ["concat", ...]]) evaluated to a string.
+fn propKey(a: std.mem.Allocator, prop: Expr.Prop, ctx: *Context) Error![]const u8 {
+    const ke = prop.key_expr orelse return prop.key;
+    return switch (try eval(a, ke, ctx)) {
+        .string => |s| s,
+        else => error.Eval,
+    };
+}
+
 pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
     switch (e.*) {
         .literal => |v| return v,
         .get => |prop| {
+            const key = try propKey(a, prop, ctx);
             if (prop.obj) |obj_e| {
                 const obj = try eval(a, obj_e, ctx);
                 const entries = switch (obj) {
@@ -79,13 +90,14 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
                     else => return error.Eval,
                 };
                 for (entries) |entry| {
-                    if (std.mem.eql(u8, entry.key, prop.key)) return entry.value;
+                    if (std.mem.eql(u8, entry.key, key)) return entry.value;
                 }
                 return .null;
             }
-            return ctx.feature.get(prop.key);
+            return ctx.feature.get(key);
         },
         .has => |prop| {
+            const key = try propKey(a, prop, ctx);
             if (prop.obj) |obj_e| {
                 const obj = try eval(a, obj_e, ctx);
                 const entries = switch (obj) {
@@ -93,11 +105,11 @@ pub fn eval(a: std.mem.Allocator, e: *const Expr, ctx: *Context) Error!Value {
                     else => return error.Eval,
                 };
                 for (entries) |entry| {
-                    if (std.mem.eql(u8, entry.key, prop.key)) return Value.true_;
+                    if (std.mem.eql(u8, entry.key, key)) return Value.true_;
                 }
                 return Value.false_;
             }
-            return .{ .boolean = ctx.feature.has(prop.key) };
+            return .{ .boolean = ctx.feature.has(key) };
         },
         .zoom => return .{ .number = ctx.zoom },
         .geometry_type => return .{ .string = switch (ctx.feature.geom) {

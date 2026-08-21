@@ -473,9 +473,14 @@ fn parseLayer(p: *P, j: std.json.Value, index: usize, seen: *std.StringArrayHash
     if (obj.get("filter")) |fj| {
         out.filter = exprs.parse(p.a, fj) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidExpression => blk: {
-                try p.diag(id, "filter", "invalid filter expression — filter dropped, all features admitted", .{});
-                break :blk null;
+            error.InvalidExpression => {
+                // The LAYER goes, not the filter. A missing filter admits
+                // everything by spec, but a BROKEN one meant to admit a few
+                // features would blanket the map with the many — a
+                // restricted-areas fill drawn over every polygon in its
+                // source is far worse than that overlay missing.
+                try p.diag(id, "filter", "invalid filter expression — layer dropped", .{});
+                return null;
             },
         };
     }

@@ -156,6 +156,11 @@ pub const Expr = union(enum) {
     pub const Prop = struct {
         key: []const u8,
         obj: ?*const Expr = null,
+        /// A COMPUTED property name — ["get", ["concat", ...]] — evaluated to
+        /// a string per feature. Null for the ordinary literal key; the
+        /// reference allows either, and seamap styles build
+        /// "seamark:<type>:restriction" this way.
+        key_expr: ?*const Expr = null,
     };
     pub const Let = struct {
         values: []const *const Expr,
@@ -527,8 +532,22 @@ const Parser = struct {
             return p.expect(.{ .e = try p.node(.{ .literal = v }), .deps = .{}, .ty = tc.Type.ofValue(v), .rc = true }, exp);
         }
         if (std.mem.eql(u8, head, "get") or std.mem.eql(u8, head, "has")) {
-            if ((args.len != 1 and args.len != 2) or args[0] != .string) return error.InvalidExpression;
-            const key = try p.arena.dupe(u8, args[0].string);
+            if (args.len != 1 and args.len != 2) return error.InvalidExpression;
+            var key: []const u8 = "";
+            var key_expr: ?*const Expr = null;
+            var key_deps = Deps{};
+            if (args[0] == .string) {
+                key = try p.arena.dupe(u8, args[0].string);
+            } else {
+                const rk = try p.parseJson(args[0], .{ .ty = .string });
+                const folded = try p.fold(rk.e, rk.deps, rk.rc);
+                if (folded.* == .literal and folded.literal == .string) {
+                    key = folded.literal.string; // folded to a constant name
+                } else {
+                    key_expr = folded;
+                    key_deps = rk.deps;
+                }
+            }
             var obj: ?*const Expr = null;
             var deps = Deps{ .feature = true };
             var rc = false;
@@ -536,9 +555,10 @@ const Parser = struct {
                 const r = try p.parseJson(args[1], .{ .ty = .object });
                 obj = try p.fold(r.e, r.deps, r.rc);
                 deps = r.deps; // reading an object, not the feature
-                rc = obj.?.* == .literal;
+                rc = obj.?.* == .literal and key_expr == null;
             }
-            const prop = Expr.Prop{ .key = key, .obj = obj };
+            deps = deps.merge(key_deps);
+            const prop = Expr.Prop{ .key = key, .obj = obj, .key_expr = key_expr };
             const e = if (head[0] == 'g')
                 try p.node(.{ .get = prop })
             else
@@ -1305,7 +1325,10 @@ const ZoomSweep = struct {
 fn eachChild(e: *const Expr, ctx: anytype, comptime visit: anytype) void {
     switch (e.*) {
         .literal, .zoom, .geometry_type, .id, .var_ref, .global_state, .elevation, .heatmap_density, .line_progress, .properties, .distance => {},
-        .get, .has => |prop| if (prop.obj) |o| visit(ctx, o),
+        .get, .has => |prop| {
+            if (prop.obj) |o| visit(ctx, o);
+            if (prop.key_expr) |k| visit(ctx, k);
+        },
         .feature_state => |k| visit(ctx, k),
         .within => |w| visit(ctx, w),
         .image_op => |img| visit(ctx, img),
