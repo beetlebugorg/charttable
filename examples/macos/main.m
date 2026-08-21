@@ -1290,6 +1290,11 @@ int main(int argc, const char *argv[]) {
                     NSLog(@"zoomshake: frame %3d zoom %.3f shift %+d,%+d ratio %.2f", i,
                           cur_v.zoom, bestDx, bestDy, best > 0 ? zeroSad / best : 1.0);
                 }
+                if (getenv("CHARTTABLE_ZOOMSHAKE_RAW") && i >= 35 && i <= 40) {
+                    NSString *path = [NSString stringWithFormat:@"%s/raw%03d.bin",
+                                      getenv("CHARTTABLE_ZOOMSHAKE_RAW"), i];
+                    [px writeToFile:path atomically:NO];
+                }
                 if (getenv("CHARTTABLE_ZOOMSHAKE_DUMP") && i >= 28 && i <= 40) {
                     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
                     CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, W, H, 8, W * 4, cs,

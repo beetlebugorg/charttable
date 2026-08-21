@@ -203,7 +203,16 @@ pub const Camera = struct {
     }
 
     /// Advance the zoom ease and fling by `dt` seconds.
-    pub fn tick(self: *Camera, dt: f64) void {
+    ///
+    /// `dt` is CLAMPED to about two frames' worth. The ease runs on
+    /// wall-clock time, and a hitched frame — a heavy scene rebuild landing,
+    /// a style's tiles decoding — otherwise advances the zoom by the whole
+    /// hitch in one visible step: the chart lurches, resumes, lurches at the
+    /// next hitch, which a mariner reads as the map shaking whenever the
+    /// renderer breathes. Clamped, the same hitch is a barely-late ease.
+    /// The fling takes the same clamp: velocity times a hitch is a teleport.
+    pub fn tick(self: *Camera, dt_raw: f64) void {
+        const dt = @min(dt_raw, 0.033);
         if (@abs(self.target_zoom - self.zoom) > 1e-4) {
             const k = 1.0 - @exp(-dt / ZOOM_TAU);
             self.zoom += (self.target_zoom - self.zoom) * k;
