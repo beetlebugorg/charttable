@@ -1746,6 +1746,16 @@ pub const Gpu = struct {
         @memcpy(s.pbuf.mapped.?[0..n], bytes[0..n]);
     }
 
+    /// The quad half of the same contract: a raster cross-fade rewrites the
+    /// quad paint stream's alphas frame by frame, and nothing else moves.
+    pub fn updateQuadPaint(self: *Gpu, quad_paint: []const scene.PaintVertex) !void {
+        const s = if (self.scene) |*sc| sc else return;
+        if (s.qpbuf.mapped == null or quad_paint.len == 0) return;
+        const bytes = std.mem.sliceAsBytes(quad_paint);
+        const n = @min(bytes.len, s.qpbuf.size);
+        @memcpy(s.qpbuf.mapped.?[0..n], bytes[0..n]);
+    }
+
     pub fn freeStagedScene(self: *Gpu, sc: *Scene) void {
         self.freeSceneValue(sc);
     }

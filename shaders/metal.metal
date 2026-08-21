@@ -223,12 +223,14 @@ vertex QuadOut sprite_vert(uint vid [[vertex_id]],
 fragment float4 sprite_frag(QuadOut in [[stage_in]],
                             texture2d<float> atlas [[texture(0)]],
                             sampler smp [[sampler(0)]]) {
-    // A sprite keeps its authored colours: the paint stream is ignored here
-    // (scene.PaintVertex doc). A fully transparent fragment must not reach the
-    // depth buffer — a raster tile drawn through this pipeline WITH depth
-    // write is transparent outside its coverage, and those pixels would
-    // otherwise cut holes in content underneath.
-    float4 c = atlas.sample(smp, in.uv);
+    // Authored colours MODULATED by the paint stream: every symbol bakes
+    // white there, so a sprite keeps its texels, while a raster tile mid
+    // cross-fade rides its ramping alpha (map_object.tickFade). A fully
+    // transparent fragment must not reach the depth buffer — a raster tile
+    // drawn through this pipeline WITH depth write is transparent outside
+    // its coverage, and those pixels would otherwise cut holes in content
+    // underneath; the same discard removes a fully faded tile outright.
+    float4 c = atlas.sample(smp, in.uv) * in.color;
     if (c.a < (1.0 / 255.0)) discard_fragment();
     return c;
 }

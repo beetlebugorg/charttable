@@ -75,6 +75,10 @@ fn traceOn() bool {
 /// which is what a slower host wants.
 pub const GESTURE_HOLD: u32 = 15;
 
+/// Updates a raster cross-fade runs for — about a quarter second at 60 Hz.
+/// Counted in updates like GESTURE_HOLD, because charttable reads no clock.
+pub const FADE_UPDATES: u32 = 15;
+
 pub const Options = struct {
     cache: caches.Options = .{},
     overscan: f64 = OVERSCAN,
@@ -109,7 +113,8 @@ pub const Tick = struct {
     tiles_landed: bool = false,
     /// Tiles still loading.
     pending: usize = 0,
-    /// Stream B was refilled for a zoom-only paint change (no re-layout).
+    /// Stream B was rewritten without a re-layout: a zoom-only paint change,
+    /// or a raster cross-fade step (the quad stream's alphas moved).
     paint_refilled: bool = false,
 
     // Where this tick's time went, µs. A host frame profiler reads these to
@@ -281,6 +286,15 @@ pub const Map = struct {
     build_thread: ?std.Thread = null,
     build_done: std.atomic.Value(bool) = .init(false),
     build_have: std.ArrayListUnmanaged(u64) = .empty,
+    /// Outgoing-level raster tiles the build in flight draws fading OUT
+    /// under the incoming level (specs/zoom-shake.md: the level swap was the
+    /// DEM half of the shake). Chosen on the owner thread when the build is
+    /// decided; the worker only reads it.
+    build_fade_out: std.ArrayListUnmanaged(u64) = .empty,
+    /// Bit per cache source index whose incoming rasters fade IN.
+    build_fade_sources: u8 = 0,
+    /// Updates left in the live scene's raster cross-fade; 0 = none.
+    fade_left: u32 = 0,
     build_style: ?*const styles.Style = null,
     build_in: BuildInputs = .{ .origin = .{ .x = 0, .y = 0 }, .zoom = 0, .budget = 0, .blank = true },
     staged: Staged = .{},
@@ -348,6 +362,7 @@ pub const Map = struct {
         // still be alive here (see setStagingGpu).
         self.clearPendingScene();
         self.build_have.deinit(self.gpa);
+        self.build_fade_out.deinit(self.gpa);
         self.ahead.deinit(self.gpa);
         self.progs.deinit(self.gpa);
         self.dropBuckets();
@@ -626,6 +641,10 @@ pub const Map = struct {
     pub fn update(self: *Map) !Tick {
         var tick = Tick{};
         if (self.updates_since_input < std.math.maxInt(u32)) self.updates_since_input += 1;
+        // The raster cross-fade advances every update, including the ones
+        // that only wait on a build: the scene it animates is the one
+        // already on screen, which the worker never touches.
+        tick.paint_refilled = self.tickFade();
         const tr = traceOn() and (self.building or self.busy());
 
         // A build in flight owns the tile cache, the bucket cache, the style
@@ -665,6 +684,15 @@ pub const Map = struct {
         }
         // Asking every frame is also what holds the set against eviction.
         for (self.wanted.items) |k| _ = self.cache.want(@bitCast(k));
+        // The LIVE scene's rasters stay wanted too. After a level swap the
+        // outgoing level leaves `wanted` at once, but the next build still
+        // needs those tiles to draw them fading out — and the wait for the
+        // incoming level's supply can be long enough for eviction to take
+        // them otherwise.
+        for (self.resident.items) |k| {
+            const key: caches.Key = @bitCast(k);
+            if (self.cache.sourceKind(key) == .raster) _ = self.cache.want(key);
+        }
 
         // Fetch what the camera is zooming TOWARD, before the rebuild that
         // will need it.
@@ -710,7 +738,7 @@ pub const Map = struct {
         // `coverage_broke` being false leaves untouched.
         if (!coverage_broke and !self.partial and self.sameResident(have.items)) {
             t = clock.ticksUs();
-            tick.paint_refilled = self.refillPaintIfMoved(&style);
+            if (self.refillPaintIfMoved(&style)) tick.paint_refilled = true;
             tick.refill_us = clock.ticksUs() - t;
             if (tr) self.traceLine("steady", @intCast(have.items.len));
             return tick;
@@ -756,6 +784,37 @@ pub const Map = struct {
             if (st == .loading) n += 1;
         }
         return n;
+    }
+
+    /// One step of the raster cross-fade: rewrite the alphas of the live
+    /// scene's fade spans in the quad paint stream and bump the paint
+    /// generation, so the host re-uploads one buffer per step and the level
+    /// swap dissolves instead of snapping. Returns true when it moved.
+    fn tickFade(self: *Map) bool {
+        if (self.fade_left == 0) return false;
+        const b = if (self.built) |*bb| bb else {
+            self.fade_left = 0;
+            return false;
+        };
+        if (b.fades.len == 0) {
+            self.fade_left = 0;
+            return false;
+        }
+        self.fade_left -= 1;
+        const t = 1.0 - @as(f32, @floatFromInt(self.fade_left)) / @as(f32, @floatFromInt(FADE_UPDATES));
+        for (b.fades) |fd| {
+            const level: f32 = if (fd.dir == .in) t else 1.0 - t;
+            const a8: u8 = @intFromFloat(std.math.clamp(level, 0, 1) * 255.0 + 0.5);
+            const end = @min(b.quad_paint.len, @as(usize, fd.first) + fd.count);
+            for (b.quad_paint[fd.first..end]) |*qp| qp.color[3] = a8;
+        }
+        self.paint_generation += 1;
+        if (self.fade_left == 0) {
+            // The outgoing quads are invisible now; one more rebuild drops
+            // them (and their textures) from the scene entirely.
+            self.dirty = true;
+        }
+        return true;
     }
 
     /// A zoom-only color follows the camera, so when the camera moves
@@ -939,10 +998,10 @@ pub const Map = struct {
     }
 
     /// Work outstanding, ignoring whether the current camera has been drawn:
-    /// loading, an animation, a rebuild owed.
+    /// loading, an animation, a rebuild owed, a cross-fade mid-ramp.
     fn busy(self: *Map) bool {
         return self.building or self.dirty or self.partial or self.cam.animating() or
-            self.needsRebuild() or self.pendingWanted() > 0;
+            self.fade_left > 0 or self.needsRebuild() or self.pendingWanted() > 0;
     }
 
     /// True when anything the last drawn frame depended on has changed: the
@@ -1134,9 +1193,12 @@ pub const Map = struct {
         // all of it inside this call.
         const b = self.built orelse return false;
         if (state.scene == self.scene_generation) {
-            // Geometry is current; only the paint stream may have moved.
+            // Geometry is current; only the paint streams may have moved —
+            // the triangle stream for a palette change, the quad stream for
+            // a raster cross-fade step. Both are one memcpy.
             if (state.paint == self.paint_generation) return false;
-            try g.updatePaint(b.paint);
+            if (b.paint.len > 0) try g.updatePaint(b.paint);
+            if (b.quad_paint.len > 0) try g.updateQuadPaint(b.quad_paint);
             state.paint = self.paint_generation;
             return true;
         }
@@ -1329,6 +1391,7 @@ pub const Map = struct {
     fn startBuild(self: *Map, style: *const styles.Style, have: []const u64) !void {
         self.build_have.clearRetainingCapacity();
         try self.build_have.appendSlice(self.gpa, have);
+        try self.chooseFades(have);
         self.build_style = style;
         self.build_in = self.buildInputs();
         self.staged = .{};
@@ -1342,6 +1405,42 @@ pub const Map = struct {
             try self.adopt(st, self.build_have.items);
             return;
         };
+    }
+
+    /// Decide the raster cross-fade for the build about to start: a raster
+    /// source whose tile LEVEL changed keeps its outgoing level for one more
+    /// scene, fading out under the incoming one, instead of the whole
+    /// picture snapping at adoption (specs/zoom-shake.md — over a DEM-shaded
+    /// chart the swap repainted every water pixel at once). Owner thread:
+    /// the worker only reads what this writes.
+    fn chooseFades(self: *Map, have: []const u64) !void {
+        self.build_fade_out.clearRetainingCapacity();
+        self.build_fade_sources = 0;
+        if (self.built == null) return; // a first scene has nothing to fade from
+        var prev_level: [8]?u8 = @splat(null);
+        var next_level: [8]?u8 = @splat(null);
+        for (have) |k| {
+            const key: caches.Key = @bitCast(k);
+            if (self.cache.sourceKind(key) == .raster) next_level[key.source] = key.tileId().z;
+        }
+        for (self.resident.items) |k| {
+            const key: caches.Key = @bitCast(k);
+            if (self.cache.sourceKind(key) == .raster) prev_level[key.source] = key.tileId().z;
+        }
+        for (0..8) |si| {
+            const pz = prev_level[si] orelse continue;
+            const nz = next_level[si] orelse continue;
+            if (pz == nz) continue;
+            self.build_fade_sources |= @as(u8, 1) << @intCast(si);
+            for (self.resident.items) |k| {
+                const key: caches.Key = @bitCast(k);
+                if (key.source != si or self.cache.sourceKind(key) != .raster) continue;
+                // Evicted since the last build: nothing to fade for this
+                // tile. The fade degrades, never blocks.
+                if (!self.cache.isResident(key)) continue;
+                try self.build_fade_out.append(self.gpa, k);
+            }
+        }
     }
 
     fn buildWorker(self: *Map) void {
@@ -1516,6 +1615,21 @@ pub const Map = struct {
         // frame while the uncacheable part is paid once per frame regardless.
         var budget: usize = in.budget;
         var deferred: usize = 0;
+        // The outgoing raster level rides this scene too, drawn UNDER the
+        // incoming one (list order is draw order within a layer) and faded
+        // out by the Map after adoption (chooseFades).
+        for (self.build_fade_out.items) |k| {
+            const key: caches.Key = @bitCast(k);
+            const img = self.cache.getRaster(key) orelse continue;
+            try rasters.append(a, .{
+                .id = key.tileId(),
+                .source = self.sourceName(key.source),
+                .w = img.w,
+                .h = img.h,
+                .rgba = img.rgba,
+                .fade = .out,
+            });
+        }
         for (have) |k| {
             const key: caches.Key = @bitCast(k);
             switch (self.cache.sourceKind(key)) {
@@ -1550,6 +1664,9 @@ pub const Map = struct {
                         .w = img.w,
                         .h = img.h,
                         .rgba = img.rgba,
+                        // A source whose level swapped fades its new tiles
+                        // in from invisible over the outgoing ones.
+                        .fade = if (self.build_fade_sources & (@as(u8, 1) << key.source) != 0) .in else .none,
                     });
                 },
             }
@@ -1613,6 +1730,10 @@ pub const Map = struct {
         self.paint_generation += 1;
         self.rebuilds += 1;
         self.scene_partial = st.partial;
+        // A scene carrying fade spans starts its cross-fade now (the frame
+        // that adopts it draws the baked start alphas, so nothing snaps); a
+        // scene without ends any running one — its content is final.
+        self.fade_left = if (self.built.?.fades.len > 0) FADE_UPDATES else 0;
         // Tiles left untessellated by the budget: come back next update and
         // take the next batch. Their buckets are cached now, so the work
         // already done is not repeated.
@@ -2480,6 +2601,83 @@ test "Map: a raster source draws as world-space quads in style order" {
         if (d.pipeline == .raster) saw_raster = true;
     }
     try testing.expect(saw_raster);
+}
+
+test "Map: a raster level swap cross-fades instead of snapping" {
+    const a = testing.allocator;
+    const png = @import("util/png.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const px = try ar.alloc(u8, 4 * 4 * 4);
+    for (0..16) |i| px[i * 4 ..][0..4].* = .{ 90, 120, 200, 255 };
+    var stub = StubSource{ .bytes = try png.encode(ar, px, 4, 4) };
+
+    const style =
+        \\{"version": 8,
+        \\ "sources": {"photo": {"type": "raster", "tiles": ["x/{z}/{x}/{y}"], "maxzoom": 14}},
+        \\ "layers": [{"id": "picture", "type": "raster", "source": "photo"}]}
+    ;
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(style);
+    _ = try m.bindSource("photo", .{
+        .ptr = &stub,
+        .fetch = StubSource.fetch,
+        .kind = .raster,
+        .maxzoom = 14,
+    });
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 13);
+    try settle(&m);
+    try testing.expectEqual(@as(usize, 0), m.scene().?.fades.len);
+
+    // A whole level in: the raster level swaps, and the adoption must carry
+    // BOTH levels — the outgoing one opaque underneath, the incoming one
+    // starting invisible — with the spans recorded for the ramp.
+    m.setView(-76.4767, 38.9763, 14);
+    const gen13 = m.scene_generation;
+    var spins: usize = 0;
+    while (m.scene_generation == gen13 and spins < 2000) : (spins += 1) {
+        _ = try m.update();
+        @import("util/lock.zig").sleepMs(1);
+    }
+    const b = m.scene() orelse return error.NoScene;
+    try testing.expect(b.fades.len > 0);
+    var saw_in = false;
+    var saw_out = false;
+    for (b.fades) |fd| switch (fd.dir) {
+        .in => {
+            saw_in = true;
+            try testing.expectEqual(@as(u8, 0), b.quad_paint[fd.first].color[3]);
+        },
+        .out => {
+            saw_out = true;
+            try testing.expectEqual(@as(u8, 255), b.quad_paint[fd.first].color[3]);
+        },
+        .none => return error.UnexpectedFadeDir,
+    };
+    try testing.expect(saw_in);
+    try testing.expect(saw_out);
+
+    // Each update moves the ramp through the quad paint stream alone.
+    const pg = m.paint_generation;
+    const sg = m.scene_generation;
+    const tk = try m.update();
+    try testing.expect(tk.paint_refilled);
+    try testing.expect(m.paint_generation > pg);
+    try testing.expectEqual(sg, m.scene_generation);
+    for (m.scene().?.fades) |fd| {
+        const alpha = m.scene().?.quad_paint[fd.first].color[3];
+        if (fd.dir == .in) try testing.expect(alpha > 0) else try testing.expect(alpha < 255);
+    }
+
+    // Settling finishes the ramp and then drops the dead quads: the fade
+    // keeps the map busy until the cleanup rebuild lands a clean scene.
+    try settle(&m);
+    try testing.expectEqual(@as(usize, 0), m.scene().?.fades.len);
+    try testing.expectEqual(@as(u32, 0), m.fade_left);
 }
 
 // What a continuous zoom actually costs. Prints a breakdown rather than

@@ -60,6 +60,11 @@ pub const Gpu = struct {
         _ = paint;
         return error.Unsupported;
     }
+    pub fn updateQuadPaint(self: *Gpu, quad_paint: []const scene.PaintVertex) !void {
+        _ = self;
+        _ = quad_paint;
+        return error.Unsupported;
+    }
     /// Only the D3D12 backend hands a swapchain to its host to compose.
     pub fn swapchainPtr(self: *Gpu) ?*anyopaque {
         _ = self;

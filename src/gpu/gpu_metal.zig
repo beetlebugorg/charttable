@@ -403,6 +403,16 @@ pub const Gpu = struct {
         if (mc.ctm_write_buffer(buf, bytes.ptr, bytes.len) == 0) return error.MetalFailure;
     }
 
+    /// The quad half of the same contract: a raster cross-fade rewrites the
+    /// quad paint stream's alphas frame by frame, and nothing else moves.
+    pub fn updateQuadPaint(self: *Gpu, quad_paint: []const scene.PaintVertex) !void {
+        const s = if (self.scene) |*sc| sc else return error.NoScene;
+        const buf = s.qpbuf orelse return error.NoScene;
+        if (quad_paint.len != s.quad_vert_count) return error.PaintStreamMismatch;
+        const bytes = std.mem.sliceAsBytes(quad_paint);
+        if (mc.ctm_write_buffer(buf, bytes.ptr, bytes.len) == 0) return error.MetalFailure;
+    }
+
     fn newBuffer(self: *Gpu, bytes: []const u8) !*mc.ctm_buf {
         return mc.ctm_new_buffer(self.ctx, bytes.ptr, bytes.len) orelse error.MetalFailure;
     }

@@ -76,7 +76,13 @@ pub const Built = struct {
     paint_zoom_floor: f64 = 0,
     indices: []const u32 = &.{},
     quads: []const types.Quad = &.{},
-    quad_paint: []const types.PaintVertex = &.{},
+    /// MUTABLE like `paint`: a raster cross-fade rewrites the alphas of the
+    /// spans in `fades` in place, frame by frame, through the same stream-B
+    /// re-upload a palette flip uses.
+    quad_paint: []types.PaintVertex = &.{},
+    /// Quad spans a raster cross-fade animates (see RasterTile.fade). Empty
+    /// on a scene with no level swap to hide.
+    fades: []const QuadFade = &.{},
     ranges: []const types.Range = &.{},
     /// Area-fill pattern cells, indexed by Range.pattern.
     patterns: []const types.PatternCell = &.{},
@@ -269,6 +275,23 @@ pub const RasterTile = struct {
     w: u32,
     h: u32,
     rgba: []const u8,
+    /// Cross-fade role for this tile's quads (specs/zoom-shake.md): when a
+    /// gesture swaps a raster source's tile level, the outgoing level rides
+    /// one more scene fading OUT underneath while the incoming one fades IN,
+    /// instead of the whole picture snapping at adoption. The layout bakes
+    /// the starting alpha (in: 0, out: opaque) and records the quad span in
+    /// Built.fades; the Map animates it through the quad paint stream.
+    fade: Fade = .none,
+
+    pub const Fade = enum(u2) { none, in, out };
+};
+
+/// One quad span of Built.quads that a raster cross-fade animates, recorded
+/// by the raster/DEM layout. first/count index QUAD VERTICES (6 per tile).
+pub const QuadFade = struct {
+    first: u32,
+    count: u32,
+    dir: RasterTile.Fade,
 };
 
 /// Symbol assets for the build; without them symbol layers are skipped.
@@ -721,6 +744,7 @@ pub fn buildSceneWithRasters(
     var indices: std.ArrayList(u32) = .empty;
     var quads: std.ArrayList(types.Quad) = .empty;
     var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
+    var fades: std.ArrayList(QuadFade) = .empty;
     var ranges: std.ArrayList(types.Range) = .empty;
     var paint_spans: std.ArrayList(PaintSpan) = .empty;
     var patterns: std.ArrayList(types.PatternCell) = .empty;
@@ -770,11 +794,11 @@ pub fn buildSceneWithRasters(
             .fill, .line => {},
             .symbol => if (assets.sprite == null and assets.glyph_atlas == null) continue,
             .hillshade, .color_relief => {
-                try layoutDemLayer(arena, style, sl, layer_i, rasters, view, &ctx, layerDepth(layer_i, n_layers), &quads, &quad_paint, &patterns, &ranges, &out.eval_errors);
+                try layoutDemLayer(arena, style, sl, layer_i, rasters, view, &ctx, layerDepth(layer_i, n_layers), &quads, &quad_paint, &fades, &patterns, &ranges, &out.eval_errors);
                 continue;
             },
             .raster => {
-                try layoutRasterLayer(arena, sl, layer_i, rasters, view, layerDepth(layer_i, n_layers), &quads, &quad_paint, &patterns, &ranges);
+                try layoutRasterLayer(arena, sl, layer_i, rasters, view, layerDepth(layer_i, n_layers), &quads, &quad_paint, &fades, &patterns, &ranges);
                 continue;
             },
         }
@@ -1112,6 +1136,7 @@ pub fn buildSceneWithRasters(
     out.indices = indices.items;
     out.quads = quads.items;
     out.quad_paint = quad_paint.items;
+    out.fades = fades.items;
     out.ranges = ranges.items;
     out.paint_spans = paint_spans.items;
     out.paint_zoom = view.zoom;
@@ -1148,6 +1173,7 @@ fn layoutDemLayer(
     depth: f32,
     quads: *std.ArrayList(types.Quad),
     quad_paint: *std.ArrayList(types.PaintVertex),
+    fades: *std.ArrayList(QuadFade),
     patterns: *std.ArrayList(types.PatternCell),
     ranges: *std.ArrayList(types.Range),
     errors: *usize,
@@ -1203,6 +1229,9 @@ fn layoutDemLayer(
         const corners = [4][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
         const uvs = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
         const order = [6]u8{ 0, 1, 2, 0, 2, 3 };
+        // A fading-in tile STARTS invisible: the frame that adopts this
+        // scene must look like the one before it, and only then ramp.
+        const alpha: u8 = if (rt.fade == .in) 0 else 255;
         try quads.ensureUnusedCapacity(arena, 6);
         try quad_paint.ensureUnusedCapacity(arena, 6);
         for (order) |ci| {
@@ -1221,8 +1250,9 @@ fn layoutDemLayer(
                 .tangent_q = 0,
                 .depth = depth,
             });
-            quad_paint.appendAssumeCapacity(.{ .color = .{ 255, 255, 255, 255 } });
+            quad_paint.appendAssumeCapacity(.{ .color = .{ 255, 255, 255, alpha } });
         }
+        if (rt.fade != .none) try fades.append(arena, .{ .first = first, .count = 6, .dir = rt.fade });
         try ranges.append(arena, .{
             .first = first,
             .count = 6,
@@ -1310,6 +1340,7 @@ fn layoutRasterLayer(
     depth: f32,
     quads: *std.ArrayList(types.Quad),
     quad_paint: *std.ArrayList(types.PaintVertex),
+    fades: *std.ArrayList(QuadFade),
     patterns: *std.ArrayList(types.PatternCell),
     ranges: *std.ArrayList(types.Range),
 ) !void {
@@ -1332,6 +1363,8 @@ fn layoutRasterLayer(
         const corners = [4][2]f32{ .{ x0, y0 }, .{ x1, y0 }, .{ x1, y1 }, .{ x0, y1 } };
         const uvs = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
         const order = [6]u8{ 0, 1, 2, 0, 2, 3 };
+        // A fading-in tile STARTS invisible (see layoutDemLayer).
+        const alpha: u8 = if (rt.fade == .in) 0 else 255;
         try quads.ensureUnusedCapacity(arena, 6);
         try quad_paint.ensureUnusedCapacity(arena, 6);
         for (order) |ci| {
@@ -1350,8 +1383,9 @@ fn layoutRasterLayer(
                 .tangent_q = 0,
                 .depth = depth,
             });
-            quad_paint.appendAssumeCapacity(.{ .color = .{ 255, 255, 255, 255 } });
+            quad_paint.appendAssumeCapacity(.{ .color = .{ 255, 255, 255, alpha } });
         }
+        if (rt.fade != .none) try fades.append(arena, .{ .first = first, .count = 6, .dir = rt.fade });
         try ranges.append(arena, .{
             .first = first,
             .count = 6,
@@ -1390,6 +1424,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
     var indices: std.ArrayList(u32) = .empty;
     var quads: std.ArrayList(types.Quad) = .empty;
     var quad_paint: std.ArrayList(types.PaintVertex) = .empty;
+    var fades: std.ArrayList(QuadFade) = .empty;
     var ranges: std.ArrayList(types.Range) = .empty;
     var patterns: std.ArrayList(types.PatternCell) = .empty;
     var spans: std.ArrayList(PaintSpan) = .empty;
@@ -1432,6 +1467,12 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
             try paint_hi.appendSlice(arena, b.paint);
         }
         try quad_paint.appendSlice(arena, b.quad_paint);
+        try fades.ensureUnusedCapacity(arena, b.fades.len);
+        for (b.fades) |fd| {
+            var moved = fd;
+            moved.first += qbase;
+            fades.appendAssumeCapacity(moved);
+        }
         try indices.ensureUnusedCapacity(arena, b.indices.len);
         for (b.indices) |ix| indices.appendAssumeCapacity(ix + vbase);
         // The cell's PIXELS are copied, not borrowed. A part's pattern
@@ -1491,6 +1532,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
     out.indices = indices.items;
     out.quads = quads.items;
     out.quad_paint = quad_paint.items;
+    out.fades = fades.items;
     out.ranges = ranges.items;
     out.patterns = patterns.items;
     out.paint_spans = spans.items;
@@ -2492,6 +2534,49 @@ test "buildScene: a zoom-curve line width bakes a slope through the true width" 
         @sqrt(@as(f64, b2.vertices[0].ox) * b2.vertices[0].ox + @as(f64, b2.vertices[0].oy) * b2.vertices[0].oy),
         1e-6,
     );
+}
+
+// A raster tile's cross-fade role bakes its starting alpha and records the
+// quad span the Map animates: fading-in starts invisible, fading-out starts
+// opaque, and the outgoing tile is listed first so it draws underneath.
+test "buildSceneWithRasters: fade roles bake start alphas and record spans" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"photo": {"type": "raster", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "picture", "type": "raster", "source": "photo"}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+
+    const img = try a.alloc(u8, 4 * 4 * 4);
+    @memset(img, 200);
+    const rect = (coord.TileId{ .z = 13, .x = 100, .y = 200 }).worldRect();
+    const rasters = [_]RasterTile{
+        .{ .id = .{ .z = 13, .x = 100, .y = 200 }, .source = "photo", .w = 4, .h = 4, .rgba = img, .fade = .out },
+        .{ .id = .{ .z = 14, .x = 200, .y = 400 }, .source = "photo", .w = 4, .h = 4, .rgba = img, .fade = .in },
+        .{ .id = .{ .z = 14, .x = 201, .y = 400 }, .source = "photo", .w = 4, .h = 4, .rgba = img },
+    };
+    const b = try buildSceneWithRasters(a, &style, &.{}, &rasters, .{
+        .zoom = 14,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{});
+
+    try std.testing.expectEqual(@as(usize, 3 * 6), b.quads.len);
+    try std.testing.expectEqual(@as(usize, 2), b.fades.len);
+    // The outgoing tile came first: under the incoming one in draw order.
+    try std.testing.expectEqual(RasterTile.Fade.out, b.fades[0].dir);
+    try std.testing.expectEqual(@as(u32, 0), b.fades[0].first);
+    try std.testing.expectEqual(@as(u32, 6), b.fades[0].count);
+    try std.testing.expectEqual(@as(u8, 255), b.quad_paint[0].color[3]);
+    try std.testing.expectEqual(RasterTile.Fade.in, b.fades[1].dir);
+    try std.testing.expectEqual(@as(u32, 6), b.fades[1].first);
+    try std.testing.expectEqual(@as(u8, 0), b.quad_paint[6].color[3]);
+    // The unmarked tile is plain opaque and in no span.
+    try std.testing.expectEqual(@as(u8, 255), b.quad_paint[12].color[3]);
 }
 
 test "concatScenes: per-tile geometry plus a global symbol pass equals one build" {
