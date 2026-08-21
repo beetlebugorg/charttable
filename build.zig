@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         else => false,
     };
     const windows = target.result.os.tag == .windows;
+    const android = target.result.abi == .android or target.result.abi == .androideabi;
 
     // Windows can draw with either backend: D3D12 is the default there, and
     // the Vulkan backend has a win32 surface path for a host that would rather
@@ -28,6 +29,18 @@ pub fn build(b: *std.Build) void {
         // of the fence need it.
         .link_libc = true,
     });
+
+    if (android) {
+        // bionic's nullability-on-array declarations ("const struct timeval
+        // _Nonnull [2]") break translate-c, and the @cImports here (png.h,
+        // vulkan.h) reach sys/ headers through the NDK sysroot. The
+        // annotations are hints only; defining them empty drops them for our
+        // parse and the C compiles alike — the same neutralisation
+        // lookout-marine applies to its own module.
+        mod.addCMacro("_Nonnull", "");
+        mod.addCMacro("_Nullable", "");
+        mod.addCMacro("_Null_unspecified", "");
+    }
 
     // The Metal backend (src/gpu/gpu_metal.zig + metal_shim.m). The shader
     // source rides an anonymous import (`@embedFile("metal_msl")`) and is
@@ -122,11 +135,12 @@ pub fn build(b: *std.Build) void {
         mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sr, "usr/include" }) });
     }
     if (use_webp or use_libpng) {
-        // Windows carries neither Homebrew nor a system copy of these, and
-        // both options default to on, so the sources are fetched by the
-        // package manager and compiled in (build/codecs.zig). Naming a
-        // codec-dir still wins, for a build that wants its own archives.
-        if (windows and codec_dir == null) {
+        // Windows and Android carry neither Homebrew nor a system copy of
+        // these, and both options default to on, so the sources are fetched
+        // by the package manager and compiled in (build/codecs.zig) — zlib
+        // included, so nothing here asks the linker to search for -lz.
+        // Naming a codec-dir still wins, for a build with its own archives.
+        if ((windows or android) and codec_dir == null) {
             _ = codecs.addFromSource(b, mod, target, use_webp, use_libpng);
         } else {
             if (codec_dir) |dir| {
@@ -214,8 +228,12 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = mod });
     // The library leaves the Vulkan loader to whoever links it (the shells do,
     // through meson/gradle/MSBuild), but a test binary IS the consumer, so it
-    // has to name the loader itself. The D3D12 backend links nothing.
-    if (use_vk) tests.root_module.linkSystemLibrary("vulkan", .{});
+    // has to name the loader itself. tests.root_module IS `mod`, so this flag
+    // rides on every consumer too — harmless where the shell links the loader
+    // anyway, but an android cross-build has no -lvulkan to find, and its
+    // tests never run; the gradle/CMake link names the loader there. The
+    // D3D12 backend links nothing.
+    if (use_vk and !android) tests.root_module.linkSystemLibrary("vulkan", .{});
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 }

@@ -14,6 +14,7 @@ pub const c = if (android) @cImport({
     @cDefine("VK_USE_PLATFORM_ANDROID_KHR", "1");
     @cInclude("vulkan/vulkan.h");
     @cInclude("android/native_window.h");
+    @cInclude("android/log.h"); // __android_log_print + the ANDROID_LOG_* levels
 }) else @cImport({
     @cInclude("vulkan/vulkan.h");
 });

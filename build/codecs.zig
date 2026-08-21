@@ -155,7 +155,13 @@ fn addPng(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarge
 
     const zroot = zdep.path(".");
     mod.addIncludePath(zroot); // zlib.h, for libpng and for the charttable @cImport
-    mod.addCSourceFiles(.{ .root = zroot, .files = &zlib_src, .flags = &base_flags });
+    // Off Windows zlib's gz* io calls read/write/lseek/close; without the
+    // define it leaves them implicitly declared, an error under C99.
+    if (target.result.os.tag == .windows) {
+        mod.addCSourceFiles(.{ .root = zroot, .files = &zlib_src, .flags = &base_flags });
+    } else {
+        mod.addCSourceFiles(.{ .root = zroot, .files = &zlib_src, .flags = &(base_flags ++ [_][]const u8{"-DZ_HAVE_UNISTD_H"}) });
+    }
 
     const proot = pdep.path(".");
     // libpng is normally configured; the shipped prebuilt is that configuration
