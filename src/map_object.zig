@@ -230,10 +230,6 @@ pub const Map = struct {
     cov_hw: f64 = 0,
     cov_hh: f64 = 0,
     has_coverage: bool = false,
-    /// The zoom RASTER sources pick their tile level from: refreshed while
-    /// the camera is still, held through a gesture (see visibleTiles). Null
-    /// until the first choice.
-    raster_zoom_hold: ?f64 = null,
     /// Set by anything that must force a rebuild regardless of coverage.
     dirty: bool = true,
 
@@ -693,7 +689,7 @@ pub const Map = struct {
         const heading = self.headingZoom();
         if (!coverage_broke and (self.buildZoom() != self.cov_zoom or heading != self.buildZoom())) {
             self.ahead.clearRetainingCapacity();
-            try self.visibleTilesAtHeld(heading, false, &self.ahead);
+            try self.visibleTilesAt(heading, &self.ahead);
             for (self.ahead.items) |k| _ = self.cache.want(@bitCast(k));
         } else self.ahead.clearRetainingCapacity();
 
@@ -827,40 +823,25 @@ pub const Map = struct {
         // will need are already being fetched (see `ahead` in update).
         if (!self.coverageHolds() and (drift == 0 or !self.gesturing())) return true;
 
-        // Deliberately NO special case for "mid-gesture" any more.
+        // Mid-gesture, a WHOLE level of drift rebuilds; a quantum does not.
         //
-        // While the build ran on the owner thread, rebuilding through a
-        // gesture meant re-tessellating scenes nobody looked at for more
-        // than a frame, so the scene was held and allowed to drift a whole
-        // zoom level. That is what makes lines and symbols look jagged until
-        // the gesture stops: they are drawn at the detail of where the
-        // camera was, scaled.
-        //
-        // The build is off-thread now and only one runs at a time, so a
-        // rebuild during a gesture costs the frame nothing and the chart
-        // sharpens as it goes.
-        if (drift != 0) return true;
+        // The build is off-thread and costs the frame nothing, so for a
+        // while every quantum rebuilt through the gesture and the chart
+        // sharpened as it went. But each adoption renormalizes line widths,
+        // re-places labels and re-derives raster shading — a small visible
+        // snap — and on the quantum grid those snaps land on a steady beat,
+        // four to the zoom level. A mariner pinching over a heavy style
+        // reads that rhythm as the map shaking, and it looks mechanical
+        // because it is. Scaling softly between whole levels and sharpening
+        // once per level (then fully at the settle) is the trade every
+        // mainstream map makes, and the eye agrees with it.
+        if (drift >= 1.0) return true;
+        if (drift != 0 and !self.gesturing()) return true;
         // A zoom-interpolated paint pair brackets one integer zoom. Drift
         // across that boundary and the two halves no longer bracket the
         // camera, so the shader would mix the wrong pair.
         if (self.built) |b| {
             if (b.paint_hi.len > 0 and @floor(self.buildZoom()) != b.paint_zoom_floor) return true;
-        }
-        // The raster hold releasing: the gesture is over and the level the
-        // rasters were held at is not the level this zoom would pick — the
-        // one flip the hold deferred happens here, in a settle rebuild the
-        // await-tiles gate keeps invisible until its tiles are in hand.
-        if (!self.gesturing()) {
-            if (self.raster_zoom_hold) |h| {
-                if (@round(h) != @round(self.buildZoom()) and self.hasRasterSource()) return true;
-            }
-        }
-        return false;
-    }
-
-    fn hasRasterSource(self: *const Map) bool {
-        for (self.cache.sources.items) |s| {
-            if (s.kind == .raster) return true;
         }
         return false;
     }
@@ -1269,17 +1250,6 @@ pub const Map = struct {
     /// integer zoom nearest the build target and inside that source's band.
     /// Keys come out sorted so `sameResident` is an ordered compare.
     fn visibleTiles(self: *Map, out: *std.ArrayListUnmanaged(u64)) !void {
-        // The raster hold. Raster and DEM sources pick their level from where
-        // the camera last sat still, not from the gesture in flight: their
-        // pixels are re-derived per rebuild (a DEM tile becomes hillshade or
-        // depth shading), and a level flip mid-zoom redraws every band of
-        // water somewhere slightly else — the measured zoom shake. Held, the
-        // same grids re-render identically and nothing lurches; the flip
-        // happens once, in the settle rebuild, when the eye expects the
-        // chart to sharpen anyway. Vector tiles carry coordinates, not
-        // pixels, so they keep following the quantum and stay sharp.
-        if (!self.gesturing() or self.raster_zoom_hold == null)
-            self.raster_zoom_hold = self.buildZoom();
         return self.visibleTilesAt(self.buildZoom(), out);
     }
 
@@ -1287,13 +1257,6 @@ pub const Map = struct {
     /// build zoom; the prefetch uses where the camera is heading, which is not
     /// the same thing on the way in.
     fn visibleTilesAt(self: *Map, zoom: f64, out: *std.ArrayListUnmanaged(u64)) !void {
-        return self.visibleTilesAtHeld(zoom, true, out);
-    }
-
-    /// `hold_rasters` is false on the PREFETCH path: a prefetch is never
-    /// drawn, so it aims raster sources at the live zoom too — the settle
-    /// rebuild that releases the hold then finds its tiles already here.
-    fn visibleTilesAtHeld(self: *Map, zoom: f64, hold_rasters: bool, out: *std.ArrayListUnmanaged(u64)) !void {
         const he = self.extentsAt(zoom);
         const hw = he.x;
         const hh = he.y;
@@ -1301,21 +1264,10 @@ pub const Map = struct {
         const cy = self.cam.center.y;
 
         for (self.cache.sources.items, 0..) |src, si| {
-            // A raster source's level comes from the hold (see visibleTiles).
-            // Capped from ABOVE only: a hold deeper than the live zoom is a
-            // zoom OUT asking for 4x the tiles per level of difference, so it
-            // may lead by at most one; a hold COARSER than the live zoom (a
-            // zoom in) costs nothing and is the whole point — a moving clamp
-            // below would slide with the camera and re-introduce the level
-            // flips the hold exists to defer.
-            const src_zoom = if (src.kind == .raster and hold_rasters)
-                @min(self.raster_zoom_hold orelse zoom, zoom + 1.0)
-            else
-                zoom;
             // A 256-px source is sampled a level deeper so its pixels land
             // at the same density as a 512-px one (see Source.tile_size).
             const tz: u8 = @intCast(std.math.clamp(
-                @as(i64, @intFromFloat(@round(src_zoom))) + src.zoomOffset(),
+                @as(i64, @intFromFloat(@round(zoom))) + src.zoomOffset(),
                 @as(i64, src.minzoom),
                 @as(i64, src.maxzoom),
             ));
