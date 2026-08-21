@@ -461,6 +461,20 @@ fn parseLayer(p: *P, j: std.json.Value, index: usize, seen: *std.StringArrayHash
         return null;
     };
 
+    // A patterned line drawn without its pattern is a fat SOLID line in the
+    // default black — a T-stub boundary becomes a blanket around every parcel
+    // it borders. The pattern IS the layer's look; without it the layer goes,
+    // like a layer whose filter cannot be honored. (fill-pattern needs no
+    // such guard: an unresolvable fill pattern already draws nothing.)
+    if (kind == .line) {
+        if (obj.get("paint")) |pj| {
+            if (pj == .object and pj.object.get("line-pattern") != null) {
+                try p.diag(id, "line-pattern", "line-pattern is tier 2 — layer dropped (a solid default line would blanket its areas)", .{});
+                return null;
+            }
+        }
+    }
+
     var out = Layer{
         .id = id,
         .kind = kind,
