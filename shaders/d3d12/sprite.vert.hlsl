@@ -67,7 +67,9 @@ VSOut main(VSIn i) {
     bool vis = zmin <= u_zoom && u_zoom <= zmax;
     o.pos = vis ? clip : float4(0.0, 0.0, 2.0, 1.0);
     o.uv = i.a_uv;
-    o.color = lerp(i.a_color, i.a_color_hi, u_zoom_t);
+    // zoom_t clamped: mid-gesture it can leave [0,1] while the re-bracketing
+    // rebuild is in flight, and holding the end color beats wrapping.
+    o.color = lerp(i.a_color, i.a_color_hi, saturate(u_zoom_t));
     o.weight = i.a_weight;
     return o;
 }

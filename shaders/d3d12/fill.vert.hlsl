@@ -23,7 +23,7 @@ struct VSIn {
     float2 a_pos      : TEXCOORD0; // tile-local world units
     float2 a_off      : TEXCOORD1; // screen offset, reference px
     uint   a_zwin     : TEXCOORD2; // zmin | zmax<<16
-    uint   a_flags    : TEXCOORD3; // bit 0: map_align
+    uint   a_flags    : TEXCOORD3; // bit 0: map_align; byte 1: width slope (wscale_q)
     float  a_depth    : TEXCOORD4; // paint-order depth (0,1)
     float4 a_color    : TEXCOORD5; // stream B, UNORM8x4 straight alpha
     // The zoom-interpolated pair's upper half: the same property one integer
@@ -68,9 +68,19 @@ float2 screen_offset(float2 off, uint flags) {
 VSOut main(VSIn i) {
     VSOut o;
     float4 clip = project(i.a_pos);
-    clip.xy += screen_offset(i.a_off, i.a_flags) * u_px_to_clip * u_size_scale * clip.w;
+    float2 off = screen_offset(i.a_off, i.a_flags);
+    // The baked width slope (scene.Vertex.wscale_q, byte 1 of the flags
+    // word): a zoom-curve line width keeps following the camera between
+    // rebuilds. 128 states slope 0 and the factor collapses to 1. zoom_t is
+    // deliberately NOT clamped here — past the bracket the slope
+    // extrapolates, the continuous answer while the rebuild lands.
+    float wslope = (float((i.a_flags >> 8) & 0xFF) - 128.0) * (1.0 / 32.0);
+    off *= exp2(wslope * u_zoom_t);
+    clip.xy += off * u_px_to_clip * u_size_scale * clip.w;
     clip.z = i.a_depth * clip.w; // paint-order depth (ortho: w = 1)
     o.pos = gate(i.a_zwin) ? clip : float4(0.0, 0.0, 2.0, 1.0); // z=2 -> clipped
-    o.color = lerp(i.a_color, i.a_color_hi, u_zoom_t);
+    // Clamped: mid-gesture zoom_t can leave [0,1]; hold the end color
+    // rather than wrapping to the far one.
+    o.color = lerp(i.a_color, i.a_color_hi, saturate(u_zoom_t));
     return o;
 }

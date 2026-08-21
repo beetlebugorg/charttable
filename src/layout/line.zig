@@ -48,6 +48,18 @@ pub const Join = enum(u8) { miter, bevel, round };
 pub const Options = struct {
     /// Stroke width in reference px. Baked into the offsets at layout.
     width_px: f32,
+    /// Width slope for Vertex.wscale_q: how the shader should grow the baked
+    /// offsets per zoom level of camera drift (scene/types.zig wscaleQ).
+    /// WSCALE_FLAT bakes a width that holds still, which is right for every
+    /// width that is not a zoom curve.
+    wscale_q: u8 = types.WSCALE_FLAT,
+    /// The width the DASH pattern measures in (spec: dash lengths are width
+    /// multiples), when it differs from width_px. The offsets may be baked
+    /// at a slope-corrected width so the shader lands the true width at the
+    /// build zoom; the dash period must not absorb that correction, or the
+    /// pattern's proportions drift with the correction instead of holding
+    /// the style's. 0 means width_px.
+    dash_width_px: f32 = 0,
     cap: Cap = .butt,
     join: Join = .miter,
     /// Spec line-miter-limit. Values <= 0 mean every miter draws as bevel.
@@ -114,7 +126,8 @@ pub fn layoutLine(
     // restated relative to the tile's scale).
     const eps = tile_span * 1e-12;
 
-    const pattern = try compilePattern(a, opts.dasharray, opts.width_px);
+    const dash_width = if (opts.dash_width_px > 0) opts.dash_width_px else opts.width_px;
+    const pattern = try compilePattern(a, opts.dasharray, dash_width);
     if (pattern) |pat| {
         if (pat.runs.len == 0) return; // all-gap pattern: nothing to draw
         std.debug.assert(px_per_unit > 0);
@@ -190,6 +203,7 @@ const Emitter = struct {
             .zmin = e.opts.zmin,
             .zmax = e.opts.zmax,
             .flags = types.Flags.map_align,
+            .wscale_q = e.opts.wscale_q,
             .depth = e.opts.depth,
         });
         return i;
@@ -613,6 +627,27 @@ test "caps: butt adds nothing, square a quad, round an 8-segment half fan" {
         for (b.verts.items[5..14]) |v| try testing.expect(v.ox <= 1e-6);
         for (b.verts.items[15..24]) |v| try testing.expect(v.ox >= -1e-6);
     }
+}
+
+test "wscale_q rides every vertex; the dash pattern measures the nominal width" {
+    var b = Built{};
+    defer b.deinit();
+    const pts = [_]mvt.Point{ .{ .x = 0, .y = 0 }, .{ .x = 100, .y = 0 }, .{ .x = 100, .y = 100 } };
+    const parts = [_][]const mvt.Point{&pts};
+    try b.layout(&parts, 4096.0, 1.0, .{ .width_px = 10, .cap = .round, .join = .round, .wscale_q = 160 });
+    try testing.expect(b.verts.items.len > 0);
+    for (b.verts.items) |v| try testing.expectEqual(@as(u8, 160), v.wscale_q);
+
+    // Offsets baked at a slope-corrected width must not shrink the dash
+    // period with them: width 5 with dash_width 10 cuts width-10 dashes.
+    var d = Built{};
+    defer d.deinit();
+    const line2 = [_]mvt.Point{ .{ .x = 0, .y = 0 }, .{ .x = 1000, .y = 0 } };
+    const parts2 = [_][]const mvt.Point{&line2};
+    try d.layout(&parts2, 4096.0, 1.0, .{ .width_px = 5, .dash_width_px = 10, .dasharray = &.{ 4, 6 } });
+    try testing.expectEqual(@as(usize, 10 * 4), d.verts.items.len); // period 100 px: 10 dashes
+    try testing.expectEqual(@as(f32, 40), d.verts.items[2].x); // 4 x 10 px of "on"
+    try testing.expectEqual(@as(f32, 2.5), d.verts.items[0].oy); // half of width_px, not dash width
 }
 
 test "dasharray cuts the expected dash count, pattern restarts per part" {

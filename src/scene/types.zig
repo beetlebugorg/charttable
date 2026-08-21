@@ -71,9 +71,35 @@ pub const Vertex = extern struct {
     zmin: u16, // visible while zmin <= zq(zoom) <= zmax
     zmax: u16,
     flags: u8, // Flags.*
-    _pad: [3]u8 = .{ 0, 0, 0 },
+    /// Width slope: log2 of how fast this vertex's offset should grow per
+    /// zoom level, quantized by wscaleQ. The shader scales (ox, oy) by
+    /// exp2(wscaleS(wscale_q) * zoom_t), so a line whose style width is a
+    /// zoom curve keeps FOLLOWING the camera between rebuilds instead of
+    /// holding the width it was built at and snapping on adoption — the
+    /// per-adoption width snap of the zoom shake (specs/zoom-shake.md).
+    /// WSCALE_FLAT (the offsets don't move) is the value for everything
+    /// that is not a zoom-curve line width.
+    wscale_q: u8 = WSCALE_FLAT,
+    _pad: [2]u8 = .{ 0, 0 },
     depth: f32, // paint-order depth in (0,1): later paint = smaller
 };
+
+/// wscale_q for "the offset does not vary with zoom".
+pub const WSCALE_FLAT: u8 = 128;
+
+/// Quantize a width slope (log2 of width ratio per zoom level) for
+/// Vertex.wscale_q: bias 128, 1/32 of a doubling per step, clamped to
+/// [-4, +3.97]. The worst quantization error is half a step — under 1.1%
+/// of width per level of drift, well below what the eye reads as a snap.
+pub fn wscaleQ(s: f64) u8 {
+    const q = @round(s * 32.0) + 128.0;
+    return @intFromFloat(std.math.clamp(q, 0, 255));
+}
+
+/// The slope a quantized wscale_q states.
+pub fn wscaleS(q: u8) f64 {
+    return (@as(f64, @floatFromInt(q)) - 128.0) / 32.0;
+}
 
 /// One textured-quad vertex (stream A): a sprite or an SDF glyph. Six per
 /// quad (two triangles), non-indexed. 40 bytes.
@@ -228,7 +254,14 @@ pub const Uniforms = extern struct {
     px_to_clip: [2]f32, // reference-px -> clip delta (the ox/oy channel)
     size_scale: f32, // pixel density x symbol size multiplier
     zoom: f32, // fractional zoom * 256, tested against zmin/zmax
-    zoom_t: f32, // fract(zoom): shader-side mix for zoom-interpolated paint
+    /// Camera zoom MINUS the scene's paint_zoom_floor. Equals fract(zoom)
+    /// whenever the scene's bracket matches the camera (the steady state);
+    /// mid-gesture it may leave [0, 1] while a rebuild is in flight. The
+    /// shaders CLAMP it for the zoom-interpolated paint mix and use it raw
+    /// for the line-width slope (Vertex.wscale_q), where extrapolating the
+    /// slope is the continuous answer and snapping back to a bracket end is
+    /// exactly the jump this field exists to remove.
+    zoom_t: f32,
     wrap_x: f32, // camera centre world-x (antimeridian wrap)
     rot_sin: f32,
     rot_cos: f32,
@@ -264,6 +297,9 @@ test "vertex attribute offsets match what the shaders declare" {
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(Vertex, "zmin"));
     try std.testing.expectEqual(@as(usize, 18), @offsetOf(Vertex, "zmax"));
     try std.testing.expectEqual(@as(usize, 20), @offsetOf(Vertex, "flags"));
+    // The width slope rides byte 1 of the same R32_UINT word the shaders
+    // already fetch for flags.
+    try std.testing.expectEqual(@as(usize, 21), @offsetOf(Vertex, "wscale_q"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(Vertex, "depth"));
 
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Quad, "x"));
@@ -283,6 +319,19 @@ test "vertex attribute offsets match what the shaders declare" {
     const v = Vertex{ .x = 0, .y = 0, .ox = 0, .oy = 0, .zmin = 0x1234, .zmax = 0x5678, .flags = 1, .depth = 0 };
     const word = std.mem.bytesAsValue(u32, std.mem.asBytes(&v)[16..20]).*;
     try std.testing.expectEqual(@as(u32, 0x5678_1234), word);
+}
+
+test "wscale quantizes around flat and clamps" {
+    try std.testing.expectEqual(WSCALE_FLAT, wscaleQ(0));
+    try std.testing.expectEqual(@as(f64, 0), wscaleS(WSCALE_FLAT));
+    // One doubling per level survives the round trip exactly.
+    try std.testing.expectEqual(@as(f64, 1), wscaleS(wscaleQ(1)));
+    try std.testing.expectEqual(@as(f64, -1), wscaleS(wscaleQ(-1)));
+    // Quantization error is bounded by half a step.
+    try std.testing.expect(@abs(wscaleS(wscaleQ(0.7)) - 0.7) <= 0.5 / 32.0);
+    // Saturation, not wraparound, at the extremes.
+    try std.testing.expectEqual(@as(u8, 0), wscaleQ(-100));
+    try std.testing.expectEqual(@as(u8, 255), wscaleQ(100));
 }
 
 test "zq quantizes and saturates" {

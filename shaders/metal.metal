@@ -43,7 +43,7 @@ struct Vertex {                 // scene.Vertex, 28 B
     ushort zmin;                // visible while zmin <= u.zoom <= zmax
     ushort zmax;
     uchar  flags;               // bit 0: map_align
-    uchar  pad0;
+    uchar  wscale;              // width slope: log2 per level, biased 128, 1/32 steps
     uchar  pad1;
     uchar  pad2;
     float  depth;               // paint-order depth (0,1), later = smaller
@@ -111,11 +111,14 @@ struct FillOut {
 // The zoom-interpolated pair: buffer(3) is the same property one integer
 // zoom up. When no layer needs one the host binds buffer(1) here too, so the
 // mix collapses to a no-op and costs a scene with no such property nothing.
+// zoom_t is CLAMPED here: mid-gesture it can leave [0,1] while the
+// re-bracketing rebuild is in flight, and holding the end color beats
+// wrapping to the far one.
 static inline float4 paint_of(const device Paint *lo, const device Paint *hi,
                               uint vid, constant U &u) {
     float4 a = float4(lo[vid].color) / 255.0;
     float4 b = float4(hi[vid].color) / 255.0;
-    return mix(a, b, u.zoom_t);
+    return mix(a, b, clamp(u.zoom_t, 0.0, 1.0));
 }
 
 vertex FillOut fill_vert(uint vid [[vertex_id]],
@@ -126,6 +129,12 @@ vertex FillOut fill_vert(uint vid [[vertex_id]],
     Vertex v = verts[vid];
     float4 clip = project(u, v.pos);
     float2 off = screen_offset(u, v.off, v.flags);
+    // The baked width slope: a zoom-curve line width keeps following the
+    // camera between rebuilds (scene.Vertex.wscale_q). wscale == 128 states
+    // slope 0 and the factor collapses to 1. zoom_t is deliberately NOT
+    // clamped — past the bracket the slope extrapolates, which is the
+    // continuous answer while the re-bracketing rebuild lands.
+    off *= exp2((float(v.wscale) - 128.0) * (1.0 / 32.0) * u.zoom_t);
     clip.xy += off * u.px_to_clip * u.size_scale * clip.w;
     clip.z = v.depth * clip.w; // paint-order depth (ortho: w = 1)
     FillOut out;

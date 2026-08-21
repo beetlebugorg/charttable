@@ -99,6 +99,11 @@ pub const Built = struct {
     paint_spans: []const PaintSpan = &.{},
     /// The zoom `paint` currently holds values for.
     paint_zoom: f64 = 0,
+    /// Some line layer's width is a zoom curve, so its offsets carry a baked
+    /// slope (Vertex.wscale_q) bracketed on paint_zoom_floor — the scene
+    /// goes stale when the camera's integer zoom leaves that bracket, the
+    /// same staleness paint_hi has.
+    width_zoom: bool = false,
 };
 
 const PaintKind = struct {
@@ -108,6 +113,16 @@ const PaintKind = struct {
     /// ...and it moves with the camera, so a zoom change must.
     zoom_dependent: bool,
 };
+
+/// True when this line layer's width follows the camera — the case whose
+/// baked offsets need a width slope (Vertex.wscale_q) so the drawn width
+/// keeps following the camera BETWEEN rebuilds. Without it the width holds
+/// what the build evaluated and snaps on adoption, which is the width half
+/// of the zoom shake (specs/zoom-shake.md).
+fn widthZoomy(sl: *const styles.Layer) bool {
+    const lp = sl.get("line-width") orelse return false;
+    return lp.class == .zoom_only or lp.class == .zoom_and_data;
+}
 
 /// True when this layer's color or opacity varies with BOTH zoom and the
 /// feature — the case that needs the interpolated pair.
@@ -824,6 +839,10 @@ pub fn buildSceneWithRasters(
         // a pair the shader mixes; nothing else can serve it.
         const zoom_data = !is_pattern and hasZoomAndData(sl);
         if (zoom_data) any_zoom_data = true;
+        // A zoom-curve line width bakes a slope instead of a still offset,
+        // and the slope is bracketed on zoom_floor like the paint pair.
+        const width_zoomy = sl.kind == .line and widthZoomy(sl);
+        if (width_zoomy) out.width_zoom = true;
 
         for (tiles) |st| {
             if (sl.source) |want| {
@@ -967,8 +986,36 @@ pub fn buildSceneWithRasters(
                         color.a *= @floatCast(std.math.clamp(asNum(ov, 1), 0, 1));
                         const wv = runProp(arena, &progs.width, &fields, view.zoom, sl, "line-width", &ctx, .{ .number = 1 }, &out.eval_errors);
                         const dash = dashArray(arena, resolveProp(sl, "line-dasharray"), &ctx, &out.eval_errors);
+                        const width_px = asNum(wv, 1);
+                        var baked_px = width_px;
+                        var wscale_q: u8 = types.WSCALE_FLAT;
+                        if (width_zoomy) {
+                            // The slope over the same integer bracket the
+                            // paint pair uses, per feature (the curve may be
+                            // data-driven too). Baked so that
+                            // drawn = baked * 2^(slope * zoom_t) passes
+                            // through the TRUE width at the build zoom and
+                            // keeps following the camera from there.
+                            const pv = resolveProp(sl, "line-width").?;
+                            var lo_ctx = eval_mod.Context{ .zoom = zoom_floor };
+                            lo_ctx.feature = mf.ref();
+                            var hi_ctx = eval_mod.Context{ .zoom = zoom_floor + 1 };
+                            hi_ctx.feature = mf.ref();
+                            const w_lo = asNum(evalProp(arena, pv, &lo_ctx, .{ .number = 1 }, &out.eval_errors), 1);
+                            const w_hi = asNum(evalProp(arena, pv, &hi_ctx, .{ .number = 1 }, &out.eval_errors), 1);
+                            if (w_lo > 0 and w_hi > 0) {
+                                wscale_q = types.wscaleQ(std.math.log2(w_hi / w_lo));
+                                const s = types.wscaleS(wscale_q);
+                                baked_px = width_px * std.math.exp2(-s * (view.zoom - zoom_floor));
+                            }
+                        }
                         try line.layoutLine(arena, f.parts, tl.extent, tile_span, px_per_unit, .{
-                            .width_px = @floatCast(asNum(wv, 1)),
+                            .width_px = @floatCast(baked_px),
+                            .wscale_q = wscale_q,
+                            // The dash pattern keeps measuring the style's
+                            // width: the baked correction is the shader's
+                            // business, not the pattern's.
+                            .dash_width_px = if (width_zoomy) @floatCast(width_px) else 0,
                             .cap = capOf(sl, arena, &ctx, &out.eval_errors),
                             .join = joinOf(sl, arena, &ctx, &out.eval_errors),
                             .dasharray = dash,
@@ -1373,8 +1420,12 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
         try paint.appendSlice(arena, b.paint);
         // Parts without a pair still need their rows in the hi stream, or
         // the two streams desynchronize and every later vertex mixes with
-        // someone else's color.
-        if (b.paint_hi.len == b.paint.len) {
+        // someone else's color. Only a part with a REAL pair makes the
+        // stream worth keeping: an empty part matching 0 == 0 must not — it
+        // made every concatenated scene carry (and upload) a full duplicate
+        // of stream B, and claim the integer-zoom bracket staleness that
+        // pair exists to track.
+        if (b.paint_hi.len > 0 and b.paint_hi.len == b.paint.len) {
             try paint_hi.appendSlice(arena, b.paint_hi);
             any_hi = true;
         } else {
@@ -1425,6 +1476,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
         out.compiled_props += b.compiled_props;
         out.paint_zoom = b.paint_zoom;
         out.paint_zoom_floor = b.paint_zoom_floor;
+        if (b.width_zoom) out.width_zoom = true;
     }
 
     std.mem.sort(types.Range, ranges.items, {}, struct {
@@ -2368,6 +2420,78 @@ test "buildScene: a zoom-and-data color bakes the pair the shader mixes" {
     }, .{});
     try std.testing.expect(b2.paint.len > 0);
     try std.testing.expectEqual(@as(usize, 0), b2.paint_hi.len);
+}
+
+// A zoom-curve line width cannot be baked still: the camera drifts from the
+// build zoom for the length of a gesture, and re-baking on adoption is the
+// width snap of specs/zoom-shake.md. The layout bakes a SLOPE instead
+// (Vertex.wscale_q), corrected so drawn = baked * 2^(slope * zoom_t) passes
+// through the true width at the build zoom.
+test "buildScene: a zoom-curve line width bakes a slope through the true width" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Exponential base 2 with stops 8 -> 1, 16 -> 256 is exactly w = 2^(z-8):
+    // the width doubles per level, so the slope is exactly one doubling.
+    const json =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "edges", "type": "line", "source": "chart",
+        \\   "source-layer": "lines",
+        \\   "paint": {"line-color": "#00ff00",
+        \\     "line-width": ["interpolate", ["exponential", 2], ["zoom"], 8, 1, 16, 256]}}]}
+    ;
+    var style = try styles.parse(std.testing.allocator, json);
+    defer style.deinit();
+
+    const tile = try testTile(a);
+    const id = coord.TileId{ .z = 10, .x = 0, .y = 0 };
+    const rect = id.worldRect();
+    const built = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 10.5,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{});
+
+    try std.testing.expect(built.width_zoom);
+    try std.testing.expect(built.vertices.len >= 4);
+    const v = built.vertices[0]; // the straight segment's first quad vertex
+    try std.testing.expect(v.flags & types.Flags.map_align != 0);
+    // Slope: log2(w(11)/w(10)) = log2(8/4) = 1 -> 128 + 32.
+    try std.testing.expectEqual(types.wscaleQ(1), v.wscale_q);
+    // Baked half-width: w(10.5) = 2^2.5, corrected by 2^(-1 * 0.5) -> 4 px
+    // wide, 2 px half-width.
+    const hw = @sqrt(@as(f64, v.ox) * v.ox + @as(f64, v.oy) * v.oy);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), hw, 1e-5);
+    // ...so the width the shader draws at the build zoom is the true one.
+    const t_build = 0.5;
+    try std.testing.expectApproxEqAbs(
+        std.math.pow(f64, 2.0, 2.5),
+        2.0 * hw * std.math.exp2(types.wscaleS(v.wscale_q) * t_build),
+        1e-5,
+    );
+
+    // A constant width bakes flat and claims no bracket.
+    const plain =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "edges", "type": "line", "source": "chart",
+        \\   "source-layer": "lines",
+        \\   "paint": {"line-color": "#00ff00", "line-width": 3}}]}
+    ;
+    var style2 = try styles.parse(std.testing.allocator, plain);
+    defer style2.deinit();
+    const b2 = try buildScene(a, &style2, &.{.{ .id = id, .tile = &tile }}, .{
+        .zoom = 10.5,
+        .origin = .{ .x = rect.x0, .y = rect.y0 },
+    }, .{});
+    try std.testing.expect(!b2.width_zoom);
+    try std.testing.expectEqual(types.WSCALE_FLAT, b2.vertices[0].wscale_q);
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 1.5),
+        @sqrt(@as(f64, b2.vertices[0].ox) * b2.vertices[0].ox + @as(f64, b2.vertices[0].oy) * b2.vertices[0].oy),
+        1e-6,
+    );
 }
 
 test "concatScenes: per-tile geometry plus a global symbol pass equals one build" {

@@ -28,7 +28,7 @@ are not negotiable — they are the struct layouts in scene/types.zig.
 | 0 | a_pos | R32G32_SFLOAT | 0 |
 | 1 | a_off | R32G32_SFLOAT | 8 |
 | 2 | a_zwin | R32_UINT | 16 | zmin \| zmax<<16 |
-| 3 | a_flags | R32_UINT | 20 | flags in the low byte |
+| 3 | a_flags | R32_UINT | 20 | flags low byte, wscale_q byte 1 |
 | 4 | a_depth | R32_SFLOAT | 24 |
 
 **Binding 0 — `scene.Quad`, stride 40** (sprite and sdf pipelines):

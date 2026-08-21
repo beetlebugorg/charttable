@@ -63,6 +63,8 @@ void main() {
     bool vis = zmin <= u.zoom && u.zoom <= zmax;
     gl_Position = vis ? clip : vec4(0.0, 0.0, 2.0, 1.0);
     v_uv = a_uv;
-    v_color = mix(a_color, a_color_hi, u.zoom_t);
+    // zoom_t clamped: mid-gesture it can leave [0,1] while the re-bracketing
+    // rebuild is in flight, and holding the end color beats wrapping.
+    v_color = mix(a_color, a_color_hi, clamp(u.zoom_t, 0.0, 1.0));
     v_weight = a_weight;
 }

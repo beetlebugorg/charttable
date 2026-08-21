@@ -837,11 +837,14 @@ pub const Map = struct {
         // mainstream map makes, and the eye agrees with it.
         if (drift >= 1.0) return true;
         if (drift != 0 and !self.gesturing()) return true;
-        // A zoom-interpolated paint pair brackets one integer zoom. Drift
-        // across that boundary and the two halves no longer bracket the
-        // camera, so the shader would mix the wrong pair.
+        // A zoom-interpolated paint pair — and a baked line-width slope —
+        // brackets one integer zoom. Drift across that boundary and the pair
+        // no longer brackets the camera (the shader clamps the mix), and the
+        // width slope extrapolates instead of tracking the style's curve; a
+        // rebuild re-brackets both. Fires mid-gesture too, which lands at
+        // the same once-per-level cadence as the drift rule above.
         if (self.built) |b| {
-            if (b.paint_hi.len > 0 and @floor(self.buildZoom()) != b.paint_zoom_floor) return true;
+            if ((b.paint_hi.len > 0 or b.width_zoom) and @floor(self.buildZoom()) != b.paint_zoom_floor) return true;
         }
         return false;
     }
@@ -1057,7 +1060,15 @@ pub const Map = struct {
             .px_to_clip = self.cam.pxToClip(),
             .size_scale = self.size_scale,
             .zoom = @floatFromInt(types.zq(self.cam.zoom)),
-            .zoom_t = @floatCast(self.cam.zoom - @floor(self.cam.zoom)),
+            // Relative to the SCENE'S bracket, not the camera's own floor:
+            // equal in the steady state, but mid-gesture the camera can
+            // cross an integer zoom while the re-bracketing rebuild is still
+            // in flight, and fract(zoom) would wrap — snapping every
+            // zoom-interpolated color to the far end of the pair and every
+            // baked width slope back to its base. Stated this way the slope
+            // extrapolates smoothly and the color mix clamps at the end it
+            // was already approaching (scene/types.zig Uniforms.zoom_t).
+            .zoom_t = @floatCast(self.cam.zoom - (if (self.built) |b| b.paint_zoom_floor else @floor(self.cam.zoom))),
             .wrap_x = @floatCast(cameras.wrapDx(self.cam.center.x, origin.x)),
             .rot_sin = rs[0],
             .rot_cos = rs[1],
@@ -1819,6 +1830,67 @@ test "Map: a zoom inside the band holds the scene; a big one rebuilds" {
     m.cam.setTarget();
     try settle(&m);
     try testing.expectEqual(@as(f64, 14), m.buildTargetZoom());
+}
+
+test "Map: a zoom-curve line width re-brackets on an integer crossing; a flat one does not" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    // The polygon's ring stroked by a line layer whose width doubles per
+    // level: the scene carries a baked width slope bracketed on the build's
+    // integer zoom (specs/zoom-shake.md).
+    const zoomy_style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "edges", "type": "line", "source": "chart",
+        \\   "source-layer": "areas",
+        \\   "paint": {"line-color": "#00ff00",
+        \\     "line-width": ["interpolate", ["exponential", 2], ["zoom"], 8, 1, 16, 256]}}]}
+    ;
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(zoomy_style);
+    _ = try m.bindSource("chart", stub.source(16));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14.75);
+    try settle(&m);
+    try testing.expect(m.scene().?.width_zoom);
+    try testing.expectEqual(@as(f64, 14), m.scene().?.paint_zoom_floor);
+
+    // Mid-gesture, inside coverage, drift under a level: normally no
+    // rebuild. But the camera's integer zoom has left the slope's bracket,
+    // and extrapolating forever tracks the wrong curve — so this DOES owe
+    // one.
+    m.zoomAt(0.35, 256, 256); // 14.75 -> 15.1, counts as gesture input
+    try testing.expect(m.needsRebuild());
+    // Until it lands, the uniform states the drift RELATIVE TO THE SCENE'S
+    // bracket — past 1.0, not wrapped to fract(zoom), so the shader's slope
+    // extrapolates instead of snapping.
+    try testing.expectApproxEqAbs(@as(f32, 1.1), m.uniforms().zoom_t, 1e-4);
+
+    // The same move under a constant width stays free.
+    const flat_style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]}},
+        \\ "layers": [{"id": "edges", "type": "line", "source": "chart",
+        \\   "source-layer": "areas",
+        \\   "paint": {"line-color": "#00ff00", "line-width": 2}}]}
+    ;
+    var m2 = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m2.deinit();
+    try m2.setStyleJson(flat_style);
+    _ = try m2.bindSource("chart", stub.source(16));
+    m2.setViewport(512, 512);
+    m2.setView(-76.4767, 38.9763, 14.75);
+    try settle(&m2);
+    try testing.expect(!m2.scene().?.width_zoom);
+    m2.zoomAt(0.35, 256, 256);
+    // ...and carries no phantom paint pair to re-bracket either (the empty
+    // global pass must not alias one in at concatenation).
+    try testing.expectEqual(@as(usize, 0), m2.scene().?.paint_hi.len);
+    try testing.expect(!m2.needsRebuild());
 }
 
 test "Map: a style swap rebuilds without refetching tiles" {

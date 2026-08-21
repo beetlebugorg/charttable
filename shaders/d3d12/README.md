@@ -17,7 +17,7 @@ Formats and offsets are the struct layouts in scene/types.zig.
 | TEXCOORD0 | a_pos | R32G32_FLOAT | 0 |
 | TEXCOORD1 | a_off | R32G32_FLOAT | 8 |
 | TEXCOORD2 | a_zwin | R32_UINT | 16 | zmin \| zmax<<16 |
-| TEXCOORD3 | a_flags | R32_UINT | 20 | flags in the low byte |
+| TEXCOORD3 | a_flags | R32_UINT | 20 | flags low byte, wscale_q byte 1 |
 | TEXCOORD4 | a_depth | R32_FLOAT | 24 |
 
 **Slot 0 — `scene.Quad`, stride 40** (sprite and sdf pipelines):
