@@ -38,10 +38,6 @@ extern "C" {
 #define CHARTTABLE_ERR_MEMORY (-6)
 #define CHARTTABLE_ERR_UNSUPPORTED (-7)
 
-/* How to interpret the pointer passed to charttable_attach_surface. */
-#define CHARTTABLE_NATIVE_NONE 0        /* offscreen only (snapshots)      */
-#define CHARTTABLE_NATIVE_METAL_LAYER 1 /* CAMetalLayer* (macOS and iOS)   */
-
 typedef struct charttable charttable;
 
 typedef struct {

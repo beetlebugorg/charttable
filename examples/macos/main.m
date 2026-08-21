@@ -215,6 +215,12 @@ static NSData *applyMariner(NSData *styleJson, MarinerSettings m) {
     return [NSJSONSerialization dataWithJSONObject:style options:0 error:nil];
 }
 
+// Shared by both build configurations: the map handle the async callbacks
+// answer into, and the sprite density they rasterized at. These lived inside
+// the compose block below, which left the PLAIN build with no g_map at all.
+static charttable *g_map;
+static double g_asset_ratio = 1.0;
+
 #ifdef USE_TILE57_COMPOSE
 /// Build the style the way tile57 does: template + mariner + colortables,
 /// with the SCAMIN manifest so the `_scamin` layers split into per-value
@@ -294,8 +300,6 @@ static size_t collectScamin(NSString *dir, int32_t **out, double *out_lat) {
 static tile57_compose *g_compose;
 static double g_compose_ms;   // benchmark attribution: time spent composing
 static int g_compose_n;
-static charttable *g_map;
-static double g_asset_ratio = 1.0;
 static double g_symbol_ms;   // benchmark attribution: inline symbol rasterization
 static int g_symbol_n;
 
@@ -430,6 +434,15 @@ static NSData *fetchURL(NSString *url) {
 /// those are reported rather than guessed at.
 static NSString *resolveURL(NSString *ref, NSString *base) {
     if (!ref) return nil;
+    // The array sprite form ([{id,url},…]) is tier 2; take the LAST sheet's
+    // url so a style that layers a nautical sheet over a base sheet at least
+    // resolves the one it draws seamarks from.
+    if ([ref isKindOfClass:NSArray.class]) {
+        NSDictionary *entry = ((NSArray *)ref).lastObject;
+        ref = [entry isKindOfClass:NSDictionary.class] ? entry[@"url"] : nil;
+        if (!ref) return nil;
+    }
+    if (![ref isKindOfClass:NSString.class]) return nil;
     if (isURL(ref)) return ref;
     if ([ref hasPrefix:@"mapbox://"]) { NSLog(@"cannot resolve %@ (no token)", ref); return nil; }
     if (!base) return ref;
@@ -1213,6 +1226,89 @@ int main(int argc, const char *argv[]) {
                   @"%.1f%% over 16.7 ms",
                   n, total, ms[n / 2], ms[(int)(n * 0.95)], ms[(int)(n * 0.99)], ms[n - 1],
                   100.0 * over / n);
+            return 0;
+        }
+
+        // CHARTTABLE_ZOOMSHAKE=1: script an eased zoom offscreen and measure
+        // the frame-to-frame DISPLACEMENT of the picture's centre. A smooth
+        // zoom about the centre shifts it nowhere; a shake shows up as the
+        // shift oscillating. Run with CT_MAP_TRACE=1 and the adoption lines
+        // interleave, which ties a jump to the scene swap it rode in on.
+        if (getenv("CHARTTABLE_ZOOMSHAKE")) {
+            const uint32_t W = 1024, H = 768;
+            if (charttable_attach_surface(map, CHARTTABLE_NATIVE_NONE, NULL, W, H) != CHARTTABLE_OK) {
+                NSLog(@"offscreen surface failed"); return 1;
+            }
+            charttable_set_pixel_density(map, 1.0f);
+            charttable_resize(map, W, H);
+            for (int i = 0; i < 4000 && !charttable_idle(map); i++) {
+                charttable_tick(map, 16);
+                usleep(1000);
+            }
+            // A 48x48 patch at the exact centre: at dz 0.04 per frame the
+            // scale moves its edges under 1 px, so any larger match offset is
+            // real displacement, not the zoom.
+            enum { FRAMES = 220, PATCH = 48, SHIFT = 6 };
+            NSMutableData *px = [NSMutableData dataWithLength:(size_t)W * H * 4];
+            static double prev[PATCH][PATCH];
+            BOOL havePrev = NO;
+            for (int i = 0; i < FRAMES; i++) {
+                double zs_dz = strcmp(getenv("CHARTTABLE_ZOOMSHAKE"), "out") == 0 ? -0.04 : 0.04;
+                if (i < 100) charttable_zoom_toward(map, zs_dz, W / 2.0f, H / 2.0f);
+                charttable_tick(map, 1000.0 / 60.0);
+                if (charttable_needs_redraw(map)) charttable_render(map);
+                if (charttable_snapshot_rgba(map, px.mutableBytes, px.length) != CHARTTABLE_OK)
+                    continue;
+                const uint8_t *p8 = px.bytes;
+                double cur[PATCH][PATCH];
+                for (int y = 0; y < PATCH; y++) {
+                    for (int x = 0; x < PATCH; x++) {
+                        const uint8_t *q = p8 + (((size_t)H / 2 - PATCH / 2 + y) * W +
+                                                 (W / 2 - PATCH / 2 + x)) * 4;
+                        cur[y][x] = q[0] * 0.299 + q[1] * 0.587 + q[2] * 0.114;
+                    }
+                }
+                if (havePrev) {
+                    int bestDx = 0, bestDy = 0;
+                    double best = 1e300;
+                    double zeroSad = 0;
+                    for (int dy = -SHIFT; dy <= SHIFT; dy++) {
+                        for (int dx = -SHIFT; dx <= SHIFT; dx++) {
+                            double sad = 0;
+                            for (int y = SHIFT; y < PATCH - SHIFT; y++)
+                                for (int x = SHIFT; x < PATCH - SHIFT; x++)
+                                    sad += fabs(cur[y][x] - prev[y + dy][x + dx]);
+                            if (dx == 0 && dy == 0) zeroSad = sad;
+                            if (sad < best) { best = sad; bestDx = dx; bestDy = dy; }
+                        }
+                    }
+                    charttable_view cur_v;
+                    charttable_get_view(map, &cur_v);
+                    // ratio >> 1 with a nonzero shift = the frame truly moved;
+                    // ratio ~1 = content changed in place (a rebuild's new
+                    // detail) and the shift is noise.
+                    NSLog(@"zoomshake: frame %3d zoom %.3f shift %+d,%+d ratio %.2f", i,
+                          cur_v.zoom, bestDx, bestDy, best > 0 ? zeroSad / best : 1.0);
+                }
+                if (getenv("CHARTTABLE_ZOOMSHAKE_DUMP") && i >= 28 && i <= 40) {
+                    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                    CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, W, H, 8, W * 4, cs,
+                                                             kCGImageAlphaPremultipliedLast);
+                    CGImageRef img = CGBitmapContextCreateImage(ctx);
+                    NSString *path = [NSString stringWithFormat:@"%s/zf%03d.png",
+                                      getenv("CHARTTABLE_ZOOMSHAKE_DUMP"), i];
+                    NSURL *url = [NSURL fileURLWithPath:path];
+                    CGImageDestinationRef dst = CGImageDestinationCreateWithURL(
+                        (__bridge CFURLRef)url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
+                    CGImageDestinationAddImage(dst, img, NULL);
+                    CGImageDestinationFinalize(dst);
+                    CFRelease(dst); CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
+                }
+                memcpy(prev, cur, sizeof cur);
+                havePrev = YES;
+                usleep(16000);
+            }
+            charttable_close(map);
             return 0;
         }
 
