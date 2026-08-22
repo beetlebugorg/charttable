@@ -405,10 +405,14 @@ pub const Gpu = struct {
 
     /// The quad half of the same contract: a raster cross-fade rewrites the
     /// quad paint stream's alphas frame by frame, and nothing else moves.
+    /// A missing scene or a mismatched stream length is treated as a no-op
+    /// rather than an error. A fade tick can race a scene swap, and the
+    /// Vulkan and D3D12 backends already ignore that case silently; Metal
+    /// was the only backend turning it into a frame error.
     pub fn updateQuadPaint(self: *Gpu, quad_paint: []const scene.PaintVertex) !void {
-        const s = if (self.scene) |*sc| sc else return error.NoScene;
-        const buf = s.qpbuf orelse return error.NoScene;
-        if (quad_paint.len != s.quad_vert_count) return error.PaintStreamMismatch;
+        const s = if (self.scene) |*sc| sc else return;
+        const buf = s.qpbuf orelse return;
+        if (quad_paint.len != s.quad_vert_count) return;
         const bytes = std.mem.sliceAsBytes(quad_paint);
         if (mc.ctm_write_buffer(buf, bytes.ptr, bytes.len) == 0) return error.MetalFailure;
     }

@@ -225,11 +225,10 @@ fragment float4 sprite_frag(QuadOut in [[stage_in]],
                             sampler smp [[sampler(0)]]) {
     // Authored colours MODULATED by the paint stream: every symbol bakes
     // white there, so a sprite keeps its texels, while a raster tile mid
-    // cross-fade rides its ramping alpha (map_object.tickFade). A fully
-    // transparent fragment must not reach the depth buffer — a raster tile
-    // drawn through this pipeline WITH depth write is transparent outside
-    // its coverage, and those pixels would otherwise cut holes in content
-    // underneath; the same discard removes a fully faded tile outright.
+    // cross-fade rides its ramping alpha (map_object.tickFade). Fully
+    // transparent fragments are DISCARDED: no quad pipeline writes depth,
+    // but a faded-out tile's pixels would still blend for nothing, and the
+    // discard removes a fully faded tile outright.
     float4 c = atlas.sample(smp, in.uv) * in.color;
     if (c.a < (1.0 / 255.0)) discard_fragment();
     return c;

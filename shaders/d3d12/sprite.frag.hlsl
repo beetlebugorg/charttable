@@ -1,10 +1,9 @@
 // Authored colors MODULATED by the paint stream: every symbol bakes white
 // there, so a sprite keeps its texels, while a raster tile mid cross-fade
-// rides its ramping alpha (map_object.tickFade). A fully transparent
-// fragment must not reach the depth buffer -- a raster tile drawn through
-// this pipeline WITH depth write is transparent outside its coverage, and
-// those pixels would otherwise cut holes in what is underneath; the same
-// discard removes a fully faded tile outright.
+// rides its ramping alpha (map_object.tickFade). Fully transparent
+// fragments are DISCARDED: no quad pipeline writes depth, but a faded-out
+// tile's pixels would still blend for nothing, and the discard removes a
+// fully faded tile outright.
 
 Texture2D    atlas     : register(t0);
 SamplerState atlas_smp : register(s0);
