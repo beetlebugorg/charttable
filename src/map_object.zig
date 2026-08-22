@@ -310,6 +310,10 @@ pub const Map = struct {
     /// Updates spent waiting on tile supply for the next rebuild
     /// (SUPPLY_WAIT). Reset whenever a build starts.
     supply_wait: u32 = 0,
+    /// Signature of the wanted set that supply_wait is timing. The clock
+    /// resets when the set changes and keeps running when the same set is
+    /// chosen again.
+    wanted_sig: u64 = 0,
     build_style: ?*const styles.Style = null,
     build_in: BuildInputs = .{ .origin = .{ .x = 0, .y = 0 }, .zoom = 0, .budget = 0, .blank = true },
     staged: Staged = .{},
@@ -696,6 +700,21 @@ pub const Map = struct {
         if (coverage_broke) {
             self.wanted.clearRetainingCapacity();
             try self.visibleTiles(&self.wanted);
+            // Reset the deadline only when the set actually changed. A
+            // multi-level gesture would otherwise accrue the wait across
+            // every level it passed through, and the final level would adopt
+            // a partial scene immediately instead of getting its own
+            // SUPPLY_WAIT. The comparison matters in the other direction
+            // too: re-choosing the same set (any dirty rebuild inside
+            // coverage) must not reset the clock, or a gesture that marks
+            // the map dirty every update would keep the deadline at zero and
+            // it would never fire.
+            var sig: u64 = @intCast(self.wanted.items.len);
+            for (self.wanted.items) |k| sig ^= k *% 0x9E3779B97F4A7C15;
+            if (sig != self.wanted_sig) {
+                self.wanted_sig = sig;
+                self.supply_wait = 0;
+            }
         }
         // Asking every frame is also what holds the set against eviction.
         for (self.wanted.items) |k| _ = self.cache.want(@bitCast(k));
@@ -776,15 +795,23 @@ pub const Map = struct {
         //
         // A tile that came back empty or failed is ANSWERED and is not
         // pending, so a view over open water is never held back.
-        if (self.built != null and self.pendingWanted() > 0) {
-            self.supply_wait += 1;
-            // Half the set is the floor: adopting three tiles of fifty
-            // replaces a stale-but-whole picture with mostly background,
-            // which is strictly worse than waiting the tail out.
-            const enough = have.items.len * 2 >= self.wanted.items.len;
-            if (self.supply_wait <= SUPPLY_WAIT or !enough) {
-                if (tr) self.traceLine("await-tiles", @intCast(have.items.len));
-                return tick;
+        if (self.built != null) {
+            const pending = self.pendingWanted();
+            if (pending > 0) {
+                self.supply_wait += 1;
+                // Wait until at least half of the set has been answered.
+                // Adopting three tiles out of fifty would replace a stale
+                // but complete picture with mostly background, which is
+                // worse than waiting. Count answered tiles rather than
+                // resident ones: over sparse coverage most answers are
+                // "empty tile", and a floor counting only resident tiles
+                // could never be reached.
+                const answered = self.wanted.items.len - pending;
+                const enough = answered * 2 >= self.wanted.items.len;
+                if (self.supply_wait <= SUPPLY_WAIT or !enough) {
+                    if (tr) self.traceLine("await-tiles", @intCast(have.items.len));
+                    return tick;
+                }
             }
         }
 
