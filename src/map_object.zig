@@ -1158,6 +1158,17 @@ pub const Map = struct {
         return !self.busy();
     }
 
+    /// The scene itself is being constructed: no scene yet, or a build worker
+    /// (whole or partial) is running. UNLIKE `busy`, this ignores tiles still
+    /// in flight. A vector chart's tiles are local and arrive at once, so the
+    /// two agree; a web map streams tiles continuously, and treating that
+    /// stream as "building" would leave a build indicator up for as long as
+    /// the map is looked at. This answers the narrower question a progress
+    /// pill actually wants: is there a picture to show yet.
+    pub fn buildingScene(self: *const Map) bool {
+        return self.built == null or self.building or self.partial;
+    }
+
     pub fn scene(self: *const Map) ?*const Built {
         return if (self.built) |*b| b else null;
     }
