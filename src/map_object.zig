@@ -1354,6 +1354,22 @@ pub const Map = struct {
         return self.visibleTilesAt(self.buildZoom(), out);
     }
 
+    /// Whether the STYLE references the source bound at cache index `si`.
+    /// A style swap must stop asking for the old style's tiles: bindings
+    /// outlive the swap (a chart-link session binds its own providers, and
+    /// the host's own source stays bound underneath), and fetching tiles no
+    /// layer can draw wastes the supply at best — at worst, when the old
+    /// provider has stopped answering, it parks every rebuild forever
+    /// behind tiles nobody will ever send.
+    fn sourceInStyle(self: *const Map, si: usize) bool {
+        const style = if (self.style) |*s| s else return true;
+        for (self.bound.items) |b| {
+            if (b.index == si) return style.sources.get(b.name) != null;
+        }
+        // Bound without a name to check against: keep asking.
+        return true;
+    }
+
     /// The tiles covering the view at an arbitrary zoom. The build uses the
     /// build zoom; the prefetch uses where the camera is heading, which is not
     /// the same thing on the way in.
@@ -1365,6 +1381,7 @@ pub const Map = struct {
         const cy = self.cam.center.y;
 
         for (self.cache.sources.items, 0..) |src, si| {
+            if (!self.sourceInStyle(si)) continue;
             // A 256-px source is sampled a level deeper so its pixels land
             // at the same density as a 512-px one (see Source.tile_size).
             const tz: u8 = @intCast(std.math.clamp(
@@ -3226,9 +3243,22 @@ test "Map: a shallow source does not cap the build zoom" {
     var deep = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
     var shallow = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
 
+    // Both sources DECLARED: only sources the style names are asked for
+    // tiles at all (sourceInStyle).
+    const two_source_style =
+        \\{"version": 8,
+        \\ "sources": {"chart": {"type": "vector", "tiles": ["x/{z}/{x}/{y}"]},
+        \\             "overlay": {"type": "vector", "tiles": ["y/{z}/{x}/{y}"]}},
+        \\ "layers": [
+        \\   {"id": "bg", "type": "background", "paint": {"background-color": "#112233"}},
+        \\   {"id": "areas", "type": "fill", "source": "chart", "source-layer": "areas",
+        \\    "paint": {"fill-color": "#00ff00"}},
+        \\   {"id": "over", "type": "fill", "source": "overlay", "source-layer": "areas",
+        \\    "paint": {"fill-color": "#0000ff"}}]}
+    ;
     var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
     defer m.deinit();
-    try m.setStyleJson(test_style);
+    try m.setStyleJson(two_source_style);
     _ = try m.bindSource("chart", deep.source(14));
     _ = try m.bindSource("overlay", shallow.source(8));
     m.setViewport(512, 512);
@@ -3243,6 +3273,36 @@ test "Map: a shallow source does not cap the build zoom" {
     for (m.resident.items) |k| levels[@as(caches.Key, @bitCast(k)).tileId().z] = true;
     try testing.expect(levels[13]); // the deep source, at the build zoom
     try testing.expect(levels[8]); // the overlay, overzoomed from its own max
+}
+
+// The switch-away half of a chart-link session: bindings outlive a style
+// swap, and a source the NEW style does not name must not be asked for
+// tiles — its provider may have stopped answering, and a wanted tile nobody
+// answers parks every rebuild forever (the "blank chart until restart" bug).
+test "Map: a bound source the style does not name is not asked" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var live = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+    var stale = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style); // names only "chart"
+    _ = try m.bindSource("chart", live.source(14));
+    _ = try m.bindSource("gone-with-the-old-style", stale.source(14));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 14);
+    try settle(&m);
+
+    // The map settled — nothing waits on the unnamed source — and that
+    // source was never fetched from at all.
+    try testing.expect(m.idle());
+    try testing.expectEqual(@as(u32, 0), stale.asked.load(.monotonic));
+    try testing.expect(live.asked.load(.monotonic) > 0);
+    for (m.resident.items) |k| {
+        try testing.expectEqual(@as(u3, 0), @as(caches.Key, @bitCast(k)).source);
+    }
 }
 
 test "Map: a raster source alongside a vector one does not blank the scene" {
