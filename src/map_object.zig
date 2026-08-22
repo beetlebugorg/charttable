@@ -79,6 +79,18 @@ pub const GESTURE_HOLD: u32 = 15;
 /// Counted in updates like GESTURE_HOLD, because charttable reads no clock.
 pub const FADE_UPDATES: u32 = 15;
 
+/// Updates a rebuild waits for its COMPLETE tile set before giving up and
+/// adopting what has landed — about three quarters of a second at 60 Hz.
+///
+/// Waiting for the whole set is what stops the chart visibly assembling
+/// itself tile by tile, and on a fast source the wait is a few frames. But
+/// supply is not always fast: a cold cache over a boat's connection takes
+/// tens of seconds for a full viewport, and one stalled tile must not hold
+/// the whole level back that long — that reads as "zoom does nothing".
+/// After the deadline the scene adopts progressively, at most one adoption
+/// per deadline, until the set completes and the final swap lands.
+pub const SUPPLY_WAIT: u32 = 45;
+
 pub const Options = struct {
     cache: caches.Options = .{},
     overscan: f64 = OVERSCAN,
@@ -295,6 +307,9 @@ pub const Map = struct {
     build_fade_sources: u8 = 0,
     /// Updates left in the live scene's raster cross-fade; 0 = none.
     fade_left: u32 = 0,
+    /// Updates spent waiting on tile supply for the next rebuild
+    /// (SUPPLY_WAIT). Reset whenever a build starts.
+    supply_wait: u32 = 0,
     build_style: ?*const styles.Style = null,
     build_in: BuildInputs = .{ .origin = .{ .x = 0, .y = 0 }, .zoom = 0, .budget = 0, .blank = true },
     staged: Staged = .{},
@@ -744,7 +759,7 @@ pub const Map = struct {
             return tick;
         }
 
-        // Build only when the whole tile set is in hand.
+        // Build only when the whole tile set is in hand — up to a deadline.
         //
         // Rebuilding through a gesture is what keeps the chart sharp, but
         // the tiles for a new level arrive over many frames, and adopting a
@@ -753,11 +768,24 @@ pub const Map = struct {
         // complete set means one swap per level instead of a dozen, and the
         // scene already on screen keeps projecting correctly meanwhile.
         //
+        // But only up to SUPPLY_WAIT. On a slow source the complete set is
+        // tens of seconds away, and one stalled tile must not make the zoom
+        // look dead the whole time. Past the deadline the scene adopts what
+        // is here — at most one adoption per deadline, so slow supply fills
+        // in visibly but calmly rather than at every arrival.
+        //
         // A tile that came back empty or failed is ANSWERED and is not
         // pending, so a view over open water is never held back.
         if (self.built != null and self.pendingWanted() > 0) {
-            if (tr) self.traceLine("await-tiles", @intCast(have.items.len));
-            return tick;
+            self.supply_wait += 1;
+            // Half the set is the floor: adopting three tiles of fifty
+            // replaces a stale-but-whole picture with mostly background,
+            // which is strictly worse than waiting the tail out.
+            const enough = have.items.len * 2 >= self.wanted.items.len;
+            if (self.supply_wait <= SUPPLY_WAIT or !enough) {
+                if (tr) self.traceLine("await-tiles", @intCast(have.items.len));
+                return tick;
+            }
         }
 
         // &self.style.?, NOT &style: the local is a COPY of the optional's
@@ -1392,6 +1420,7 @@ pub const Map = struct {
         self.build_have.clearRetainingCapacity();
         try self.build_have.appendSlice(self.gpa, have);
         try self.chooseFades(have);
+        self.supply_wait = 0;
         self.build_style = style;
         self.build_in = self.buildInputs();
         self.staged = .{};
@@ -2601,6 +2630,72 @@ test "Map: a raster source draws as world-space quads in style order" {
         if (d.pipeline == .raster) saw_raster = true;
     }
     try testing.expect(saw_raster);
+}
+
+/// Answers every tile instantly except ONE z14 tile it claims and holds
+/// until the test releases it — the stalled straggler of a slow source.
+const StragglerSource = struct {
+    bytes: []const u8,
+    hold: std.atomic.Value(bool) = .init(false),
+    claimed: std.atomic.Value(bool) = .init(false),
+
+    fn fetch(ptr: ?*anyopaque, gpa: Allocator, id: coord.TileId) caches.Fetch {
+        const self: *StragglerSource = @ptrCast(@alignCast(ptr.?));
+        if (id.z == 14 and self.hold.load(.acquire)) {
+            if (self.claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                while (self.hold.load(.acquire)) @import("util/lock.zig").sleepMs(1);
+            }
+        }
+        return .{ .bytes = gpa.dupe(u8, self.bytes) catch return .failed };
+    }
+
+    fn source(self: *StragglerSource, maxzoom: u8) caches.Source {
+        return .{ .ptr = self, .fetch = fetch, .encoding = .mvt, .maxzoom = maxzoom };
+    }
+};
+
+test "Map: one stalled tile stops holding the level back after the supply deadline" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var stub = StragglerSource{ .bytes = try stubTileBytes(arena.allocator()) };
+
+    var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+    defer m.deinit();
+    try m.setStyleJson(test_style);
+    _ = try m.bindSource("chart", stub.source(16));
+    m.setViewport(512, 512);
+    m.setView(-76.4767, 38.9763, 13);
+    try settle(&m);
+    const gen13 = m.scene_generation;
+
+    // Zoom a level with one tile of the new set stalled: the rebuild waits
+    // for the whole set first...
+    stub.hold.store(true, .release);
+    m.setView(-76.4767, 38.9763, 14);
+    var spins: u32 = 0;
+    while (spins < SUPPLY_WAIT / 2) : (spins += 1) {
+        _ = try m.update();
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try testing.expectEqual(gen13, m.scene_generation); // still waiting: no half-built swap yet
+
+    // ...but not forever. Past the deadline the level adopts without the
+    // straggler, and the map honestly stays busy for the tail.
+    spins = 0;
+    while (m.scene_generation == gen13 and spins < 2000) : (spins += 1) {
+        _ = try m.update();
+        @import("util/lock.zig").sleepMs(1);
+    }
+    try testing.expect(m.scene_generation > gen13);
+    try testing.expect(m.pendingWanted() > 0);
+    try testing.expect(!m.idle());
+
+    // The straggler lands, and the final complete swap follows.
+    stub.hold.store(false, .release);
+    try settle(&m);
+    try testing.expectEqual(@as(usize, 0), m.pendingWanted());
+    try testing.expectEqual(m.wanted.items.len, m.resident.items.len);
 }
 
 test "Map: a raster level swap cross-fades instead of snapping" {
