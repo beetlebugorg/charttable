@@ -769,8 +769,9 @@ test "spec expression conformance suite" {
     outer: while (try walker.next(io)) |entry| {
         if (entry.kind != .file or !std.mem.eql(u8, entry.basename, "test.json")) continue;
         score.total += 1;
+        // The walker's paths carry the native separator.
         for (skip_ops) |s| {
-            if (std.mem.startsWith(u8, entry.path, s) and entry.path.len > s.len and entry.path[s.len] == '/') {
+            if (std.mem.startsWith(u8, entry.path, s) and entry.path.len > s.len and entry.path[s.len] == std.fs.path.sep) {
                 score.skipped += 1;
                 continue :outer;
             }
@@ -782,7 +783,9 @@ test "spec expression conformance suite" {
             score.fail_parse += 1;
             continue;
         };
-        const detail = runFixture(arena, &score, doc, std.mem.startsWith(u8, entry.path, "distance/")) catch |e| switch (e) {
+        const distance_fixture = std.mem.startsWith(u8, entry.path, "distance") and
+            entry.path.len > "distance".len and entry.path["distance".len] == std.fs.path.sep;
+        const detail = runFixture(arena, &score, doc, distance_fixture) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Malformed, error.Unsupported => {
                 score.skipped += 1;
