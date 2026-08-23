@@ -173,22 +173,35 @@ fn findEntry(dir: []const Entry, tid: u64) ?usize {
 
 // ---- gzip -------------------------------------------------------------------
 
-/// gzip-decompress `data`; caller owns the result. Decompress only — the
-/// compress side stayed in tile57 (charttable never writes archives).
-fn gunzip(gpa: Allocator, data: []const u8) ![]u8 {
+// Decompressed-size ceilings. gzip reaches roughly 1000:1 on a run of zeros,
+// so a few kilobytes on disk can ask for gigabytes in memory. Every gunzip
+// here names the largest OUTPUT it is willing to hold. The numbers are far
+// above any real archive: the largest chart directory measured is under a
+// megabyte, metadata is a short JSON document, and a tile that decompresses
+// past 32 MiB has more geometry than a screen can use.
+const max_directory_bytes: usize = 64 << 20;
+const max_metadata_bytes: usize = 4 << 20;
+const max_tile_bytes: usize = 32 << 20;
+
+/// gzip-decompress `data` into at most `max` bytes; caller owns the result.
+/// Decompress only — the compress side stayed in tile57 (charttable never
+/// writes archives). A stream that keeps producing past `max` is Malformed:
+/// the reader stops there instead of growing the buffer to fit it.
+fn gunzip(gpa: Allocator, data: []const u8, max: usize) ![]u8 {
     var in = std.Io.Reader.fixed(data);
     var window: [flate.max_window_len]u8 = undefined;
     var d = flate.Decompress.init(&in, .gzip, &window);
-    return d.reader.allocRemaining(gpa, .unlimited) catch |err| switch (err) {
+    return d.reader.allocRemaining(gpa, .limited(max)) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => error.Malformed, // truncated or corrupt gzip stream
+        // Truncated, corrupt, or a decompression bomb over `max`.
+        else => error.Malformed,
     };
 }
 
-fn maybeDecompress(a: Allocator, data: []const u8, comp: Compression) ![]const u8 {
+fn maybeDecompress(a: Allocator, data: []const u8, comp: Compression, max: usize) ![]const u8 {
     return switch (comp) {
         .none => data,
-        .gzip => try gunzip(a, data),
+        .gzip => try gunzip(a, data, max),
         else => error.UnsupportedCompression,
     };
 }
@@ -313,7 +326,7 @@ pub const Reader = struct {
     fn decodeDir(r: *Reader, off: u64, len: u64) ![]Entry {
         const scratch = r.arena.child_allocator;
         const comp = r.header.internal_compression;
-        const raw = try maybeDecompress(scratch, try r.slice(off, len), comp);
+        const raw = try maybeDecompress(scratch, try r.slice(off, len), comp, max_directory_bytes);
         defer if (comp != .none) scratch.free(@constCast(raw));
         return deserializeDir(r.arena.allocator(), raw);
     }
@@ -361,7 +374,7 @@ pub const Reader = struct {
         const comp = (try r.getCompressed(z, x, y)) orelse return null;
         return switch (r.header.tile_compression) {
             .none => try gpa.dupe(u8, comp),
-            .gzip => try gunzip(gpa, comp),
+            .gzip => try gunzip(gpa, comp, max_tile_bytes),
             else => error.UnsupportedCompression,
         };
     }
@@ -373,7 +386,7 @@ pub const Reader = struct {
         const raw = try r.slice(r.header.metadata_offset, r.header.metadata_length);
         return switch (r.header.internal_compression) {
             .none => try gpa.dupe(u8, raw),
-            .gzip => try gunzip(gpa, raw),
+            .gzip => try gunzip(gpa, raw, max_metadata_bytes),
             else => error.UnsupportedCompression,
         };
     }
@@ -759,4 +772,30 @@ test "open() maps a real ENC archive when present (integration; skipped without 
         }
     }
     try std.testing.expect(found);
+}
+
+test "gunzip refuses a stream that decompresses past its ceiling" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    // 4 MiB of zeros gzips to a couple of kilobytes: the classic shape of a
+    // decompression bomb, at a size a test can hold.
+    const plain = try arena.allocator().alloc(u8, 4 << 20);
+    @memset(plain, 0);
+    const packed_bytes = try testGzip(arena.allocator(), plain);
+    try std.testing.expect(packed_bytes.len < 64 * 1024);
+
+    // Under the ceiling it decompresses normally.
+    const out = try gunzip(a, packed_bytes, 8 << 20);
+    defer a.free(out);
+    try std.testing.expectEqual(plain.len, out.len);
+
+    // Over it, the reader stops instead of growing the buffer to fit.
+    try std.testing.expectError(error.Malformed, gunzip(a, packed_bytes, 64 * 1024));
+    try std.testing.expectError(error.Malformed, gunzip(a, packed_bytes, 0));
+
+    // The three call-site ceilings are the ones actually wired up.
+    try std.testing.expect(max_metadata_bytes < max_tile_bytes);
+    try std.testing.expect(max_tile_bytes < max_directory_bytes);
 }

@@ -398,6 +398,9 @@ pub const PmtilesLibrary = struct {
     }
 };
 
+/// How many sources one Cache can hold, fixed by the width of `Key.source`.
+pub const max_sources: usize = 1 << @bitSizeOf(@FieldType(Key, "source"));
+
 /// One cached tile, addressed by source index and tile id. 64 bits so the
 /// slot table keys on a scalar.
 pub const Key = packed struct(u64) {
@@ -524,9 +527,14 @@ pub const Cache = struct {
         if (r.payload == .vector) self.gpa.destroy(r.payload.vector);
     }
 
-    pub fn addSource(self: *Cache, src: Source) Allocator.Error!usize {
+    pub fn addSource(self: *Cache, src: Source) error{ OutOfMemory, TooManySources }!usize {
         const i = self.sources.items.len;
-        std.debug.assert(i < 8); // Key.source is 3 bits
+        // Key.source is 3 bits, so index 8 does not fit. This used to be a
+        // std.debug.assert, which is compiled out of ReleaseFast: the append
+        // then succeeded, Key.of truncated the index, and source 8 shared a
+        // cache key with source 0 -- one source's tiles served as another's.
+        // Refuse the bind instead, in every optimization mode.
+        if (i >= max_sources) return error.TooManySources;
         try self.sources.append(self.gpa, src);
         return i;
     }

@@ -664,7 +664,11 @@ fn mapAligned(sl: *const styles.Layer, name: []const u8, placement: Placement, a
 /// pick drops whole hatch strokes at that ratio.
 fn patternCell(arena: std.mem.Allocator, sp: *const sprites.Sprite, name: []const u8) ?types.PatternCell {
     const rect = sp.cell(name) orelse return null;
-    if (rect.w == 0 or rect.h == 0 or !(rect.pixel_ratio > 0)) return null;
+    // Not just "> 0": the divide below turns a denormal ratio into a value
+    // no integer type holds, and @intFromFloat traps on it. sprites bounds
+    // the band at its two entry points; this keeps the trap from depending
+    // on that being true.
+    if (rect.w == 0 or rect.h == 0 or !sprites.validRatio(rect.pixel_ratio)) return null;
     const ratio: f64 = rect.pixel_ratio;
     const dw: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(rect.w)) / ratio))));
     const dh: u32 = @max(1, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(rect.h)) / ratio))));
@@ -3043,4 +3047,36 @@ test "buildScene: layer zoom bounds gate at fractional zoom" {
     const hi = try buildScene(a, &style, &.{.{ .id = id, .tile = &tile }}, view_hi, .{});
     try std.testing.expectEqual(@as(usize, 0), lo.ranges.len);
     try std.testing.expectEqual(@as(usize, 1), hi.ranges.len);
+}
+
+test "sprite: a pixelRatio outside the band is refused before anything divides by it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // patternCell divides the cell size by pixelRatio. At 1e-30 the quotient
+    // is about 1e34, which does not fit the u32 the @intFromFloat lands in:
+    // a panic under ReleaseSafe, undefined under ReleaseFast. The ratio is
+    // refused at the sprite boundary now, on both the JSON path and the
+    // charttable_add_image path.
+    var sprite = try sprites.Sprite.initEmpty(std.testing.allocator, 64);
+    defer sprite.deinit();
+    const px = try a.alloc(u8, 4 * 4 * 4);
+    @memset(px, 255);
+    try std.testing.expectError(error.Malformed, sprite.addImage("tiny", px, 4, 4, 1e-30));
+    try std.testing.expectError(error.Malformed, sprite.addImage("huge", px, 4, 4, 1e30));
+    try std.testing.expectError(error.Malformed, sprite.addImage("nan", px, 4, 4, std.math.nan(f32)));
+    try std.testing.expectError(error.Malformed, sprite.addImage("inf", px, 4, 4, std.math.inf(f32)));
+
+    // A ratio in band is still accepted, and still rescales.
+    try sprite.addImage("ok", px, 4, 4, 2);
+    const c = patternCell(a, &sprite, "ok") orelse return error.NoCell;
+    try std.testing.expectEqual(@as(u32, 2), c.w);
+    try std.testing.expectEqual(@as(u32, 2), c.h);
+
+    // A cell that somehow carried a bad ratio anyway is declined, not fatal.
+    try std.testing.expect(!sprites.validRatio(1e-30));
+    try std.testing.expect(!sprites.validRatio(std.math.nan(f32)));
+    try std.testing.expect(sprites.validRatio(1));
+    try std.testing.expect(sprites.validRatio(4));
 }

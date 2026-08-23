@@ -53,8 +53,12 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) Error!Image {
     if (c.WebPGetInfo(bytes.ptr, bytes.len, &w, &h) == 0) return error.Malformed;
     if (w <= 0 or h <= 0 or w > 16384 or h > 16384) return error.Unsupported;
 
+    // WebPDecodeRGBA writes the DECODED dimensions back into w and h, so the
+    // check above was made against WebPGetInfo's answer and no longer covers
+    // the numbers the allocation below uses. Check the ones that survived.
     const pixels = c.WebPDecodeRGBA(bytes.ptr, bytes.len, &w, &h) orelse return error.Malformed;
     defer c.WebPFree(pixels);
+    if (w <= 0 or h <= 0 or w > 16384 or h > 16384) return error.Unsupported;
 
     const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
     const out = try arena.alloc(u8, n);

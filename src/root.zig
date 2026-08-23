@@ -38,6 +38,7 @@ pub const webp = @import("util/webp.zig");
 pub const libpng = @import("util/libpng.zig");
 pub const lock = @import("util/lock.zig");
 pub const clock = @import("util/clock.zig");
+pub const jsondepth = @import("util/jsondepth.zig");
 
 comptime {
     // Force the C ABI's `export fn`s to be analyzed and emitted. Zig is lazy:
@@ -79,4 +80,5 @@ test {
     _ = libpng;
     _ = lock;
     _ = clock;
+    _ = jsondepth;
 }

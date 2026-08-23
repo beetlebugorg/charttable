@@ -31,6 +31,7 @@ const cameras = @import("camera.zig");
 const coord = @import("source/coord.zig");
 const gpu = @import("gpu/gpu.zig");
 const Lock = @import("util/lock.zig").Lock;
+const jsondepth = @import("util/jsondepth.zig");
 
 /// Status codes. 0 is success; everything else is negative so `if (rc)` in C
 /// reads as "something went wrong".
@@ -42,6 +43,35 @@ pub const ERR_SOURCE: c_int = -4;
 pub const ERR_SURFACE: c_int = -5;
 pub const ERR_MEMORY: c_int = -6;
 pub const ERR_UNSUPPORTED: c_int = -7;
+
+// ---- input ceilings ---------------------------------------------------------
+//
+// The host is in this address space and can already read any byte it likes,
+// so these are NOT a defence against a hostile host. They are a defence
+// against the bytes the host RELAYS: a tile body, a sprite sheet or a style
+// document that arrived over the network and that the host passed straight
+// through. Each one bounds work that would otherwise scale with whatever a
+// tile server chose to send.
+
+/// Largest side of an image handed to charttable_add_image or
+/// charttable_set_glyph_sheet. Bounds `w * h_px * 4` well inside usize, and
+/// matches sprites.max_height / glyphs.max_height / png.max_dim so the C
+/// entry point is no stricter than the decoders behind it.
+const max_image_dim: u32 = 16384;
+
+/// Largest body accepted for one resource answer. This is the ingest point
+/// for every network tile, so it is the single place that bounds MVT decode
+/// work: layer, feature, key and point counts are all bounded by the bytes
+/// that encode them, and this bounds the bytes.
+const max_resource_bytes: usize = 32 << 20;
+
+/// Largest style document. A real style is tens of kilobytes; the cap is a
+/// sanity ceiling, not a budget.
+const max_style_bytes: usize = 16 << 20;
+
+/// Largest JSON accepted for ONE paint or layout property value. A property
+/// value is an expression, not a document.
+const max_property_json_bytes: usize = 1 << 20;
 
 pub const NativeKind = enum(c_int) {
     none = 0, // offscreen only (snapshot)
@@ -344,6 +374,7 @@ export fn charttable_abi_layout() callconv(.c) u32 {
 export fn charttable_set_style_json(h: ?*anyopaque, json: [*]const u8, len: usize) callconv(.c) c_int {
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
+    if (len > max_style_bytes) return ERR_STYLE;
     self.m.setStyleJson(json[0..len]) catch return ERR_STYLE;
     self.uploaded = .{};
     return OK;
@@ -395,7 +426,7 @@ export fn charttable_add_source_pmtiles(
     for (self.libraries.items) |lb| {
         if (!std.mem.eql(u8, lb.name, want)) continue;
         lb.lib.add(&ar.reader) catch return ERR_MEMORY;
-        _ = self.m.bindPmtilesLibrary(want, &lb.lib) catch return ERR_MEMORY;
+        _ = self.m.bindPmtilesLibrary(want, &lb.lib) catch |e| return bindErr(e);
         return OK;
     }
     const lb = self.gpa.create(Handle.Library) catch return ERR_MEMORY;
@@ -406,7 +437,7 @@ export fn charttable_add_source_pmtiles(
     lb.lib = caches.PmtilesLibrary.init(self.gpa);
     lb.lib.add(&ar.reader) catch return ERR_MEMORY;
     self.libraries.append(self.gpa, lb) catch return ERR_MEMORY;
-    _ = self.m.bindPmtilesLibrary(want, &lb.lib) catch return ERR_MEMORY;
+    _ = self.m.bindPmtilesLibrary(want, &lb.lib) catch |e| return bindErr(e);
     return OK;
 }
 
@@ -437,6 +468,7 @@ export fn charttable_set_paint_property(
     defer self.mu.unlock();
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
+    if (len > max_property_json_bytes or !jsondepth.ok(json_value[0..len])) return ERR_ARG;
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_value[0..len], .{}) catch
         return ERR_ARG;
     const paint_only = self.m.setPaintProperty(std.mem.span(layer), std.mem.span(name), v) catch |e|
@@ -455,6 +487,7 @@ export fn charttable_set_layout_property(
     defer self.mu.unlock();
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
+    if (len > max_property_json_bytes or !jsondepth.ok(json_value[0..len])) return ERR_ARG;
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_value[0..len], .{}) catch
         return ERR_ARG;
     self.m.setLayoutProperty(std.mem.span(layer), std.mem.span(name), v) catch |e| return setErr(e);
@@ -476,6 +509,7 @@ export fn charttable_set_filter(
     defer arena.deinit();
     var v: ?std.json.Value = null;
     if (json_filter) |bytes| {
+        if (len > max_property_json_bytes or !jsondepth.ok(bytes[0..len])) return ERR_ARG;
         v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes[0..len], .{}) catch
             return ERR_ARG;
     }
@@ -538,10 +572,21 @@ export fn charttable_add_source_provided_opts(
     pr.provider.minzoom = @intCast(@min(o.minzoom, 22));
     pr.provider.maxzoom = @intCast(@min(@max(o.maxzoom, o.minzoom), 22));
     self.provided.append(self.gpa, pr) catch {
+        pr.provider.deinit();
         self.gpa.free(pr.name);
+        self.gpa.destroy(pr);
         return ERR_MEMORY;
     };
-    _ = self.m.bindProvider(std.mem.span(name), &pr.provider) catch return ERR_MEMORY;
+    // A refused bind leaves nothing behind: keeping the entry would shift
+    // id_bias for every source added after it, and the provider is unusable.
+    // Freed exactly the way charttable_close frees one.
+    _ = self.m.bindProvider(std.mem.span(name), &pr.provider) catch |e| {
+        _ = self.provided.pop();
+        pr.provider.deinit();
+        self.gpa.free(pr.name);
+        self.gpa.destroy(pr);
+        return bindErr(e);
+    };
     return OK;
 }
 
@@ -573,10 +618,36 @@ export fn charttable_resource_respond(
         1 => .empty,
         else => .failed,
     };
+    // Every network tile enters here. A body past the ceiling is treated as
+    // a failed fetch rather than decoded: the decoders downstream allocate in
+    // proportion to their input, so bounding the input is what bounds them.
+    if (st == .ok and len > max_resource_bytes) {
+        const slice: []const u8 = &.{};
+        respondTo(self, req_id, slice, .failed);
+        return;
+    }
     const slice: []const u8 = if (st == .ok and bytes != null) bytes.?[0..len] else &.{};
-    // The id says which source asked (see id_bias); only that provider is
-    // offered the answer. Broadcasting it was how a raster tile's PNG ended
-    // up being decoded as someone else's vector tile.
+    respondTo(self, req_id, slice, st);
+}
+
+/// Map a source-binding failure to a status code. A Cache holds at most
+/// caches.max_sources sources, because the tile-cache key spends three bits
+/// naming one; the ninth bind is refused rather than silently aliased onto
+/// the first.
+fn bindErr(e: anyerror) c_int {
+    return switch (e) {
+        error.TooManySources => ERR_SOURCE,
+        error.OutOfMemory => ERR_MEMORY,
+        else => ERR_SOURCE,
+    };
+}
+
+/// Route one answer to the provider that asked for it. Caller holds the lock.
+///
+/// The id says which source asked (see id_bias); only that provider is
+/// offered the answer. Broadcasting it was how a raster tile's PNG ended up
+/// being decoded as someone else's vector tile.
+fn respondTo(self: *Handle, req_id: u64, slice: []const u8, st: providers.Status) void {
     const which = req_id >> 48;
     if (which >= 1 and which <= self.provided.items.len) {
         self.provided.items[which - 1].provider.respond(req_id, slice, st);
@@ -598,10 +669,23 @@ fn flushPendingImages(self: *Handle) void {
 
 /// Hand the host every ask raised since the last call. Runs OUTSIDE the
 /// lock so the callback may answer immediately.
+///
+/// The callback may also ADD a source, and charttable_add_source_provided
+/// appends to `self.provided`. An append that reallocates frees the buffer
+/// a `for (self.provided.items)` loop is in the middle of reading, so this
+/// walks by index and re-reads `self.provided.items` on every step. The
+/// elements are heap pointers and only charttable_close destroys them, so
+/// `pr` itself stays good across the unlock.
+///
+/// Today the reallocation cannot happen: std.ArrayList's first allocation
+/// holds 17 pointers and caches.max_sources is 8. The index walk costs
+/// nothing and stops that coincidence from being load-bearing.
 fn pumpResources(self: *Handle) void {
     const cb = self.on_resource orelse return;
     const user = self.resource_user;
-    for (self.provided.items) |pr| {
+    var i: usize = 0;
+    while (i < self.provided.items.len) : (i += 1) {
+        const pr = self.provided.items[i];
         self.asks.clearRetainingCapacity();
         pr.provider.drain(&self.asks, self.gpa);
         if (self.asks.items.len == 0) continue;
@@ -640,6 +724,13 @@ export fn charttable_add_image(
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
     if (w == 0 or h_px == 0) return ERR_ARG;
+    // w and h_px are u32 straight from the caller, and `w * h_px * 4` is a
+    // usize multiply: 2^31 x 2^31 overflows 64 bits, which panics under
+    // ReleaseSafe and silently wraps under ReleaseFast into a SHORT slice of
+    // a buffer the host said was huge. Reject the dimensions instead. The
+    // cap matches sprites.max_height and png.max_dim, so the C entry point
+    // is no stricter than the decoders behind it.
+    if (w > max_image_dim or h_px > max_image_dim) return ERR_ARG;
     // A build in flight is reading the atlases, and this is the ONE asset
     // call a host makes at frame rate: answering missing images. Blocking
     // here would hand the frame thread the rest of the build -- measured at
@@ -728,6 +819,9 @@ export fn charttable_set_glyph_sheet(
 ) callconv(.c) c_int {
     const self = locked(h) orelse return ERR_HANDLE;
     defer self.mu.unlock();
+    // Same overflow guard as charttable_add_image.
+    if (w == 0 or h_px == 0) return ERR_ARG;
+    if (w > max_image_dim or h_px > max_image_dim) return ERR_ARG;
     self.m.waitForBuild();
     if (self.glyph_atlas == null) {
         self.glyph_atlas = glyphs.GlyphAtlas.init(self.gpa, glyphs.default_width) catch
@@ -1328,4 +1422,151 @@ test "capi: two provided sources do not answer each other's requests" {
             try testing.expect(id != other);
         }
     }
+}
+
+// ---- input-ceiling regressions ---------------------------------------------
+
+/// The resource callback ADDS a source while pumpResources is walking the
+/// provider list. That is legal: the pump drops the lock around the callback
+/// precisely so the host may call back in.
+///
+/// Reaching the reallocation this guards against takes 18 providers, because
+/// std.ArrayList sizes its first allocation to a cache line — 17 pointers —
+/// and the source ceiling is 8. So this test exercises the reentrancy, not
+/// the move; the index walk in pumpResources is what keeps the two facts
+/// independent, and the ceiling test below is what keeps the count at 8.
+const GrowProbe = struct {
+    var map_handle: ?*anyopaque = null;
+    var seen: usize = 0;
+    var grown: usize = 0;
+    var extra_names: [4][8:0]u8 = @splat(@splat(0));
+
+    fn onResource(req_id: u64, source: [*:0]const u8, z: u32, x: u32, y: u32, user: ?*anyopaque) callconv(.c) void {
+        _ = .{ source, z, x, y, user };
+        seen += 1;
+        // Grow the list from inside the callback, exactly when the caller is
+        // iterating it. Several appends, so at least one crosses a capacity
+        // boundary whatever the starting capacity is.
+        if (grown < GrowProbe.extra_names.len) {
+            const slot = &GrowProbe.extra_names[grown];
+            slot.* = @splat(0);
+            _ = std.fmt.bufPrint(slot, "grow{d}", .{grown}) catch {};
+            grown += 1;
+            _ = charttable_add_source_provided(map_handle, @ptrCast(slot));
+        }
+        charttable_resource_respond(map_handle, req_id, null, 0, 1);
+    }
+};
+
+test "capi: a callback may add a source while the pump is walking the list" {
+    const style =
+        \\{"version": 8,
+        \\ "sources": {
+        \\   "a": {"type": "vector", "tiles": ["https://x/a/{z}/{x}/{y}"], "maxzoom": 14},
+        \\   "b": {"type": "vector", "tiles": ["https://x/b/{z}/{x}/{y}"], "maxzoom": 14},
+        \\   "c": {"type": "vector", "tiles": ["https://x/c/{z}/{x}/{y}"], "maxzoom": 14},
+        \\   "d": {"type": "vector", "tiles": ["https://x/d/{z}/{x}/{y}"], "maxzoom": 14}},
+        \\ "layers": [{"id": "bg", "type": "background",
+        \\   "paint": {"background-color": "#000000"}}]}
+    ;
+    const h = charttable_open(&.{ .workers = 1 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+    GrowProbe.map_handle = h;
+    GrowProbe.seen = 0;
+    GrowProbe.grown = 0;
+
+    try testing.expectEqual(OK, charttable_set_style_json(h, style.ptr, style.len));
+    charttable_set_resource_provider(h, GrowProbe.onResource, null);
+    for ([_][*:0]const u8{ "a", "b", "c", "d" }) |n| {
+        try testing.expectEqual(OK, charttable_add_source_provided(h, n));
+    }
+    try testing.expectEqual(OK, charttable_resize(h, 512, 512));
+    var v = View{ .lon = -76.4767, .lat = 38.9763, .zoom = 14 };
+    charttable_set_view(h, &v);
+
+    var spins: usize = 0;
+    while (spins < 2000 and charttable_idle(h) == 0) : (spins += 1) {
+        _ = charttable_tick(h, 16);
+        @import("util/lock.zig").sleepMs(1);
+    }
+    // Every provider in the list was still served after the list grew.
+    try testing.expect(GrowProbe.seen > 0);
+    try testing.expect(GrowProbe.grown > 0);
+    try testing.expectEqual(OK, charttable_tick(h, 16));
+}
+
+test "capi: a body over the resource ceiling is refused without reading it" {
+    const h = charttable_open(&.{ .workers = 1 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+    try testing.expectEqual(OK, charttable_set_style_json(h, smoke_style.ptr, smoke_style.len));
+
+    // A one-byte buffer with a length past the ceiling. The check runs before
+    // the slice is formed, so nothing dereferences past the byte that exists.
+    var one: [1]u8 = .{0};
+    charttable_resource_respond(h, 1, &one, max_resource_bytes + 1, 0);
+    charttable_resource_respond(h, 1, &one, std.math.maxInt(usize), 0);
+    try testing.expectEqual(OK, charttable_tick(h, 16));
+}
+
+test "capi: image dimensions that would overflow w*h*4 are rejected" {
+    const h = charttable_open(&.{ .workers = 1 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+    try testing.expectEqual(OK, charttable_set_style_json(h, smoke_style.ptr, smoke_style.len));
+
+    var px: [4]u8 = .{ 255, 0, 0, 255 };
+    // 2^31 x 2^31 x 4 does not fit in a usize. Neither operand is read.
+    try testing.expectEqual(ERR_ARG, charttable_add_image(h, "big", &px, 1 << 31, 1 << 31, 1.0));
+    try testing.expectEqual(ERR_ARG, charttable_add_image(h, "big", &px, max_image_dim + 1, 1, 1.0));
+    try testing.expectEqual(ERR_ARG, charttable_add_image(h, "big", &px, 1, max_image_dim + 1, 1.0));
+    // A 1x1 image is still accepted.
+    try testing.expectEqual(OK, charttable_add_image(h, "ok", &px, 1, 1, 1.0));
+
+    var idx: [2]u8 = .{ '{', '}' };
+    try testing.expectEqual(ERR_ARG, charttable_set_glyph_sheet(h, &idx, idx.len, &px, 1 << 31, 1 << 31));
+    try testing.expectEqual(ERR_ARG, charttable_set_glyph_sheet(h, &idx, idx.len, &px, 0, 0));
+}
+
+test "capi: deeply nested JSON is refused instead of overflowing the stack" {
+    const a = testing.allocator;
+    const h = charttable_open(&.{ .workers = 1 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+    try testing.expectEqual(OK, charttable_set_style_json(h, smoke_style.ptr, smoke_style.len));
+
+    // 100k open brackets. std.json builds its value tree by recursion, so
+    // without the pre-scan this kills the process rather than erroring.
+    const deep = try a.alloc(u8, 100_000);
+    defer a.free(deep);
+    @memset(deep, '[');
+    try testing.expectEqual(ERR_STYLE, charttable_set_style_json(h, deep.ptr, deep.len));
+    try testing.expectEqual(ERR_ARG, charttable_set_paint_property(h, "bg", "background-color", deep.ptr, deep.len));
+    try testing.expectEqual(ERR_ARG, charttable_set_layout_property(h, "bg", "visibility", deep.ptr, deep.len));
+    try testing.expectEqual(ERR_ARG, charttable_set_filter(h, "bg", deep.ptr, deep.len));
+
+    // The handle is still usable afterwards.
+    try testing.expectEqual(OK, charttable_set_style_json(h, smoke_style.ptr, smoke_style.len));
+}
+
+test "capi: the ninth source is refused, not aliased onto the first" {
+    const h = charttable_open(&.{ .workers = 1 }) orelse return error.OpenFailed;
+    defer charttable_close(h);
+    try testing.expectEqual(OK, charttable_set_style_json(h, smoke_style.ptr, smoke_style.len));
+
+    // The tile cache key spends three bits naming a source, so eight fit.
+    // The ninth used to trip a std.debug.assert -- a panic under ReleaseSafe,
+    // and under ReleaseFast no check at all: the index truncated and source 8
+    // shared every cache key with source 0.
+    var name: [8:0]u8 = @splat(0);
+    for (0..caches.max_sources) |i| {
+        name = @splat(0);
+        _ = try std.fmt.bufPrint(&name, "s{d}", .{i});
+        try testing.expectEqual(OK, charttable_add_source_provided(h, &name));
+    }
+    name = @splat(0);
+    _ = try std.fmt.bufPrint(&name, "s{d}", .{caches.max_sources});
+    try testing.expectEqual(ERR_SOURCE, charttable_add_source_provided(h, &name));
+
+    // Re-binding a name already present still works: it replaces, and takes
+    // no new slot.
+    try testing.expectEqual(OK, charttable_add_source_provided(h, "s0"));
+    try testing.expectEqual(OK, charttable_tick(h, 16));
 }

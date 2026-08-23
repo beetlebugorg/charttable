@@ -573,7 +573,34 @@ pub const Collider = struct {
 
     /// True (and records the box) when `box` fits without overlap.
     /// `ignore_placement` boxes never block others: check but don't record.
+    /// The largest box the grid will walk, in reference px.
+    ///
+    /// icon-size and text-size are style expressions, and the spec requires
+    /// the arithmetic operators to produce NaN and Infinity exactly as IEEE
+    /// does -- ["/", 1, 0] IS Infinity, and the conformance suite checks it.
+    /// So a non-finite box is reachable from a perfectly valid style, and
+    /// fits()/record() convert its corners with @intFromFloat, which is
+    /// illegal behavior for NaN or for anything outside i32.
+    ///
+    /// A finite but enormous box costs just as much: the cell walk runs one
+    /// iteration and allocates one hash entry per CELL-sized square, so a
+    /// 1e9 px box asks for about 10^14 of them and never returns.
+    ///
+    /// A symbol that large or that ill-defined has no placement worth
+    /// computing, so it is refused rather than clamped -- clamping would
+    /// silently collide it against things it does not really cover.
+    const max_box_px: f32 = 1 << 20;
+
+    fn walkable(box: Box) bool {
+        for ([_]f32{ box.x0, box.y0, box.x1, box.y1 }) |v| {
+            // NaN fails this comparison, which is the point.
+            if (!(@abs(v) <= max_box_px)) return false;
+        }
+        return true;
+    }
+
     pub fn place(self: *Collider, box: Box, allow_overlap: bool, ignore_placement: bool) !bool {
+        if (!walkable(box)) return false;
         if (!allow_overlap and !self.fits(box)) return false;
         if (!ignore_placement) try self.record(box);
         return true;
@@ -583,6 +610,7 @@ pub const Collider = struct {
     /// turns the slack into a zmin gate so the box hides itself before it
     /// can reach a neighbor.
     pub fn placeWithSlack(self: *Collider, box: Box, allow_overlap: bool, ignore_placement: bool) !PlaceResult {
+        if (!walkable(box)) return .{ .placed = false };
         if (!allow_overlap and !self.fits(box)) return .{ .placed = false };
         const slack = self.slackLevels(box);
         if (!ignore_placement) try self.record(box);
@@ -787,4 +815,59 @@ test "collider: overlap rejected, allow-overlap passes, ignored boxes don't bloc
     try std.testing.expect(try c.place(.{ .x0 = 20, .y0 = 0, .x1 = 30, .y1 = 10 }, false, false));
     // an ignore-placement box was not recorded: this spot is free
     try std.testing.expect(try c.place(.{ .x0 = 12, .y0 = 12, .x1 = 14, .y1 = 14 }, false, false));
+}
+
+test "Collider: a non-finite or enormous box is rejected, not converted" {
+    var c = Collider.init(std.testing.allocator);
+    defer c.deinit();
+
+    // icon-size and text-size are style expressions with no clamp on the way
+    // in, and the spec REQUIRES the arithmetic operators to produce NaN and
+    // Infinity the way IEEE does ("/" by zero, ln of a negative). So a box
+    // can arrive non-finite, and fits()/record() convert its corners to i32.
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    const bad = [_]Box{
+        .{ .x0 = nan, .y0 = 0, .x1 = 1, .y1 = 1 },
+        .{ .x0 = 0, .y0 = nan, .x1 = 1, .y1 = 1 },
+        .{ .x0 = -inf, .y0 = -inf, .x1 = inf, .y1 = inf },
+        .{ .x0 = -1e30, .y0 = -1e30, .x1 = 1e30, .y1 = 1e30 },
+        // Finite and in i32 range, but spanning 3e13 cells: the cell walk
+        // would allocate one hash entry per cell.
+        .{ .x0 = -1e9, .y0 = -1e9, .x1 = 1e9, .y1 = 1e9 },
+    };
+    for (bad) |b| try std.testing.expect(!try c.place(b, false, false));
+
+    // A real box still places, and still collides.
+    try std.testing.expect(try c.place(.{ .x0 = 0, .y0 = 0, .x1 = 10, .y1 = 10 }, false, false));
+    try std.testing.expect(!try c.place(.{ .x0 = 5, .y0 = 5, .x1 = 15, .y1 = 15 }, false, false));
+    try std.testing.expect(try c.place(.{ .x0 = 100, .y0 = 100, .x1 = 110, .y1 = 110 }, false, false));
+}
+
+test "placeAlongLine: extreme tile coordinates do not run the anchor walk forever" {
+    const a = std.testing.allocator;
+    var out: std.ArrayList(Placement) = .empty;
+    defer out.deinit(a);
+
+    // MVT geometry deltas are wrapping i32 (mvt.zig says so, deliberately, so
+    // a hostile tile cannot panic the decoder). Nothing clamps them to the
+    // layer extent, so a two-point line can span the whole i32 range. The
+    // anchor walk steps by symbol-spacing along the arc.
+    const part = [_]mvt.Point{
+        .{ .x = -2147483648, .y = -2147483648 },
+        .{ .x = 2147483647, .y = 2147483647 },
+    };
+    const parts = [_][]const mvt.Point{&part};
+
+    try placeAlongLine(a, &parts, 4096, 512, .{
+        .spacing_px = 250,
+        .px_per_unit = 1,
+        .tile_span = 512,
+    }, &out);
+
+    // The walk must be bounded by the tile, not by the coordinate range.
+    // Only anchors inside the tile are kept, but the loop visits every step
+    // along the arc whether it keeps it or not -- so the count here is the
+    // symptom, and the run time is the actual cost.
+    try std.testing.expect(out.items.len < 100_000);
 }

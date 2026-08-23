@@ -33,6 +33,7 @@
 //! the SDF shader samples .r).
 
 const std = @import("std");
+const jsondepth = @import("../util/jsondepth.zig");
 const Allocator = std.mem.Allocator;
 
 /// Fontnik's fixed SDF padding around each glyph bitmap, px.
@@ -61,6 +62,22 @@ pub const Fontstack = struct {
 // Sanity caps: fontnik bakes a 24 px em; nothing legitimate approaches these.
 const max_glyph_px: u32 = 512;
 const max_advance: u32 = 4096;
+/// The band an SDF sheet's `em_px` must fall in. Values are DIVIDED into and
+/// MULTIPLIED by, so "> 0" lets a denormal or a 1e300 through and the
+/// products stop fitting the integers they are converted to.
+const min_em_px: f64 = 1;
+const max_em_px: f64 = 1024;
+
+/// f64 -> T with the range checked first. @intFromFloat is illegal behavior
+/// when the value does not fit — a panic under ReleaseSafe and undefined
+/// under ReleaseFast — so every conversion of a number that came off the
+/// wire goes through here. NaN and infinity fail both comparisons.
+fn toInt(comptime T: type, x: f64) ?T {
+    const lo: f64 = @floatFromInt(std.math.minInt(T));
+    const hi: f64 = @floatFromInt(std.math.maxInt(T));
+    if (!(x >= lo and x <= hi)) return null;
+    return @intFromFloat(x);
+}
 
 /// Decode one range PBF. `a` should be a per-range arena (nothing is freed
 /// individually); strings and bitmaps borrow from `data`, which must outlive
@@ -299,15 +316,21 @@ pub const GlyphAtlas = struct {
         defer tmp.deinit();
         const a = tmp.allocator();
 
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, index_json, .{}) catch
-            return error.Malformed;
+        // Same depth guard as Sprite.load, and the same split of OutOfMemory
+        // from Malformed: mapping a genuine allocation failure to "bad input"
+        // tells the host to stop retrying when it should back off instead.
+        if (!jsondepth.ok(index_json)) return error.Malformed;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, index_json, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Malformed,
+        };
         if (parsed != .object) return error.Malformed;
         const em_px: f64 = switch (parsed.object.get("em_px") orelse return error.Malformed) {
             .integer => |i| @floatFromInt(i),
             .float => |f| f,
             else => return error.Malformed,
         };
-        if (em_px <= 0) return error.Malformed;
+        if (!(em_px >= min_em_px and em_px <= max_em_px)) return error.Malformed;
         const glyphs_val = parsed.object.get("glyphs") orelse return error.Malformed;
         if (glyphs_val != .object) return error.Malformed;
 
@@ -327,16 +350,27 @@ pub const GlyphAtlas = struct {
                 else => return error.Malformed,
             };
 
+            // Convert BEFORE touching the map. getOrPut inserts the key with
+            // an uninitialized value, so a skip after it would leave the
+            // atlas holding a glyph nobody wrote.
+            //
+            // The cell, in sheet pixels. UVs are normalized -- but nothing on
+            // the wire promises that, so range-check before converting rather
+            // than sanity-checking the converted values afterwards.
+            const px0 = toInt(u32, @round(f[0] * @as(f64, @floatFromInt(sheet_w)))) orelse continue;
+            const py0 = toInt(u32, @round(f[1] * @as(f64, @floatFromInt(sheet_h)))) orelse continue;
+            const px1 = toInt(u32, @round(f[2] * @as(f64, @floatFromInt(sheet_w)))) orelse continue;
+            const py1 = toInt(u32, @round(f[3] * @as(f64, @floatFromInt(sheet_h)))) orelse continue;
+            const left = toInt(i32, @round(f[4] * em_px)) orelse continue;
+            const top = toInt(i32, @round(-f[5] * em_px)) orelse continue;
+            const advance = @min(max_advance, toInt(u32, @max(0, @round(f[8] * em_px))) orelse continue);
+
             const gop = try self.glyphs.getOrPut(self.alloc, cp_int);
             if (gop.found_existing) continue;
             errdefer _ = self.glyphs.remove(cp_int);
 
-            // The cell, in sheet pixels. UVs are normalized.
-            const px0: u32 = @intFromFloat(@round(f[0] * @as(f64, @floatFromInt(sheet_w))));
-            const py0: u32 = @intFromFloat(@round(f[1] * @as(f64, @floatFromInt(sheet_h))));
-            const px1: u32 = @intFromFloat(@round(f[2] * @as(f64, @floatFromInt(sheet_w))));
-            const py1: u32 = @intFromFloat(@round(f[3] * @as(f64, @floatFromInt(sheet_h))));
-            const degenerate = px1 <= px0 or py1 <= py0 or px1 > sheet_w or py1 > sheet_h;
+            const degenerate = px1 <= px0 or py1 <= py0 or px1 > sheet_w or py1 > sheet_h or
+                px1 - px0 > max_glyph_px or py1 - py0 > max_glyph_px;
             const cw = if (degenerate) 0 else px1 - px0;
             const chh = if (degenerate) 0 else py1 - py0;
 
@@ -350,7 +384,7 @@ pub const GlyphAtlas = struct {
                     .height = 0,
                     .left = 0,
                     .top = 0,
-                    .advance = @intFromFloat(@max(0, @round(f[8] * em_px))),
+                    .advance = advance,
                 });
                 added += 1;
                 continue;
@@ -379,9 +413,9 @@ pub const GlyphAtlas = struct {
                 .height = chh - 2 * buffer_px,
                 // EM units to pixels. off_y is measured downward from the
                 // baseline; `top` is y-up, hence the negation.
-                .left = @intFromFloat(@round(f[4] * em_px)),
-                .top = @intFromFloat(@round(-f[5] * em_px)),
-                .advance = @intFromFloat(@max(0, @round(f[8] * em_px))),
+                .left = left,
+                .top = top,
+                .advance = advance,
             });
             added += 1;
         }
@@ -711,4 +745,57 @@ test "loads a real glyph range when the fixture is present (integration)" {
         try testing.expect(m.v0 >= 0 and m.v1 <= 1 and m.v0 <= m.v1);
         try testing.expect(m.advance >= 0);
     }
+}
+
+test "addSdfSheet: hostile index numbers are refused, not converted" {
+    const a = std.testing.allocator;
+    var atlas = try GlyphAtlas.init(a, default_width);
+    defer atlas.deinit();
+
+    const sheet_w: u32 = 64;
+    const sheet_h: u32 = 64;
+    const rgba = try a.alloc(u8, sheet_w * sheet_h * 4);
+    defer a.free(rgba);
+    @memset(rgba, 128);
+
+    // Every one of these puts a value into an @intFromFloat that the target
+    // integer cannot hold. The PBF path caps glyph size and advance; this
+    // path used to convert first and sanity-check afterwards.
+    const hostile = [_][]const u8{
+        // negative UV -> negative u32
+        \\{"em_px": 24, "glyphs": {"65": [-1.0, 0, 0.5, 0.5, 0, 0, 0, 0, 10]}}
+        ,
+        // UV past 1e30 -> u32 overflow
+        \\{"em_px": 24, "glyphs": {"65": [0, 0, 1e30, 0.5, 0, 0, 0, 0, 10]}}
+        ,
+        // left/top in em units, scaled by em_px, past i32
+        \\{"em_px": 24, "glyphs": {"65": [0, 0, 0.5, 0.5, 1e30, 0, 0, 0, 10]}}
+        ,
+        \\{"em_px": 24, "glyphs": {"65": [0, 0, 0.5, 0.5, 0, -1e30, 0, 0, 10]}}
+        ,
+        // advance past u32
+        \\{"em_px": 24, "glyphs": {"65": [0, 0, 0.5, 0.5, 0, 0, 0, 0, 1e30]}}
+        ,
+        // em_px itself: only "> 0" was required, so NaN and denormals passed
+        \\{"em_px": 1e300, "glyphs": {"65": [0, 0, 0.5, 0.5, 1, 1, 0, 0, 10]}}
+        ,
+        \\{"em_px": 1e-300, "glyphs": {"65": [0, 0, 0.5, 0.5, 1, 1, 0, 0, 10]}}
+        ,
+    };
+    for (hostile) |idx| {
+        _ = atlas.addSdfSheet(idx, rgba, sheet_w, sheet_h) catch |e| {
+            try std.testing.expect(e == error.Malformed);
+            continue;
+        };
+    }
+
+    // None of them left a half-written entry behind: getOrPut inserts the key
+    // with an uninitialized value, so a skip must happen before it.
+    try std.testing.expectEqual(@as(usize, 0), atlas.glyphs.count());
+
+    // A well-formed sheet still lands.
+    const good =
+        \\{"em_px": 24, "glyphs": {"65": [0.0, 0.0, 0.5, 0.5, 1, 1, 0, 0, 10]}}
+    ;
+    try std.testing.expect(try atlas.addSdfSheet(good, rgba, sheet_w, sheet_h) > 0);
 }

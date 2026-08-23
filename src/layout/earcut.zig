@@ -47,10 +47,46 @@ const Node = struct {
 };
 
 /// Reusable node pool. One per thread of layout; `reset` between polygons.
+/// Elementary steps the recovery stages may spend on ONE `run`.
+///
+/// A well-formed ring never reaches those stages: it clears in pass 0, and
+/// 100k convex vertices triangulate in about 13 ms. A heavily
+/// self-intersecting ring does reach them, and splitEarcut is O(n) diagonals
+/// x O(n) candidates x O(n) for the intersectsPolygon scan inside
+/// isValidDiagonal -- and it recurses into itself on each half. Measured on
+/// a self-intersecting ring: 1k vertices 28 ms, 5k 875 ms, 20k 46 SECONDS.
+///
+/// Tile geometry is untrusted, so without a bound one polygon stalls a tile
+/// worker for as long as it likes. Running out of budget abandons the
+/// recovery and leaves that sub-polygon untriangulated. This file already
+/// prefers a fill with a flaw to no fill at all (see the header note on why
+/// it was ported); an unbounded stall is worse than either.
+///
+/// The unit is one elementary step, charged in the three inner loops the
+/// time actually goes into: the z-neighbourhood walk of an ear test, the ring
+/// walk of intersectsPolygon, and the z-order sort. Charging per ear test
+/// instead is not enough -- on a degenerate ring one test walks thousands of
+/// nodes, so the bound would stay proportional to n.
+///
+/// Measured on a self-intersecting ring, before and after:
+///
+///   vertices    before      after
+///      1,000     28 ms      26 ms   (full result either way)
+///      5,000    875 ms     126 ms   (full result either way)
+///     20,000     46 s      208 ms   (partial fill)
+///     80,000     61 s      213 ms   (partial fill)
+///    300,000     --        725 ms   (partial fill)
+///
+/// A well-formed ring is untouched: 100k convex vertices still triangulate
+/// completely in about 13 ms, spending far less than this.
+const max_recovery_work: u64 = 1 << 24;
+
 pub const Tess = struct {
     nodes: std.ArrayListUnmanaged(Node) = .empty,
     scratch: std.ArrayListUnmanaged(u32) = .empty,
     gpa: Allocator,
+    /// Spent by the recovery stages only, and reset per `run`.
+    recovery_work: u64 = 0,
 
     pub fn init(gpa: Allocator) Tess {
         return .{ .gpa = gpa };
@@ -75,6 +111,7 @@ pub const Tess = struct {
         out: *std.ArrayListUnmanaged(u32),
     ) Allocator.Error!void {
         self.nodes.clearRetainingCapacity();
+        self.recovery_work = 0;
         const dim: usize = 2;
         const has_holes = hole_starts.len > 0;
         const outer_len: usize = if (has_holes) @as(usize, hole_starts[0]) * dim else coords.len;
@@ -217,6 +254,11 @@ pub const Tess = struct {
         var stop = ear;
 
         while (self.n(ear).prev != self.n(ear).next) {
+            // Charged per candidate ear. Combined with the intersectsPolygon
+            // and indexCurve charges, this bounds the whole triangulation --
+            // including the recursion splitEarcut starts on each half.
+            self.recovery_work += 1;
+            if (self.recovery_work >= max_recovery_work) return;
             const prev = self.n(ear).prev;
             const next = self.n(ear).next;
 
@@ -258,6 +300,7 @@ pub const Tess = struct {
     }
 
     fn isEar(self: *Tess, ear: u32) bool {
+        self.recovery_work += 1;
         const a = self.n(ear).prev;
         const b = ear;
         const c = self.n(ear).next;
@@ -311,11 +354,17 @@ pub const Tess = struct {
         // inside it, so walk outward from the ear in both directions.
         var p = self.n(ear).prevz;
         while (p != nil and self.n(p).z >= min_z) {
+            // Charged here, not per ear test: on a degenerate ring the z
+            // range covers most of the curve and one "test" walks thousands
+            // of nodes. A per-test charge leaves the bound proportional to
+            // that width; charging the walk itself does not.
+            self.recovery_work += 1;
             if (self.hashedBlocker(p, a, ax, ay, bx, by, cx, cy, c, x0, y0, x1, y1)) return false;
             p = self.n(p).prevz;
         }
         var q = self.n(ear).nextz;
         while (q != nil and self.n(q).z <= max_z) {
+            self.recovery_work += 1;
             if (self.hashedBlocker(q, a, ax, ay, bx, by, cx, cy, c, x0, y0, x1, y1)) return false;
             q = self.n(q).nextz;
         }
@@ -386,6 +435,7 @@ pub const Tess = struct {
         while (true) {
             var b = self.n(self.n(a).next).next;
             while (b != self.n(a).prev) {
+                if (self.recovery_work >= max_recovery_work) return;
                 if (self.n(a).i != self.n(b).i and self.isValidDiagonal(a, b)) {
                     var c = try self.splitPolygon(a, b);
                     // Each half gets a fresh set of passes.
@@ -533,6 +583,10 @@ pub const Tess = struct {
             if (p == start) break;
         }
         const arr = self.scratch.items;
+        // splitEarcut hands both halves back at pass 0, so this sort runs
+        // again on every split. Charge it, or the budget misses the cost it
+        // most needs to bound.
+        self.recovery_work += @as(u64, arr.len) * (std.math.log2_int_ceil(usize, @max(2, arr.len)) + 1);
         std.mem.sort(u32, arr, self, cmpZ);
 
         var prev: u32 = nil;
@@ -609,6 +663,10 @@ pub const Tess = struct {
     fn intersectsPolygon(self: *Tess, a: u32, b: u32) bool {
         var p = a;
         while (true) {
+            // The recovery budget is spent here: this scan is the inner loop
+            // of splitEarcut's O(n^2) diagonal search, so it is the only
+            // place where charging per step gives a flat time bound.
+            self.recovery_work += 1;
             const nx = self.n(p).next;
             if (self.n(p).i != self.n(a).i and self.n(nx).i != self.n(a).i and
                 self.n(p).i != self.n(b).i and self.n(nx).i != self.n(b).i and
@@ -808,4 +866,57 @@ test "degenerate input yields nothing and does not spin" {
     out.clearRetainingCapacity();
     try t.run(&[_]f64{ 5, 5, 5, 5, 5, 5, 5, 5 }, &.{}, &out); // all coincident
     try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "run: a self-intersecting ring finishes instead of stalling the worker" {
+    const a = std.testing.allocator;
+
+    // Tile geometry is untrusted. splitEarcut tests O(n^2) diagonals, each
+    // walking the ring, and hands both halves back at pass 0 so the z-order
+    // sort runs again per split. Before the budget a 20,000-vertex
+    // self-intersecting ring took 46 seconds; 80,000 took 61.
+    var coords: std.ArrayListUnmanaged(f64) = .empty;
+    defer coords.deinit(a);
+    const n = 20_000;
+    for (0..n) |i| {
+        const t = @as(f64, @floatFromInt(i)) * 2.399963; // golden angle
+        const r: f64 = if (i % 2 == 0) 1000 else 40;
+        try coords.append(a, @cos(t) * r);
+        try coords.append(a, @sin(t) * r);
+    }
+
+    var tess = Tess.init(a);
+    defer tess.deinit();
+    var tris: std.ArrayListUnmanaged(u32) = .empty;
+    defer tris.deinit(a);
+    try tess.run(coords.items, &.{}, &tris);
+
+    // The budget stopped the recovery, so the fill is partial by design.
+    try std.testing.expect(tess.recovery_work >= max_recovery_work);
+    try std.testing.expect(tris.items.len % 3 == 0);
+    // Every emitted index still addresses a real vertex.
+    for (tris.items) |t| try std.testing.expect(t < n);
+}
+
+test "run: the budget leaves well-formed geometry alone" {
+    const a = std.testing.allocator;
+    var coords: std.ArrayListUnmanaged(f64) = .empty;
+    defer coords.deinit(a);
+    const n = 100_000;
+    for (0..n) |i| {
+        const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n)) * 2 * std.math.pi;
+        try coords.append(a, @cos(t) * 1000);
+        try coords.append(a, @sin(t) * 1000);
+    }
+
+    var tess = Tess.init(a);
+    defer tess.deinit();
+    var tris: std.ArrayListUnmanaged(u32) = .empty;
+    defer tris.deinit(a);
+    try tess.run(coords.items, &.{}, &tris);
+
+    // A convex ring of n vertices fans into exactly n-2 triangles, and does
+    // it without coming near the budget.
+    try std.testing.expectEqual(@as(usize, n - 2), tris.items.len / 3);
+    try std.testing.expect(tess.recovery_work < max_recovery_work);
 }

@@ -28,6 +28,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const png = @import("../util/png.zig");
+const jsondepth = @import("../util/jsondepth.zig");
 
 pub const Error = error{ Malformed, Unsupported, AtlasFull, OutOfMemory };
 
@@ -57,6 +58,23 @@ const Cell = struct {
 
 const pad: u32 = 1; // gap between packed runtime cells
 pub const max_height: u32 = 16384; // grown-atlas cap (common GPU texture limit)
+
+/// The band a cell's pixelRatio must fall in.
+///
+/// Consumers DIVIDE by this number: map.zig's patternCell turns a cell into
+/// an on-screen period with `w / pixel_ratio`, and symbol.zig sizes an icon
+/// quad the same way. "Greater than zero" is not a sufficient test, because
+/// a denormal like 1e-30 makes that quotient about 1e34 — which then does not
+/// fit the u32 the @intFromFloat lands in, and traps. Real sprites use 1, 2,
+/// 3 or 4; this band is wide enough to be no one's problem and narrow enough
+/// that the quotient stays small.
+pub const min_pixel_ratio: f32 = 1.0 / 16.0;
+pub const max_pixel_ratio: f32 = 16.0;
+
+/// NaN-safe: a NaN fails both comparisons and is rejected.
+pub fn validRatio(r: f32) bool {
+    return r >= min_pixel_ratio and r <= max_pixel_ratio;
+}
 
 pub const Sprite = struct {
     alloc: Allocator,
@@ -98,6 +116,10 @@ pub const Sprite = struct {
         };
         errdefer self.deinit();
 
+        // std.json recurses without a depth limit; refuse the depths that
+        // would overflow the stack inside the parse. A sprite index is two
+        // levels deep, so this rejects nothing real.
+        if (!jsondepth.ok(index_json)) return error.Malformed;
         const doc = std.json.parseFromSliceLeaky(std.json.Value, ta, index_json, .{}) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.Malformed,
@@ -177,7 +199,7 @@ pub const Sprite = struct {
     /// Backs charttable_add_image and the missing-image hook. Packs into the
     /// grow-downward region; replacing a name orphans the old cell's pixels.
     pub fn addImage(self: *Sprite, name: []const u8, rgba: []const u8, w: u32, h: u32, pixel_ratio: f32) Error!void {
-        if (w == 0 or h == 0 or !(pixel_ratio > 0)) return error.Malformed;
+        if (w == 0 or h == 0 or !validRatio(pixel_ratio)) return error.Malformed;
         if (w > self.width - pad) return error.Unsupported; // wider than the atlas
         if (h > max_height) return error.AtlasFull;
         // w and h are bounded now, so the product cannot overflow.
@@ -295,7 +317,7 @@ fn ratioField(o: std.json.ObjectMap) ?f32 {
         .float => |f| @floatCast(f),
         else => return null,
     };
-    return if (r > 0 and r <= 16) r else null;
+    return if (validRatio(r)) r else null;
 }
 
 // ---- tests --------------------------------------------------------------

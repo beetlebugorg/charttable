@@ -29,6 +29,7 @@ const exprs = @import("expr.zig");
 const properties = @import("properties.zig");
 const compile = @import("compile.zig");
 const vals = @import("value.zig");
+const jsondepth = @import("../util/jsondepth.zig");
 
 pub const Value = vals.Value;
 pub const LayerType = properties.LayerType;
@@ -552,6 +553,11 @@ pub fn parse(gpa: std.mem.Allocator, json_text: []const u8) Error!Style {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
+
+    // std.json builds the value tree by recursion with no depth limit of its
+    // own, so a document of ten thousand open brackets overflows the stack
+    // inside the parse. Refuse those depths before handing the text over.
+    if (!jsondepth.ok(json_text)) return error.InvalidJson;
 
     // Keep a private copy of the text: std.json.Value slices may point
     // into it, and the Style must outlive the caller's buffer.
