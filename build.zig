@@ -1,7 +1,7 @@
 const std = @import("std");
 const codecs = @import("build/codecs.zig");
-/// The manifest is the one place the version is written. The shared library
-/// stamps it into its soname, so a consumer links against an ABI, not a file.
+/// The version a plain `zig build` reports. A release overrides it with
+/// `-Dversion`, so the tag is what the published library carries.
 const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
@@ -69,7 +69,15 @@ pub fn build(b: *std.Build) void {
     // the host describe the host, and a release wants an archive that carries
     // its own decoders rather than one that hunts for them on the target.
     const codec_source = b.option(bool, "codec-source", "Compile libwebp and libpng from source") orelse (windows or android);
+    // The version the library reports and the shared library stamps into its
+    // soname. A release passes the tag, so nobody hand-edits a version to match
+    // one. build.zig.zon carries the default, for every other build.
+    const version = b.option([]const u8, "version", "Version the library reports (default: build.zig.zon)") orelse zon.version;
+    const semver = std.SemanticVersion.parse(version) catch @panic("-Dversion is not a semantic version");
+
     const ct_opts = b.addOptions();
+    // NUL-terminated, so charttable_version() hands the pointer straight to C.
+    ct_opts.addOption([:0]const u8, "version", b.allocator.dupeZ(u8, version) catch @panic("OOM"));
     ct_opts.addOption(bool, "webp", use_webp);
     ct_opts.addOption(bool, "libpng", use_libpng);
     // Which renderer src/gpu/gpu.zig selects on Windows.
@@ -225,7 +233,7 @@ pub fn build(b: *std.Build) void {
         .name = "charttable",
         .root_module = mod,
         .linkage = .dynamic,
-        .version = std.SemanticVersion.parse(zon.version) catch @panic("bad version in build.zig.zon"),
+        .version = semver,
     });
     const shared_step = b.step("shared", "Build the shared library + C header");
     shared_step.dependOn(&b.addInstallArtifact(shared, .{}).step);

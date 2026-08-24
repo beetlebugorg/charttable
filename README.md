@@ -56,7 +56,8 @@ Linux also gets a Debian package:
 `apt install ./libcharttable-dev_<version>_<arch>.deb`.
 
 The released libraries carry their own libwebp and libpng. They leave the
-Vulkan loader to the program that links them.
+Vulkan loader to the program that links them. `charttable_version()` reports
+the tag the library was built from.
 
 ## Build
 
@@ -64,6 +65,12 @@ Zig 0.16.0. `zig build test` runs the suite. `zig build lib` writes
 `libcharttable.a` and the header into `zig-out`; `zig build shared` writes the
 shared library beside them. Add `-Dcodec-source` to compile libwebp and libpng
 in instead of linking the platform copies — a cross build needs it.
+
+Two options carry into the artifact. `-Dversion` sets what
+`charttable_version()` reports and what the shared library stamps into its
+soname; a release passes the tag, and every other build takes the version in
+`build.zig.zon`. `-Dgpu=vk` selects the Vulkan backend on Windows, where D3D12
+is the default.
 
 ## Status
 

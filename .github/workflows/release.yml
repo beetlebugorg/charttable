@@ -35,14 +35,10 @@ jobs:
         with:
           version: 0.16.0
 
-      # build.zig.zon is the one place the version is written, and the shared
-      # library takes its soname from it. The tag is the second place, and a
-      # mismatch ships a libcharttable.so.0 whose download says something else.
-      - name: Check the tag against the version in the source
-        run: |
-          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
-          grep -q "\.version = \"$v\"" build.zig.zon
-
+      # -Dversion carries the tag into the library: charttable_version() reports
+      # it and the shared library stamps it into its soname. The build refuses a
+      # tag that is not a semantic version.
+      #
       # Two prefixes: on Windows the static archive and the DLL's import library
       # are both charttable.lib, so one prefix loses the archive.
       #
@@ -50,9 +46,10 @@ jobs:
       # libwebp and libpng rather than hunting for them on the target machine.
       - name: Build
         run: |
+          v="${GITHUB_REF_NAME#v}"
           for step in lib shared; do
             case $step in lib) p=out/static ;; shared) p=out/shared ;; esac
-            zig build "$step" -p "$p" \
+            zig build "$step" -p "$p" -Dversion="$v" \
               -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcodec-source
           done
 
