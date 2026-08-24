@@ -1,0 +1,94 @@
+name: Release
+
+# Push a `vX.Y.Z` tag to cut a release: every supported target is built and the
+# archives are attached to a GitHub release. A tag carrying a suffix
+# (`v0.2.0-rc1`) publishes as a prerelease — use one to prove the matrix before
+# the real tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS builds run natively per arch: the Metal backend compiles the
+          # ObjC shim against the platform SDK, which no other runner carries.
+          - { target: aarch64-macos, os: macos-latest }
+          - { target: x86_64-macos, os: macos-15-intel }
+          - { target: x86_64-linux-gnu, os: ubuntu-latest, deb: amd64 }
+          - { target: aarch64-linux-gnu, os: ubuntu-latest, deb: arm64 }
+          - { target: x86_64-windows-gnu, os: ubuntu-latest }
+          - { target: aarch64-windows-gnu, os: ubuntu-latest }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # build.zig.zon is the one place the version is written, and the shared
+      # library takes its soname from it. The tag is the second place, and a
+      # mismatch ships a libcharttable.so.0 whose download says something else.
+      - name: Check the tag against the version in the source
+        run: |
+          v="${GITHUB_REF_NAME#v}"; v="${v%%-*}"
+          grep -q "\.version = \"$v\"" build.zig.zon
+
+      # Two prefixes: on Windows the static archive and the DLL's import library
+      # are both charttable.lib, so one prefix loses the archive.
+      #
+      # -Dcodec-source everywhere, so every released library carries its own
+      # libwebp and libpng rather than hunting for them on the target machine.
+      - name: Build
+        run: |
+          for step in lib shared; do
+            case $step in lib) p=out/static ;; shared) p=out/shared ;; esac
+            zig build "$step" -p "$p" \
+              -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcodec-source
+          done
+
+      - name: Package
+        run: scripts/package-release.sh "${GITHUB_REF_NAME#v}" "${{ matrix.target }}" "${{ matrix.deb }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && shasum -a 256 charttable-* libcharttable-* > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A release may already exist: cutting one from the web UI is what
+          # created the tag that started this run, and a re-run after a failed
+          # leg lands here twice. Attach to it instead of failing on the 422,
+          # and leave hand-written notes alone.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag \
+              ${{ contains(github.ref_name, '-') && '--prerelease' || '' }} \
+              dist/*
+          fi

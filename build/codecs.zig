@@ -84,9 +84,9 @@ const webp_dsp_neon = [_][]const u8{
 };
 
 const zlib_src = [_][]const u8{
-    "adler32.c", "compress.c", "crc32.c",   "deflate.c",  "gzclose.c",
-    "gzlib.c",   "gzread.c",   "gzwrite.c", "infback.c",  "inffast.c",
-    "inflate.c", "inftrees.c", "trees.c",   "uncompr.c",  "zutil.c",
+    "adler32.c", "compress.c", "crc32.c",   "deflate.c", "gzclose.c",
+    "gzlib.c",   "gzread.c",   "gzwrite.c", "infback.c", "inffast.c",
+    "inflate.c", "inftrees.c", "trees.c",   "uncompr.c", "zutil.c",
 };
 
 const png_src = [_][]const u8{

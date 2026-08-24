@@ -31,7 +31,32 @@
 - **Native everywhere the engine goes.** The same scene contract drives
   Metal, Vulkan, D3D12 and SDL backends.
 
+## Install
+
+Every `vX.Y.Z` tag publishes an archive per target on
+[Releases](https://github.com/beetlebugorg/charttable/releases). Each archive
+holds the C header, the static library and the shared library:
+
+| Target | Static | Shared |
+| --- | --- | --- |
+| macOS, arm64 and x86_64 | `libcharttable.a` | `libcharttable.dylib` |
+| Linux, arm64 and x86_64 | `libcharttable.a` | `libcharttable.so` |
+| Windows, arm64 and x86_64 | `charttable.lib` | `charttable.dll` + `charttable.dll.lib` |
+
+Linux also gets a Debian package:
+`apt install ./libcharttable-dev_<version>_<arch>.deb`.
+
+The released libraries carry their own libwebp and libpng. They leave the
+Vulkan loader to the program that links them.
+
+## Build
+
+Zig 0.16.0. `zig build test` runs the suite. `zig build lib` writes
+`libcharttable.a` and the header into `zig-out`; `zig build shared` writes the
+shared library beside them. Add `-Dcodec-source` to compile libwebp and libpng
+in instead of linking the platform copies — a cross build needs it.
+
 ## Status
 
 Early extraction. See DESIGN.md for the architecture, the conformance tiers,
-and the milestone plan. Building: `zig build test` (Zig 0.16.0).
+and the milestone plan.

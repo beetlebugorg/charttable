@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  # push only on main; PR branches are covered by pull_request. Scoping push this
+  # way avoids the double run (a push to a branch with an open PR otherwise fires
+  # both events).
+  push:
+    branches: [main]
+  pull_request:
+
+# charttable builds with Zig 0.16 into libcharttable.a, libcharttable.so and the
+# C header. Every consumer takes one of those three, so CI builds all of them.
+#
+# Three jobs, because no single runner compiles the whole library:
+#   * build-test  — the gate. Vulkan backend, system codecs, the full test suite.
+#   * macos       — the only runner that compiles the Metal backend and the ObjC
+#                   shim, and the only one that builds the demo app.
+#   * cross       — every target a release ships, so a tag does not discover a
+#                   broken cross build after the fact.
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The test binary is a consumer of the renderer, so it links the Vulkan
+      # loader. The codecs come from the system here, which is the default path
+      # off Windows and the one an embedder on Linux takes.
+      - name: Install the Vulkan loader and the codecs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev libwebp-dev libpng-dev
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Format check
+        run: zig fmt --check src/ build/ build.zig
+
+      # Debug keeps the tests' safety checks. The cross matrix covers ReleaseFast.
+      # The GPU tests open a device and skip themselves when the runner has none,
+      # so the suite passes headless.
+      - name: Build and test
+        run: zig build install test
+
+      - name: Build the shared library
+        run: zig build shared
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The default codec path on macOS: Homebrew's static archives, which is
+      # what a developer on this platform links.
+      - name: Install the codecs
+        run: brew install webp libpng
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # Compiles gpu_metal.zig and metal_shim.m, which no other runner reaches.
+      # Build only: the Metal tests need a real device, and this runner is not
+      # promised one.
+      - name: Build the libraries
+        run: zig build lib shared -Doptimize=ReleaseFast
+
+      - name: Build the chart demo
+        run: zig build example
+
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux-gnu }
+          - { target: aarch64-linux-gnu }
+          - { target: x86_64-windows-gnu }
+          - { target: aarch64-windows-gnu }
+    name: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # -Dcodec-source, as the release builds use: the system headers of this
+      # runner describe this runner, so a cross build compiles its own libwebp
+      # and libpng instead. Builds both linkages, because the shared one is a
+      # real link and fails where the archive still builds.
+      - name: Cross-compile ${{ matrix.target }}
+        run: |
+          zig build lib shared -Doptimize=ReleaseFast -Dcodec-source \
+            -Dtarget=${{ matrix.target }}
