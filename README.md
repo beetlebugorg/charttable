@@ -33,7 +33,16 @@
 
 ## Install
 
-Every `vX.Y.Z` tag publishes an archive per target on
+macOS and Linux, through Homebrew:
+
+```
+brew install beetlebugorg/tap/charttable
+```
+
+That puts `charttable.h` under `include/` and the static and shared libraries
+under `lib/`.
+
+Every `vX.Y.Z` tag also publishes an archive per target on
 [Releases](https://github.com/beetlebugorg/charttable/releases). Each archive
 holds the C header, the static library and the shared library:
 
