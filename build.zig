@@ -1,7 +1,7 @@
 const std = @import("std");
 const codecs = @import("build/codecs.zig");
-/// The version a plain `zig build` reports. A release overrides it with
-/// `-Dversion`, so the tag is what the published library carries.
+/// Read for `.version`, which is the dev sentinel a source build reports. A
+/// release passes the tag as `-Dversion` instead.
 const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {

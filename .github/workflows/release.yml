@@ -1,9 +1,10 @@
 name: Release
 
-# Push a `vX.Y.Z` tag to cut a release: every supported target is built and the
-# archives are attached to a GitHub release. A tag carrying a suffix
-# (`v0.2.0-rc1`) publishes as a prerelease — use one to prove the matrix before
-# the real tag.
+# Push a `vX.Y.Z` tag to cut a release. That is the whole procedure: the tag is
+# the version, so no file needs a bump first. Every supported target is built,
+# the archives are attached to a GitHub release, and the Homebrew tap is
+# updated. A tag carrying a suffix (`v0.2.0-rc1`) publishes as a prerelease and
+# leaves the tap alone — use one to prove the matrix before the real tag.
 on:
   push:
     tags: ["v*"]

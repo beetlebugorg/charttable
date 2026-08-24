@@ -1,6 +1,9 @@
 .{
     .name = .charttable,
-    .version = "0.1.0",
+    // Not a release number, and it never changes. A release takes its version
+    // from the tag (-Dversion), so there is nothing here to keep in step. A
+    // build from a source checkout reports this instead, which is what it is.
+    .version = "0.0.0-dev",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xf9efa2121e26fedc,
     // The image codecs, for a target that cannot take them from the platform

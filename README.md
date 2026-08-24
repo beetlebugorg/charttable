@@ -68,9 +68,9 @@ in instead of linking the platform copies — a cross build needs it.
 
 Two options carry into the artifact. `-Dversion` sets what
 `charttable_version()` reports and what the shared library stamps into its
-soname; a release passes the tag, and every other build takes the version in
-`build.zig.zon`. `-Dgpu=vk` selects the Vulkan backend on Windows, where D3D12
-is the default.
+soname; a release passes the tag. Without it a build reports `0.0.0-dev`, the
+sentinel in `build.zig.zon`, because a source checkout is not a release.
+`-Dgpu=vk` selects the Vulkan backend on Windows, where D3D12 is the default.
 
 ## Status
 
