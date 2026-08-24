@@ -57,15 +57,17 @@ class Charttable < Formula
     # soname.
     lib.install Dir["lib/*"]
 
-    # Zig writes a bare file name as the dylib id, and dyld does not search the
-    # Homebrew prefix. Name the installed path instead, so a program that links
-    # -lcharttable finds the library at run time. Editing a Mach-O header
-    # breaks the ad-hoc signature on Apple Silicon, so sign it again.
+    # Zig writes @rpath as the dylib id, which only resolves for a program that
+    # sets an rpath. Name the installed path instead, so anything that links
+    # -lcharttable finds the library at run time. The library is built with
+    # -headerpad_max_install_names, which is what leaves room for a path this
+    # long. Editing a Mach-O header breaks the ad-hoc signature on Apple
+    # Silicon, so sign it again.
     return unless OS.mac?
 
     dylib = lib/"libcharttable.#{version}.dylib"
     system "install_name_tool", "-id", lib/"libcharttable.#{version.major}.dylib", dylib
-    MachO.codesign!(dylib) if Hardware::CPU.arm?
+    system "codesign", "--force", "--sign", "-", dylib if Hardware::CPU.arm?
   end
 
   test do

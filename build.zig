@@ -242,6 +242,13 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
         .version = semver,
     });
+    // Room in the Mach-O header for a longer install name. Zig writes
+    // `@rpath/libcharttable.dylib` as the id, and a package manager rewrites
+    // that to the absolute path it installed to, which is far longer.
+    // install_name_tool cannot grow the load commands after the fact, so the
+    // space has to be reserved at link time.
+    if (apple) shared.headerpad_max_install_names = true;
+
     const shared_step = b.step("shared", "Build the shared library + C header");
     shared_step.dependOn(&b.addInstallArtifact(shared, .{}).step);
     shared_step.dependOn(&header.step);
