@@ -69,6 +69,15 @@ jobs:
       - name: Build the libraries
         run: zig build lib shared -Doptimize=ReleaseFast
 
+      # The same build the release runs. -Dtarget makes it a CROSS build to zig
+      # even on a mac, which takes a different path through the SDK than the
+      # native build above. Without this step a tag is where that difference
+      # gets found.
+      - name: Build the way a release does
+        run: |
+          zig build lib shared -Doptimize=ReleaseFast -Dcodec-source \
+            -Dtarget=aarch64-macos --sysroot "$(xcrun --show-sdk-path)"
+
       - name: Build the chart demo
         run: zig build example
 

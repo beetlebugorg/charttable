@@ -48,9 +48,16 @@ jobs:
       - name: Build
         run: |
           v="${GITHUB_REF_NAME#v}"
+          # -Dtarget makes a macOS build a CROSS build to zig, even on a mac,
+          # and a cross build skips the SDK detection that finds Metal,
+          # QuartzCore and Foundation. Naming the SDK puts them back.
+          sdk=()
+          case "${{ matrix.target }}" in
+            *macos*) sdk=(--sysroot "$(xcrun --show-sdk-path)") ;;
+          esac
           for step in lib shared; do
             case $step in lib) p=out/static ;; shared) p=out/shared ;; esac
-            zig build "$step" -p "$p" -Dversion="$v" \
+            zig build "$step" -p "$p" -Dversion="$v" "${sdk[@]}" \
               -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dcodec-source
           done
 
