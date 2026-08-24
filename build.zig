@@ -174,6 +174,13 @@ pub fn build(b: *std.Build) void {
         // passes a sysroot on every Xcode cross build.
         if (b.sysroot) |sr| {
             m.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sr, "usr/include" }) });
+            // The SDK's frameworks, for the same reason. A NATIVE macOS build
+            // finds these by asking xcrun where the SDK is. Naming -Dtarget
+            // makes the build a cross build, and a cross build starts with an
+            // EMPTY framework search path — passing --sysroot does not fill it,
+            // because the compiler reads the sysroot for headers and libraries
+            // only. Metal, QuartzCore and Foundation live here.
+            if (apple) m.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sr, "System/Library/Frameworks" }) });
         }
         if (use_webp or use_libpng) {
             // The sources are fetched by the package manager (build.zig.zon) and
