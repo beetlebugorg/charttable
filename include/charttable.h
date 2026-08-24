@@ -109,6 +109,10 @@ void charttable_set_zoom_range(charttable *, double min_zoom, double max_zoom);
  * vertex/uniform layout, which shades wrong rather than failing. */
 uint32_t charttable_abi_layout(void);
 
+/* The version this library was built as ("0.4.1"), NUL-terminated. The string
+ * is static: do not free it, and it needs no handle. */
+const char *charttable_version(void);
+
 /* ---- style and sources -------------------------------------------------- */
 
 int charttable_set_style_json(charttable *, const char *json, size_t len);

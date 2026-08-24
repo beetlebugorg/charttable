@@ -8,3 +8,7 @@ specs/
 
 # Example app build output
 examples/macos/chartview
+
+# Where scripts/package-release.sh builds and stages a release
+out/
+dist/

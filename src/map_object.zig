@@ -648,10 +648,10 @@ pub const Map = struct {
         std.debug.print(
             "ct-trace: {s} dirty={} partial={} building={} covHolds={} bz={d:.2} cov={d:.2} cam={d:.2} tgt={d:.2} anim={} gest={} wanted={d} have={d} pend={d}\n",
             .{
-                act,                  self.dirty,          self.partial,
+                act,                  self.dirty,           self.partial,
                 self.building,        self.coverageHolds(), self.buildZoom(),
-                self.cov_zoom,        self.cam.zoom,       self.cam.target_zoom,
-                self.cam.animating(), self.gesturing(),    self.wanted.items.len,
+                self.cov_zoom,        self.cam.zoom,        self.cam.target_zoom,
+                self.cam.animating(), self.gesturing(),     self.wanted.items.len,
                 have,                 self.pendingWanted(),
             },
         );
@@ -2942,9 +2942,9 @@ test "Map: the cost of a zoom sweep" {
             "zoom OUT z16->z14, 8 wheel notches of one quantum: {d} ms, {d} rebuilds, {d} tiles tessellated\n" ++
             "  buckets reused overall: {d}\n",
         .{
-            eased_ms,       eased_rebuilds,        eased_built,
-            frames,         step_ms,               m.rebuilds - r1,
-            m.tiles_built - b1, out_ms,            m.rebuilds - r2,
+            eased_ms,           eased_rebuilds,           eased_built,
+            frames,             step_ms,                  m.rebuilds - r1,
+            m.tiles_built - b1, out_ms,                   m.rebuilds - r2,
             m.tiles_built - b2, m.tiles_reused - reused0,
         },
     );

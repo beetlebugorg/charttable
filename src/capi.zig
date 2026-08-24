@@ -369,6 +369,13 @@ export fn charttable_abi_layout() callconv(.c) u32 {
     return @import("scene/types.zig").abiLayout();
 }
 
+/// The version this library was built as ("0.4.1"). A release build takes it
+/// from the tag. The string is static: it needs no free and outlives the
+/// handle, so there is no handle to pass.
+export fn charttable_version() callconv(.c) [*:0]const u8 {
+    return @import("ct_build").version;
+}
+
 // ---- style + sources -------------------------------------------------------
 
 export fn charttable_set_style_json(h: ?*anyopaque, json: [*]const u8, len: usize) callconv(.c) c_int {
@@ -1114,6 +1121,13 @@ test "capi: a handle opens, takes a style, moves the camera, and closes" {
 
     // The layout guard is the scene contract's, not a second copy.
     try testing.expectEqual(@import("scene/types.zig").abiLayout(), charttable_abi_layout());
+}
+
+test "capi: the version comes from the build" {
+    const built = @import("ct_build").version;
+    try testing.expectEqualStrings(built, std.mem.span(charttable_version()));
+    // A tag drives this, so it has to parse as one.
+    _ = try std.SemanticVersion.parse(built);
 }
 
 test "capi: every entry point is null-safe" {
