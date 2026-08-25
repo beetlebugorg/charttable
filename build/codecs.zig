@@ -137,9 +137,20 @@ fn addWebp(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarg
     switch (target.result.cpu.arch) {
         .x86, .x86_64 => {
             // SSE2 is baseline on x86_64 and the kernels guard themselves on
-            // 32-bit; SSE4.1 has to be asked for.
+            // 32-bit; SSE4.1 has to be asked for. It is asked for at the cc1
+            // level because zig resolves a C compile's cpu from the module
+            // target, and an -msse4.1 in cflags loses to it. The MSVC ABI is
+            // where that bites: clang defines _MSC_VER there, webp's cpu.h
+            // reads that as permission to use the SSE4.1 intrinsics (real
+            // MSVC needs no arch flag), and without the real features every
+            // kernel fails to compile. On the other ABIs nothing defines
+            // __SSE4_1__, so these units compile empty and the dispatcher
+            // stays on SSE2.
             mod.addCSourceFiles(.{ .root = root, .files = &webp_dsp_sse2, .flags = &(base_flags ++ [_][]const u8{"-msse2"}) });
-            mod.addCSourceFiles(.{ .root = root, .files = &webp_dsp_sse41, .flags = &(base_flags ++ [_][]const u8{"-msse4.1"}) });
+            mod.addCSourceFiles(.{ .root = root, .files = &webp_dsp_sse41, .flags = &(base_flags ++ [_][]const u8{
+                "-Xclang", "-target-feature", "-Xclang", "+ssse3",
+                "-Xclang", "-target-feature", "-Xclang", "+sse4.1",
+            }) });
         },
         .aarch64, .aarch64_be => {
             mod.addCSourceFiles(.{ .root = root, .files = &webp_dsp_neon, .flags = &base_flags });
