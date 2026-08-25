@@ -54,21 +54,17 @@ pub fn build(b: *std.Build) void {
     // reference for correctness.
     const use_libpng = b.option(bool, "libpng", "Decode PNG with libpng instead of the built-in reader") orelse true;
     // A directory holding cross-built codec archives: include/ plus
-    // lib/libwebp.a and lib/libpng16.a. Set it for a target that has no system
-    // package manager, such as an iOS or visionOS device. Left unset, the codecs
-    // come from Homebrew on macOS and from the system elsewhere.
+    // lib/libwebp.a and lib/libpng16.a, for a build that wants neither the
+    // bundled sources nor the platform's copies.
     // An empty value counts as unset, so an embedder can pass the option
     // unconditionally.
     const codec_dir: ?[]const u8 = blk: {
         const d = b.option([]const u8, "codec-dir", "Directory of cross-built codec archives (include/ + lib/)") orelse break :blk null;
         break :blk if (d.len == 0) null else d;
     };
-    // Compile the codecs from source instead of taking them from the platform.
-    // Windows and Android have neither Homebrew nor a system copy, so they turn
-    // it on by themselves. A cross build asks for it too: the system headers of
-    // the host describe the host, and a release wants an archive that carries
-    // its own decoders rather than one that hunts for them on the target.
-    const codec_source = b.option(bool, "codec-source", "Compile libwebp and libpng from source") orelse (windows or android);
+    // On for every target; a distro build that must link the platform's
+    // codecs passes -Dcodec-source=false.
+    const codec_source = b.option(bool, "codec-source", "Compile libwebp and libpng from source") orelse true;
     // The version the library reports and the shared library stamps into its
     // soname. A release passes the tag, so nobody hand-edits a version to match
     // one. build.zig.zon carries the default, for every other build.

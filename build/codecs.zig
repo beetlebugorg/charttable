@@ -1,10 +1,7 @@
 //! libwebp, libpng and zlib compiled from source into the charttable module.
 //!
-//! The other targets take these from the platform: Homebrew's static archives
-//! on macOS, the system packages elsewhere, or a directory of cross-built
-//! archives named by `-Dcodec-dir`. Windows has none of those, and the option
-//! defaults are on, so the sources are fetched by the package manager
-//! (build.zig.zon) and built here.
+//! The default on every target; `-Dcodec-source=false` links the platform's
+//! libraries instead, `-Dcodec-dir` names cross-built archives.
 //!
 //! Only the decoders are built. charttable reads tiles; it never writes a WebP
 //! or a PNG, so libwebp's encoder, mux and demux are left out and libpng's
