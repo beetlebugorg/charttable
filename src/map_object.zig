@@ -1038,11 +1038,20 @@ pub const Map = struct {
         return self.extentsAt(self.buildZoom());
     }
 
+    /// ROTATED, like `Camera.halfExtents`. Measuring the build unrotated while
+    /// `coverageHolds` tested the camera rotated left a coverage box that could
+    /// not contain the view it was built for, so the map rebuilt every frame
+    /// and never reported idle.
     fn extentsAt(self: *const Map, zoom: f64) cameras.Vec2 {
         const wp = 512.0 * std.math.pow(f64, 2.0, zoom);
+        const ext = cameras.rotatedExtent(
+            @as(f64, self.cam.vw),
+            @as(f64, self.cam.vh),
+            self.cam.rotation,
+        );
         return .{
-            .x = @as(f64, self.cam.vw) * 0.5 / wp * self.opts.overscan,
-            .y = @as(f64, self.cam.vh) * 0.5 / wp * self.opts.overscan,
+            .x = ext[0] * 0.5 / wp * self.opts.overscan,
+            .y = ext[1] * 0.5 / wp * self.opts.overscan,
         };
     }
 
@@ -2000,6 +2009,33 @@ test "Map: panning inside coverage changes no buffers; leaving it rebuilds" {
     try settle(&m);
     try testing.expect(m.rebuilds > rebuilds);
     try testing.expect(m.scene_generation > gen);
+}
+
+test "Map: a rotated view settles instead of rebuilding forever" {
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+
+    // At 45 degrees the rotated box is 1.41x the side, past the 25% overscan.
+    for ([_]f64{ 0, 10, 45, 90, 135, 171.84, -171.84 }) |deg| {
+        var stub = StubSource{ .bytes = try stubTileBytes(arena.allocator()) };
+        var m = Map.init(a, .{ .cache = .{ .workers = 2 } });
+        defer m.deinit();
+        try m.setStyleJson(test_style);
+        _ = try m.bindSource("chart", stub.source(14));
+        m.setViewport(1400, 900);
+        m.setView(-76.4767, 38.9763, 14);
+        m.cam.rotation = deg * std.math.pi / 180.0;
+
+        try settle(&m);
+        try testing.expect(m.coverageHolds());
+        try testing.expect(!m.needsRebuild());
+
+        const rebuilds = m.rebuilds;
+        for (0..8) |_| _ = try m.update();
+        try testing.expectEqual(rebuilds, m.rebuilds);
+        try testing.expect(m.idle());
+    }
 }
 
 test "Map: a zoom inside the band holds the scene; a big one rebuilds" {
