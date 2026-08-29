@@ -263,6 +263,11 @@ pub const Gpu = struct {
     /// "resource creation from any thread" contract held there and lost the
     /// device here.
     mu: Lock = .{},
+    /// The scene the last adoption displaced. Its buffers, its textures and
+    /// their descriptor sets can still be referenced by the frame in flight, and
+    /// destroying those while the GPU reads them is undefined. It is freed on
+    /// the next frame, once the fence says that frame is done.
+    retired: ?Scene = null,
     /// Set once the driver reports VK_ERROR_DEVICE_LOST. The device cannot be
     /// recovered, only recreated, so every submit after this is refused: a
     /// retry loop against a lost device spins a core and, because each attempt
@@ -344,7 +349,12 @@ pub const Gpu = struct {
     fence: vk.VkFence = null, // frame fence
     up_fence: vk.VkFence = null,
     acquire_sem: vk.VkSemaphore = null,
-    render_sem: vk.VkSemaphore = null,
+    /// One per swapchain image, not one for the swapchain. A present holds its
+    /// wait semaphore until that image is acquired again, so signalling the
+    /// same one for the next image while the previous present still owns it is
+    /// undefined — the driver is entitled to lose the device, and this one did.
+    /// Indexed by the acquired image index.
+    render_sems: [8]vk.VkSemaphore = @splat(null),
 
     msaa_used: bool,
     msaa_img: vk.VkImage = null,
@@ -1004,7 +1014,8 @@ pub const Gpu = struct {
         var si = std.mem.zeroes(vk.VkSemaphoreCreateInfo);
         si.sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         try check(vk.vkCreateSemaphore(self.device, &si, null, &self.acquire_sem), "acquire sem");
-        try check(vk.vkCreateSemaphore(self.device, &si, null, &self.render_sem), "render sem");
+        for (&self.render_sems) |*sem|
+            try check(vk.vkCreateSemaphore(self.device, &si, null, sem), "render sem");
     }
 
     /// One-shot upload commands: record via the callback, submit, fence-wait.
@@ -1826,10 +1837,28 @@ pub const Gpu = struct {
     }
 
     fn adoptSceneHeld(self: *Gpu, sc: Scene) void {
-        self.freeSceneHeld();
+        // Two adoptions with no frame between them: the first retirement has
+        // not been reached by a fence yet, so wait for it here rather than free
+        // it blind. Rare, and cheaper than the alternative of never freeing.
+        if (self.retired != null) {
+            _ = vk.vkWaitForFences(self.device, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64));
+            self.freeRetiredHeld();
+        }
+        self.retired = self.scene;
+        self.scene = null;
+
         var landed = sc;
         self.realizeScene(&landed);
         self.scene = landed;
+    }
+
+    /// Free what the last adoption displaced. The caller owns the lock and has
+    /// established that the frame using it has finished.
+    fn freeRetiredHeld(self: *Gpu) void {
+        if (self.retired) |*s| {
+            self.freeSceneValue(s);
+            self.retired = null;
+        }
     }
 
     pub fn uploadScene(self: *Gpu, alloc: std.mem.Allocator, data: SceneData) !void {
@@ -2077,6 +2106,9 @@ pub const Gpu = struct {
             if (self.swapchain == null) return true;
         }
         _ = vk.vkWaitForFences(self.device, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64));
+        // The fence is the proof the previous frame finished, so whatever that
+        // frame was still reading can go now.
+        self.freeRetiredHeld();
         var image_index: u32 = 0;
         const ar = vk.vkAcquireNextImageKHR(self.device, self.swapchain, std.math.maxInt(u64), self.acquire_sem, null, &image_index);
         if (ar == vk.VK_ERROR_OUT_OF_DATE_KHR) {
@@ -2104,7 +2136,7 @@ pub const Gpu = struct {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &self.cmd;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &self.render_sem;
+        si.pSignalSemaphores = &self.render_sems[image_index];
         const fr = vk.vkQueueSubmit(self.queue, 1, &si, self.fence);
         if (fr == vk.VK_ERROR_DEVICE_LOST) self.lost = true;
         try check(fr, "submit frame");
@@ -2112,7 +2144,7 @@ pub const Gpu = struct {
         var pi = std.mem.zeroes(vk.VkPresentInfoKHR);
         pi.sType = vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &self.render_sem;
+        pi.pWaitSemaphores = &self.render_sems[image_index];
         pi.swapchainCount = 1;
         pi.pSwapchains = &self.swapchain;
         pi.pImageIndices = &image_index;
@@ -2168,6 +2200,7 @@ pub const Gpu = struct {
         defer self.mu.unlock();
         _ = vk.vkDeviceWaitIdle(self.device);
         self.clearOverlayHeld();
+        self.freeRetiredHeld();
         self.freeSceneHeld();
         if (self.sprite_tex) |*t| self.destroyTexture(t);
         if (self.glyph_tex) |*t| self.destroyTexture(t);
@@ -2180,7 +2213,8 @@ pub const Gpu = struct {
         self.releaseDepth();
         self.destroyBuffer(&self.ring);
         if (self.acquire_sem != null) vk.vkDestroySemaphore(self.device, self.acquire_sem, null);
-        if (self.render_sem != null) vk.vkDestroySemaphore(self.device, self.render_sem, null);
+        for (self.render_sems) |sem|
+            if (sem != null) vk.vkDestroySemaphore(self.device, sem, null);
         if (self.fence != null) vk.vkDestroyFence(self.device, self.fence, null);
         if (self.up_fence != null) vk.vkDestroyFence(self.device, self.up_fence, null);
         if (self.cmd_pool != null) vk.vkDestroyCommandPool(self.device, self.cmd_pool, null);
