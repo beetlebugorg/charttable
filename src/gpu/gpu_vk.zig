@@ -1032,7 +1032,11 @@ pub const Gpu = struct {
     // ---- swapchain -------------------------------------------------------------
     fn createSwapchain(self: *Gpu) !void {
         var caps: vk.VkSurfaceCapabilitiesKHR = undefined;
-        try check(vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, &caps), "surface caps");
+        const cr = vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, &caps);
+        // Distinct from any other failure: the caller drops the surface rather
+        // than logging and trying the same rebuild again next frame.
+        if (cr == vk.VK_ERROR_SURFACE_LOST_KHR) return error.SurfaceLost;
+        try check(cr, "surface caps");
         var extent = caps.currentExtent;
         if (extent.width == 0xFFFFFFFF) {
             // Wayland: the surface has no size of its own — the client names one.
@@ -1144,6 +1148,10 @@ pub const Gpu = struct {
         self.releaseMsaa();
         self.releaseDepth();
         self.createSwapchain() catch |e| {
+            if (e == error.SurfaceLost) {
+                self.surfaceLostHeld();
+                return;
+            }
             logErr("swapchain recreate failed: %d", .{@as(c_int, @intFromError(e))});
             return;
         };
@@ -1319,6 +1327,27 @@ pub const Gpu = struct {
     pub fn detachSurface(self: *Gpu) void {
         self.mu.lock();
         defer self.mu.unlock();
+        self.detachSurfaceHeld();
+    }
+
+    /// VK_ERROR_SURFACE_LOST_KHR, from wherever it surfaced.
+    ///
+    /// It is NOT a swapchain problem and recreating the swapchain cannot fix
+    /// it: the VkSurfaceKHR itself is dead and only a new one from the host
+    /// will do. Android reaches this on every background, because the platform
+    /// frees the window the moment surfaceDestroyed returns, and it can catch
+    /// a frame that is already in flight.
+    ///
+    /// Treating it as an ordinary error meant the frame loop asked again next
+    /// frame, and the answer never changed: measured on a Lenovo TB305FU at
+    /// 1,946 failed acquires and 16% of a core over eighteen seconds, still
+    /// climbing, and still climbing after the app returned to the foreground.
+    /// Dropping the surface makes every later frame return at the
+    /// `surface == null` guard until the host attaches another, which is what
+    /// the Android shell does on the next surfaceCreated.
+    fn surfaceLostHeld(self: *Gpu) void {
+        if (self.surface == null) return;
+        logInfo("vk: surface lost; dropping it until the host attaches another", .{});
         self.detachSurfaceHeld();
     }
 
@@ -2079,6 +2108,10 @@ pub const Gpu = struct {
         _ = vk.vkWaitForFences(self.device, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64));
         var image_index: u32 = 0;
         const ar = vk.vkAcquireNextImageKHR(self.device, self.swapchain, std.math.maxInt(u64), self.acquire_sem, null, &image_index);
+        if (ar == vk.VK_ERROR_SURFACE_LOST_KHR) {
+            self.surfaceLostHeld();
+            return false;
+        }
         if (ar == vk.VK_ERROR_OUT_OF_DATE_KHR) {
             self.recreateSwapchain();
             return true; // present skipped; content still pending (view_dirty stays)
@@ -2122,6 +2155,10 @@ pub const Gpu = struct {
         // state, so it alone is no reason to rebuild — that recreates the
         // swapchain every frame. Rebuild on it only when the extent actually
         // disagrees with the viewport the host declared.
+        if (pr == vk.VK_ERROR_SURFACE_LOST_KHR) {
+            self.surfaceLostHeld();
+            return true; // the frame was recorded; there is nothing to show it on
+        }
         if (pr == vk.VK_ERROR_OUT_OF_DATE_KHR or (pr == vk.VK_SUBOPTIMAL_KHR and self.extentStale())) {
             self.recreateSwapchain();
         }
