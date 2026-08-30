@@ -26,6 +26,7 @@ const vk = c_vk.c;
 const scene = @import("../scene/types.zig");
 const batch = @import("../scene/batch.zig");
 const png = @import("../util/png.zig");
+const Lock = @import("../util/lock.zig").Lock;
 
 // Precompiled SPIR-V (shaders/vk/*.spv), converted to u32 words at comptime:
 // @embedFile data carries NO alignment guarantee and vkCreateShaderModule
@@ -254,6 +255,25 @@ pub const RasterTex = Tex;
 pub const RasterDraw = struct { tex: RasterTex, first: u32, count: u32 };
 
 pub const Gpu = struct {
+    /// A VkQueue, a VkCommandBuffer, a VkFence and a VkDescriptorPool are all
+    /// externally synchronised, and this backend holds one of each. The build
+    /// worker stages scenes (makeScene, freeStagedScene) while the owner thread
+    /// uploads atlases and draws, so every entry point that touches a device
+    /// object takes this. Metal needs none of it, which is why the Map's
+    /// "resource creation from any thread" contract held there and lost the
+    /// device here.
+    mu: Lock = .{},
+    /// The scene the last adoption displaced. Its buffers, its textures and
+    /// their descriptor sets can still be referenced by the frame in flight, and
+    /// destroying those while the GPU reads them is undefined. It is freed on
+    /// the next frame, once the fence says that frame is done.
+    retired: ?Scene = null,
+    /// Set once the driver reports VK_ERROR_DEVICE_LOST. The device cannot be
+    /// recovered, only recreated, so every submit after this is refused: a
+    /// retry loop against a lost device spins a core and, because each attempt
+    /// allocates before it fails, eats the card.
+    lost: bool = false,
+
     instance: vk.VkInstance,
     phys: vk.VkPhysicalDevice,
     device: vk.VkDevice,
@@ -329,7 +349,12 @@ pub const Gpu = struct {
     fence: vk.VkFence = null, // frame fence
     up_fence: vk.VkFence = null,
     acquire_sem: vk.VkSemaphore = null,
-    render_sem: vk.VkSemaphore = null,
+    /// One per swapchain image, not one for the swapchain. A present holds its
+    /// wait semaphore until that image is acquired again, so signalling the
+    /// same one for the next image while the previous present still owns it is
+    /// undefined — the driver is entitled to lose the device, and this one did.
+    /// Indexed by the acquired image index.
+    render_sems: [8]vk.VkSemaphore = @splat(null),
 
     msaa_used: bool,
     msaa_img: vk.VkImage = null,
@@ -989,12 +1014,14 @@ pub const Gpu = struct {
         var si = std.mem.zeroes(vk.VkSemaphoreCreateInfo);
         si.sType = vk.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         try check(vk.vkCreateSemaphore(self.device, &si, null, &self.acquire_sem), "acquire sem");
-        try check(vk.vkCreateSemaphore(self.device, &si, null, &self.render_sem), "render sem");
+        for (&self.render_sems) |*sem|
+            try check(vk.vkCreateSemaphore(self.device, &si, null, sem), "render sem");
     }
 
     /// One-shot upload commands: record via the callback, submit, fence-wait.
     /// Render-thread only (async_build is disabled on this backend).
     fn oneShot(self: *Gpu, ctx: anytype, comptime record: fn (@TypeOf(ctx), vk.VkCommandBuffer) void) !void {
+        if (self.lost) return error.VulkanFailure;
         try check(vk.vkResetCommandBuffer(self.up_cmd, 0), "reset up cmd");
         var bi = std.mem.zeroes(vk.VkCommandBufferBeginInfo);
         bi.sType = vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1006,7 +1033,9 @@ pub const Gpu = struct {
         si.sType = vk.VK_STRUCTURE_TYPE_SUBMIT_INFO;
         si.commandBufferCount = 1;
         si.pCommandBuffers = &self.up_cmd;
-        try check(vk.vkQueueSubmit(self.queue, 1, &si, self.up_fence), "submit upload");
+        const sr = vk.vkQueueSubmit(self.queue, 1, &si, self.up_fence);
+        if (sr == vk.VK_ERROR_DEVICE_LOST) self.lost = true;
+        try check(sr, "submit upload");
         _ = vk.vkWaitForFences(self.device, 1, &self.up_fence, vk.VK_TRUE, std.math.maxInt(u64));
         _ = vk.vkResetFences(self.device, 1, &self.up_fence);
     }
@@ -1014,7 +1043,11 @@ pub const Gpu = struct {
     // ---- swapchain -------------------------------------------------------------
     fn createSwapchain(self: *Gpu) !void {
         var caps: vk.VkSurfaceCapabilitiesKHR = undefined;
-        try check(vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, &caps), "surface caps");
+        const cr = vk.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.phys, self.surface, &caps);
+        // Distinct from any other failure: the caller drops the surface rather
+        // than logging and trying the same rebuild again next frame.
+        if (cr == vk.VK_ERROR_SURFACE_LOST_KHR) return error.SurfaceLost;
+        try check(cr, "surface caps");
         var extent = caps.currentExtent;
         if (extent.width == 0xFFFFFFFF) {
             // Wayland: the surface has no size of its own — the client names one.
@@ -1126,6 +1159,10 @@ pub const Gpu = struct {
         self.releaseMsaa();
         self.releaseDepth();
         self.createSwapchain() catch |e| {
+            if (e == error.SurfaceLost) {
+                self.surfaceLostHeld();
+                return;
+            }
             logErr("swapchain recreate failed: %d", .{@as(c_int, @intFromError(e))});
             return;
         };
@@ -1299,6 +1336,33 @@ pub const Gpu = struct {
     /// A VkSurfaceKHR wraps the host's window handle, so the host is free to
     /// destroy that handle the moment this returns.
     pub fn detachSurface(self: *Gpu) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.detachSurfaceHeld();
+    }
+
+    /// VK_ERROR_SURFACE_LOST_KHR, from wherever it surfaced.
+    ///
+    /// It is NOT a swapchain problem and recreating the swapchain cannot fix
+    /// it: the VkSurfaceKHR itself is dead and only a new one from the host
+    /// will do. Android reaches this on every background, because the platform
+    /// frees the window the moment surfaceDestroyed returns, and it can catch
+    /// a frame that is already in flight.
+    ///
+    /// Treating it as an ordinary error meant the frame loop asked again next
+    /// frame, and the answer never changed: measured on a Lenovo TB305FU at
+    /// 1,946 failed acquires and 16% of a core over eighteen seconds, still
+    /// climbing, and still climbing after the app returned to the foreground.
+    /// Dropping the surface makes every later frame return at the
+    /// `surface == null` guard until the host attaches another, which is what
+    /// the Android shell does on the next surfaceCreated.
+    fn surfaceLostHeld(self: *Gpu) void {
+        if (self.surface == null) return;
+        logInfo("vk: surface lost; dropping it until the host attaches another", .{});
+        self.detachSurfaceHeld();
+    }
+
+    fn detachSurfaceHeld(self: *Gpu) void {
         if (self.surface == null) return;
         _ = vk.vkDeviceWaitIdle(self.device);
         self.destroySwapchainViews();
@@ -1321,7 +1385,9 @@ pub const Gpu = struct {
     /// means rebuilding both. Nothing is attached after a failure, so a caller
     /// that cannot proceed without a view reopens.
     pub fn attachSurface(self: *Gpu, opts: Options) !void {
-        self.detachSurface();
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.detachSurfaceHeld();
         try self.createSurface(self.instance, opts);
         errdefer {
             vk.vkDestroySurfaceKHR(self.instance, self.surface, null);
@@ -1370,6 +1436,8 @@ pub const Gpu = struct {
     /// (Java) view; the pixel size follows the swapchain. Their ratio is the
     /// pixel density (the camera's HiDPI denominator).
     pub fn resize(self: *Gpu, width_pts: u32, height_pts: u32) void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.resizeFallible(width_pts, height_pts) catch |e| {
             logErr("resize failed: %d", .{@intFromError(e)});
         };
@@ -1439,6 +1507,8 @@ pub const Gpu = struct {
 
     // ---- atlases / textures --------------------------------------------------------
     pub fn uploadSpriteAtlas(self: *Gpu, rgba: []const u8, w: u32, h: u32) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.sprite_tex = try self.makeTexture(rgba, w, h);
         self.sprite_w = w;
         self.sprite_h = h;
@@ -1449,6 +1519,8 @@ pub const Gpu = struct {
     /// whole sheet for each one showed up as a stall on the interactive path.
     /// False means the caller should upload the atlas whole instead.
     pub fn updateSpriteAtlasRows(self: *Gpu, rgba: []const u8, w: u32, h: u32, y0: u32, rows: u32) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
         const t = self.sprite_tex orelse return false;
         if (w != self.sprite_w or h != self.sprite_h) return false;
         if (rows == 0 or y0 + rows > h) return false;
@@ -1494,18 +1566,28 @@ pub const Gpu = struct {
     }
 
     pub fn uploadGlyphAtlas(self: *Gpu, rgba: []const u8, w: u32, h: u32) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.glyph_tex = try self.makeTexture(rgba, w, h);
     }
     pub fn uploadGlyphAtlasBold(self: *Gpu, rgba: []const u8, w: u32, h: u32) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.glyph_bold_tex = try self.makeTexture(rgba, w, h);
     }
     pub fn uploadGlyphAtlasItalic(self: *Gpu, rgba: []const u8, w: u32, h: u32) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.glyph_italic_tex = try self.makeTexture(rgba, w, h);
     }
 
     fn makeTexture(self: *Gpu, rgba: []const u8, w: u32, h: u32) !Tex {
         var t = Tex{};
         try self.createImage(w, h, vk.VK_FORMAT_R8G8B8A8_UNORM, vk.VK_SAMPLE_COUNT_1_BIT, vk.VK_IMAGE_USAGE_SAMPLED_BIT | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT, &t.img, &t.mem, &t.view);
+        // The upload below can fail, and an atlas the host re-offers every
+        // frame would otherwise leave one image and one allocation behind on
+        // every attempt.
+        errdefer self.destroyTexture(&t);
         var staging = try self.createBuffer(rgba.len, vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
         defer self.destroyBuffer(&staging);
         @memcpy(staging.mapped.?[0..rgba.len], rgba);
@@ -1567,6 +1649,8 @@ pub const Gpu = struct {
     /// two cannot tear apart. `generation` only moves when the vertices
     /// changed, so a still overlay re-uploads nothing.
     pub fn setOverlay(self: *Gpu, verts: []const scene.OverlayVertex, generation: u64, u: Uniforms) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.overlay_u = u;
         if (generation == self.overlay_gen) return;
         self.overlay_gen = generation;
@@ -1579,6 +1663,12 @@ pub const Gpu = struct {
     }
 
     pub fn clearOverlay(self: *Gpu) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.clearOverlayHeld();
+    }
+
+    fn clearOverlayHeld(self: *Gpu) void {
         self.freeOverlayBuf();
         self.overlay_gen = 0;
     }
@@ -1628,6 +1718,11 @@ pub const Gpu = struct {
         patterns: []const scene.PatternCell = &.{},
     };
 
+    /// One pattern's pixels, copied on the build worker and made into a
+    /// texture on the owner thread. The copy is what keeps makeScene off the
+    /// queue: the build arena is gone by the time the scene lands.
+    const PendingPattern = struct { rgba: []u8, w: u32, h: u32, at: usize };
+
     pub const Scene = struct {
         vbuf: Buffer = .{}, // scene.Vertex, indexed
         ibuf: Buffer = .{}, // u32 indices
@@ -1641,6 +1736,9 @@ pub const Gpu = struct {
         /// ceiling — draws only ever merge, never split — so a frame never
         /// allocates and a batch never truncates.
         draws: []scene.Draw = &.{},
+        /// Patterns still to upload. Empty once realizeScene has run, which
+        /// every scene goes through before it is drawn.
+        pending: []PendingPattern = &.{},
         alloc: std.mem.Allocator,
     };
 
@@ -1683,7 +1781,19 @@ pub const Gpu = struct {
     /// Stage a scene's buffers. Host-visible and coherent, written straight
     /// through, so this never touches the queue and may run on the build
     /// worker while a frame is in flight.
+    ///
+    /// A pattern is the one thing here that needs the queue, so it is only
+    /// copied: realizeScene makes the textures on the owner thread. A queue,
+    /// a command buffer and a fence are externally synchronised, and this
+    /// backend holds one of each, so submitting from the worker while the
+    /// frame thread submits loses the device.
     pub fn makeScene(self: *Gpu, alloc: std.mem.Allocator, data: SceneData) !Scene {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.makeSceneHeld(alloc, data);
+    }
+
+    fn makeSceneHeld(self: *Gpu, alloc: std.mem.Allocator, data: SceneData) !Scene {
         var out = Scene{ .alloc = alloc };
         errdefer self.freeSceneValue(&out);
 
@@ -1709,14 +1819,22 @@ pub const Gpu = struct {
         if (data.patterns.len > 0) {
             out.patterns = try alloc.alloc(PatternTex, data.patterns.len);
             @memset(out.patterns, .{});
+            var pending: std.ArrayList(PendingPattern) = .empty;
+            errdefer {
+                for (pending.items) |q| alloc.free(q.rgba);
+                pending.deinit(alloc);
+            }
             for (data.patterns, 0..) |cell, i| {
                 if (cell.w == 0 or cell.h == 0 or cell.rgba.len == 0) continue;
-                out.patterns[i] = .{
-                    .tex = try self.makeTexture(cell.rgba, cell.w, cell.h),
-                    .w = @floatFromInt(cell.w),
-                    .h = @floatFromInt(cell.h),
-                };
+                out.patterns[i] = .{ .w = @floatFromInt(cell.w), .h = @floatFromInt(cell.h) };
+                try pending.append(alloc, .{
+                    .rgba = try alloc.dupe(u8, cell.rgba),
+                    .w = cell.w,
+                    .h = cell.h,
+                    .at = i,
+                });
             }
+            out.pending = try pending.toOwnedSlice(alloc);
         }
         return out;
     }
@@ -1727,18 +1845,62 @@ pub const Gpu = struct {
         return b;
     }
 
+    /// Turn a scene's pending pattern pixels into textures. Owner thread: this
+    /// is the queue work makeScene deliberately left undone. A texture that
+    /// fails to upload stays null, and recordDraws skips that range, so a bad
+    /// tile costs its own quad and nothing else.
+    fn realizeScene(self: *Gpu, s: *Scene) void {
+        for (s.pending) |q| {
+            defer s.alloc.free(q.rgba);
+            if (q.at >= s.patterns.len) continue;
+            s.patterns[q.at].tex = self.makeTexture(q.rgba, q.w, q.h) catch null;
+        }
+        if (s.pending.len > 0) s.alloc.free(s.pending);
+        s.pending = &.{};
+    }
+
     pub fn adoptScene(self: *Gpu, sc: Scene) void {
-        self.freeScene();
-        self.scene = sc;
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.adoptSceneHeld(sc);
+    }
+
+    fn adoptSceneHeld(self: *Gpu, sc: Scene) void {
+        // Two adoptions with no frame between them: the first retirement has
+        // not been reached by a fence yet, so wait for it here rather than free
+        // it blind. Rare, and cheaper than the alternative of never freeing.
+        if (self.retired != null) {
+            _ = vk.vkWaitForFences(self.device, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64));
+            self.freeRetiredHeld();
+        }
+        self.retired = self.scene;
+        self.scene = null;
+
+        var landed = sc;
+        self.realizeScene(&landed);
+        self.scene = landed;
+    }
+
+    /// Free what the last adoption displaced. The caller owns the lock and has
+    /// established that the frame using it has finished.
+    fn freeRetiredHeld(self: *Gpu) void {
+        if (self.retired) |*s| {
+            self.freeSceneValue(s);
+            self.retired = null;
+        }
     }
 
     pub fn uploadScene(self: *Gpu, alloc: std.mem.Allocator, data: SceneData) !void {
-        self.adoptScene(try self.makeScene(alloc, data));
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.adoptSceneHeld(try self.makeSceneHeld(alloc, data));
     }
 
     /// Repaint without rebuilding geometry: the paint stream alone changes when
     /// only the palette moved (day to dusk to night).
     pub fn updatePaint(self: *Gpu, paint: []const scene.PaintVertex) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         const s = if (self.scene) |*sc| sc else return;
         if (s.pbuf.mapped == null or paint.len == 0) return;
         const bytes = std.mem.sliceAsBytes(paint);
@@ -1749,6 +1911,8 @@ pub const Gpu = struct {
     /// The quad half of the same contract: a raster cross-fade rewrites the
     /// quad paint stream's alphas frame by frame, and nothing else moves.
     pub fn updateQuadPaint(self: *Gpu, quad_paint: []const scene.PaintVertex) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         const s = if (self.scene) |*sc| sc else return;
         if (s.qpbuf.mapped == null or quad_paint.len == 0) return;
         const bytes = std.mem.sliceAsBytes(quad_paint);
@@ -1757,10 +1921,15 @@ pub const Gpu = struct {
     }
 
     pub fn freeStagedScene(self: *Gpu, sc: *Scene) void {
+        self.mu.lock();
+        defer self.mu.unlock();
         self.freeSceneValue(sc);
     }
 
     fn freeSceneValue(self: *Gpu, s: *Scene) void {
+        for (s.pending) |q| s.alloc.free(q.rgba);
+        if (s.pending.len > 0) s.alloc.free(s.pending);
+        s.pending = &.{};
         self.destroyBuffer(&s.vbuf);
         self.destroyBuffer(&s.ibuf);
         self.destroyBuffer(&s.pbuf);
@@ -1777,6 +1946,12 @@ pub const Gpu = struct {
     }
 
     pub fn freeScene(self: *Gpu) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.freeSceneHeld();
+    }
+
+    fn freeSceneHeld(self: *Gpu) void {
         if (self.scene) |*s| {
             self.freeSceneValue(s);
             self.scene = null;
@@ -1935,6 +2110,8 @@ pub const Gpu = struct {
 
     /// Render one frame to the window and present. Returns false if no window.
     pub fn renderWindow(self: *Gpu, u: Uniforms) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
         return self.renderWindowFallible(u) catch |e| {
             logErr("frame failed: %d", .{@intFromError(e)});
             return false;
@@ -1942,6 +2119,7 @@ pub const Gpu = struct {
     }
 
     fn renderWindowFallible(self: *Gpu, u: Uniforms) !bool {
+        if (self.lost) return false;
         if (self.surface == null) return false;
         if (self.swapchain == null) {
             self.recreateSwapchain(); // was minimized at init
@@ -1957,8 +2135,15 @@ pub const Gpu = struct {
             if (self.swapchain == null) return true;
         }
         _ = vk.vkWaitForFences(self.device, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64));
+        // The fence is the proof the previous frame finished, so whatever that
+        // frame was still reading can go now.
+        self.freeRetiredHeld();
         var image_index: u32 = 0;
         const ar = vk.vkAcquireNextImageKHR(self.device, self.swapchain, std.math.maxInt(u64), self.acquire_sem, null, &image_index);
+        if (ar == vk.VK_ERROR_SURFACE_LOST_KHR) {
+            self.surfaceLostHeld();
+            return false;
+        }
         if (ar == vk.VK_ERROR_OUT_OF_DATE_KHR) {
             self.recreateSwapchain();
             return true; // present skipped; content still pending (view_dirty stays)
@@ -1984,13 +2169,15 @@ pub const Gpu = struct {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &self.cmd;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &self.render_sem;
-        try check(vk.vkQueueSubmit(self.queue, 1, &si, self.fence), "submit frame");
+        si.pSignalSemaphores = &self.render_sems[image_index];
+        const fr = vk.vkQueueSubmit(self.queue, 1, &si, self.fence);
+        if (fr == vk.VK_ERROR_DEVICE_LOST) self.lost = true;
+        try check(fr, "submit frame");
 
         var pi = std.mem.zeroes(vk.VkPresentInfoKHR);
         pi.sType = vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &self.render_sem;
+        pi.pWaitSemaphores = &self.render_sems[image_index];
         pi.swapchainCount = 1;
         pi.pSwapchains = &self.swapchain;
         pi.pImageIndices = &image_index;
@@ -2000,6 +2187,10 @@ pub const Gpu = struct {
         // state, so it alone is no reason to rebuild — that recreates the
         // swapchain every frame. Rebuild on it only when the extent actually
         // disagrees with the viewport the host declared.
+        if (pr == vk.VK_ERROR_SURFACE_LOST_KHR) {
+            self.surfaceLostHeld();
+            return true; // the frame was recorded; there is nothing to show it on
+        }
         if (pr == vk.VK_ERROR_OUT_OF_DATE_KHR or (pr == vk.VK_SUBOPTIMAL_KHR and self.extentStale())) {
             self.recreateSwapchain();
         }
@@ -2008,6 +2199,8 @@ pub const Gpu = struct {
 
     /// Render one frame offscreen and read the pixels back (RGBA8, top-down).
     pub fn renderOffscreen(self: *Gpu, alloc: std.mem.Allocator, u: Uniforms) ![]u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
         try self.ensureOffscreenTargets();
         _ = vk.vkWaitForFences(self.device, 1, &self.fence, vk.VK_TRUE, std.math.maxInt(u64));
         _ = vk.vkResetFences(self.device, 1, &self.fence);
@@ -2040,9 +2233,12 @@ pub const Gpu = struct {
     }
 
     pub fn deinit(self: *Gpu) void {
+        self.mu.lock();
+        defer self.mu.unlock();
         _ = vk.vkDeviceWaitIdle(self.device);
-        self.clearOverlay();
-        self.freeScene();
+        self.clearOverlayHeld();
+        self.freeRetiredHeld();
+        self.freeSceneHeld();
         if (self.sprite_tex) |*t| self.destroyTexture(t);
         if (self.glyph_tex) |*t| self.destroyTexture(t);
         if (self.glyph_bold_tex) |*t| self.destroyTexture(t);
@@ -2054,7 +2250,8 @@ pub const Gpu = struct {
         self.releaseDepth();
         self.destroyBuffer(&self.ring);
         if (self.acquire_sem != null) vk.vkDestroySemaphore(self.device, self.acquire_sem, null);
-        if (self.render_sem != null) vk.vkDestroySemaphore(self.device, self.render_sem, null);
+        for (self.render_sems) |sem|
+            if (sem != null) vk.vkDestroySemaphore(self.device, sem, null);
         if (self.fence != null) vk.vkDestroyFence(self.device, self.fence, null);
         if (self.up_fence != null) vk.vkDestroyFence(self.device, self.up_fence, null);
         if (self.cmd_pool != null) vk.vkDestroyCommandPool(self.device, self.cmd_pool, null);
