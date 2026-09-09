@@ -95,6 +95,13 @@ pub const Built = struct {
     /// missing-image hook: the host renders them (tile57_render_symbol_run
     /// for sounding digit runs), calls Sprite.addImage, and rebuilds.
     missing_images: []const []const u8 = &.{},
+    /// Codepoints a label wanted and the glyph atlas did not hold,
+    /// deduplicated — the missing-glyph hook, the text twin of
+    /// missing_images: the host bakes them into the atlas (from whatever face
+    /// its platform has for the script) and rebuilds. Without it a chart
+    /// naming its features in a script the atlas has no glyphs for lays out
+    /// half-em blanks and nothing says why.
+    missing_glyphs: []const u21 = &.{},
     /// Features that failed a paint evaluation and fell to defaults.
     eval_errors: usize = 0,
     /// Per-layer properties the compiled tier claimed. The rest keep
@@ -756,6 +763,7 @@ pub fn buildSceneWithRasters(
     // cell is remembered as NO_PATTERN so the sheet is walked once per name.
     var pattern_ids: std.StringHashMapUnmanaged(u32) = .empty;
     var missing: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var missing_glyphs: symbol.Misses = .empty;
     var collider = symbol.Collider.init(arena);
     // Projection of a world anchor to reference px for collision boxes; the
     // view origin stands in for the screen center (they coincide for a
@@ -969,7 +977,7 @@ pub fn buildSceneWithRasters(
                             .depth = feat_depth,
                             .size_scale = view.size_scale,
                             .zoom = view.zoom,
-                        }, &quads, &quad_paint, &text_scratch, &text_paint_scratch, &collider, &missing, &out.eval_errors);
+                        }, &quads, &quad_paint, &text_scratch, &text_paint_scratch, &collider, &missing, &missing_glyphs, &out.eval_errors);
                         continue;
                     },
                     .fill => {
@@ -1146,6 +1154,7 @@ pub fn buildSceneWithRasters(
     out.paint_zoom = view.zoom;
     out.patterns = patterns.items;
     out.missing_images = missing.keys();
+    out.missing_glyphs = missing_glyphs.keys();
     return out;
 }
 
@@ -1433,6 +1442,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
     var patterns: std.ArrayList(types.PatternCell) = .empty;
     var spans: std.ArrayList(PaintSpan) = .empty;
     var missing: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var missing_glyphs: symbol.Misses = .empty;
 
     for (parts) |part| {
         const b = part.built;
@@ -1513,6 +1523,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
             spans.appendAssumeCapacity(moved);
         }
         for (b.missing_images) |name| try missing.put(arena, name, {});
+        for (b.missing_glyphs) |cp| try missing_glyphs.put(arena, cp, {});
         if (b.background_set) {
             out.background = b.background;
             out.background_set = true;
@@ -1541,6 +1552,7 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
     out.patterns = patterns.items;
     out.paint_spans = spans.items;
     out.missing_images = missing.keys();
+    out.missing_glyphs = missing_glyphs.keys();
     return out;
 }
 
@@ -1625,6 +1637,7 @@ fn layoutSymbolFeature(
     text_paint_scratch: *std.ArrayList(types.PaintVertex),
     collider: *symbol.Collider,
     missing: *std.StringArrayHashMapUnmanaged(void),
+    missing_glyphs: *symbol.Misses,
     errors: *usize,
 ) error{OutOfMemory}!void {
     if (f.parts.len == 0 or f.parts[0].len == 0) return;
@@ -1740,7 +1753,7 @@ fn layoutSymbolFeature(
                 tcommon.rotate_deg = 0;
             }
             const scratch_before = text_scratch.items.len;
-            const box = (try symbol.layoutText(arena, text, ga, topts, tcommon, text_scratch)) orelse break :text;
+            const box = (try symbol.layoutText(arena, text, ga, topts, tcommon, text_scratch, missing_glyphs)) orelse break :text;
             const text_allow = sc.sym.text_allow_overlap;
             const sbox = scaledBox(box, px, py, sc.size_scale);
             // An allow-overlap label always draws and is never gated; a
