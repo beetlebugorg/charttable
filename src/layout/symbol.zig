@@ -237,6 +237,11 @@ fn wrapLines(
 /// `line_height_em`, the block anchored per the spec's text-anchor
 /// vocabulary. Returns the block's collision box, or null when nothing
 /// inked.
+/// Codepoints a layout wanted and the atlas did not hold, so a host can fetch
+/// them and lay the run out again. The set, not the count: what a host needs is
+/// which characters to bake.
+pub const Misses = std.AutoArrayHashMapUnmanaged(u21, void);
+
 pub fn layoutText(
     gpa: std.mem.Allocator,
     text: []const u8,
@@ -244,9 +249,22 @@ pub fn layoutText(
     opts: TextOpts,
     common: Common,
     quads: *std.ArrayList(types.Quad),
+    misses: ?*Misses,
 ) !?Box {
     const scale = opts.size_px / glyph_em_px;
     const em = opts.size_px;
+
+    // Every codepoint the run wants, before the wrap drops any of it: a label
+    // cut short for want of a glyph would otherwise never ask for the glyph
+    // that would have let it fit.
+    if (misses) |set| {
+        var scan = std.unicode.Utf8View.initUnchecked(text).iterator();
+        while (scan.nextCodepoint()) |cp| {
+            if (cp == '\n' or cp == ' ') continue;
+            if (atlas.get(cp) != null) continue;
+            set.put(gpa, cp, {}) catch {};
+        }
+    }
 
     var lines: [max_lines][]const u8 = undefined;
     const n_lines = wrapLines(text, atlas, scale, opts.max_width_em * em, &lines);
