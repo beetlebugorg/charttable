@@ -1203,7 +1203,9 @@ pub const Map = struct {
             // extrapolates smoothly and the color mix clamps at the end it
             // was already approaching (scene/types.zig Uniforms.zoom_t).
             .zoom_t = @floatCast(self.cam.zoom - (if (self.built) |b| b.paint_zoom_floor else @floor(self.cam.zoom))),
-            .wrap_x = @floatCast(cameras.wrapDx(self.cam.center.x, origin.x)),
+            // World units per reference pixel, for turning a vertex's screen
+            // offset back into a world delta at clip time.
+            .world_per_px = @floatCast(1.0 / self.cam.worldToPx()),
             .rot_sin = rs[0],
             .rot_cos = rs[1],
             .color = .{ 0, 0, 0, 0 },
@@ -1734,9 +1736,9 @@ pub const Map = struct {
                     const tile = self.cache.get(key) orelse continue;
                     const rect = key.tileId().worldRect();
                     const span = rect.x1 - rect.x0;
-                    // The nearest world copy: see the note in map.zig. A view
-                    // wide enough sees the same tile on both sides of the
-                    // world, and then it is listed -- and placed -- twice.
+                    // The nearest world copy: see the note in map.zig. A
+                    // wide enough view shows the same tile on both sides of
+                    // the world, and it is then listed and placed twice.
                     const dx = cameras.placeTileX(rect.x0, span, origin.x);
                     const second = cameras.wrappedCopy(dx, span, half_w);
                     try vector_tiles.append(a, .{
@@ -1767,8 +1769,9 @@ pub const Map = struct {
                         .dy = dy,
                     });
                     tile_parts += 1;
-                    // The same bucket, placed a world over: the second copy
-                    // costs a rebase at concatenation, not a tessellation.
+                    // The same bucket, placed a world over. The second copy
+                    // costs a rebase at concatenation rather than a
+                    // tessellation.
                     if (second) |copy_dx| {
                         try parts.append(self.gpa, .{
                             .built = bucket.built,
@@ -1834,8 +1837,8 @@ pub const Map = struct {
             // Tiles whose geometry is actually IN the scene: `have` less
             // whatever the budget deferred. The gap is what a test can watch
             // to catch the scene silently losing ground.
-            // Distinct tiles, not parts: a tile the view sees on both sides
-            // of the world is placed twice and is still one tile.
+            // Distinct tiles rather than parts. A tile the view sees on both
+            // sides of the world is placed twice and is still one tile.
             .scene_tiles = tile_parts,
             .partial = deferred > 0,
             .origin = origin,

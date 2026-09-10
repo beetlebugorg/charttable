@@ -823,6 +823,7 @@ int main(int argc, const char *argv[]) {
         if ((ev = getenv("CHARTTABLE_LON"))) v.lon = atof(ev);
         if ((ev = getenv("CHARTTABLE_LAT"))) v.lat = atof(ev);
         if ((ev = getenv("CHARTTABLE_ZOOM"))) v.zoom = atof(ev);
+        if ((ev = getenv("CHARTTABLE_BEARING"))) v.bearing_deg = atof(ev);
 
         BOOL composing = NO;
 #ifdef USE_TILE57_COMPOSE

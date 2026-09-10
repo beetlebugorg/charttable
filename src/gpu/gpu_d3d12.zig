@@ -288,7 +288,7 @@ pub const Gpu = struct {
     overlay_buf: Buffer = .{},
     overlay_count: u32 = 0,
     overlay_gen: u64 = 0, // 0 = nothing uploaded yet (a built store is >= 1)
-    /// The overlay pass's own frame uniform: the chart's, with the MVP and wrap
+    /// The overlay pass's own frame uniform: the chart's, with the MVP
     /// rebuilt for the overlay's origin. setOverlay writes it, and it is the
     /// only thing that fills overlay_buf, so a buffer to draw always has a
     /// uniform to draw it with.
@@ -1516,6 +1516,11 @@ pub const Gpu = struct {
         for (self.batchScene(s)) |dr| {
             const tri = dr.prim == .triangles;
             var uu = u;
+            // Tile geometry paints only its own tile. The buffered
+            // overhang two neighbours share must not blend twice
+            // (scene.CLIP_NONE). Quads are set to CLIP_NONE and draw
+            // unclipped.
+            uu.clip_rect = dr.clip;
             var pso: ?*d3d.ID3D12PipelineState = null;
             var tex_gpu: u64 = 0;
             const halo = dr.pipeline == .sdf;
@@ -1616,7 +1621,7 @@ pub const Gpu = struct {
 
     /// Draw the overlay LAST — after the whole chart, in the same command list.
     /// The overlay carries its OWN uniform (setOverlay): the shader reads mvp
-    /// and wrap_x, and both are built for the overlay's origin, not the
+    /// and it is built for the overlay's origin rather than the
     /// chart's. It goes in the ring like every other draw's.
     fn recordOverlay(self: *Gpu, cmd: *d3d.ID3D12GraphicsCommandList) void {
         if (self.overlay_count == 0 or self.overlay_buf.res == null) return;

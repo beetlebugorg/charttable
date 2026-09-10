@@ -8,12 +8,13 @@ cbuffer U : register(b0) {
     float  u_size_scale;
     float  u_zoom;
     float  u_zoom_t;
-    float  u_wrap_x;
+    float  u_world_per_px;
     float  u_rot_sin;
     float  u_rot_cos;
     float4 u_color;
     float2 u_anchor_px;
     float2 u_cell_px;
+    float4 u_clip_rect; // the tile a triangle draw may paint: x0, y0, x1, y1
 };
 
 struct VSIn {
@@ -28,9 +29,9 @@ struct VSOut {
 
 VSOut main(VSIn i) {
     VSOut o;
-    // No antimeridian wrap here: the host turns the whole frame at once, in
-    // the matrix (Camera.mvpOrigin). Wrapping per vertex tore any primitive
-    // lying across the half-world seam.
+    // The host places the whole frame at once, in the matrix
+    // (Camera.mvpOrigin). A per-vertex wrap split any primitive lying across
+    // the half-world seam.
     float4 clip = mul(u_mvp, float4(i.a_world, 0.0, 1.0));
     // z = 0 is the near plane. The chart's paint-order depths are all in (0,1)
     // and this pass writes no depth, so host content is never hidden by the

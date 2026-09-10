@@ -44,8 +44,9 @@ pub const SourcedTile = struct {
     source: []const u8 = "",
     /// Which world copy to draw this tile at: 0 for the one nearest the view
     /// origin, -1 or +1 for the copy a world away. Longitude is cyclic, and a
-    /// view wide enough sees the same tile on both sides (Camera.wrappedCopy),
-    /// so the same tile is listed twice with different values here.
+    /// wide enough view shows the same tile on both sides
+    /// (Camera.wrappedCopy), so that tile is listed twice with different
+    /// values here.
     wrap: f64 = 0,
 };
 
@@ -294,7 +295,7 @@ pub const RasterTile = struct {
     /// the starting alpha (in: 0, out: opaque) and records the quad span in
     /// Built.fades; the Map animates it through the quad paint stream.
     fade: Fade = .none,
-    /// Which world copy to draw at — see SourcedTile.wrap.
+    /// Which world copy to draw at. See SourcedTile.wrap.
     wrap: f64 = 0,
 
     pub const Fade = enum(u2) { none, in, out };
@@ -904,12 +905,22 @@ pub fn buildSceneWithRasters(
             // the map. Harmless while the viewport is a sliver of the world;
             // at low zoom it scrambles the geography.
             //
-            // By the tile's CENTRE, so the whole tile lands on one copy. The
-            // left edge alone leaves the body reaching a full tile span past
-            // the half-world seam, and at low zoom -- where a tile is a large
-            // fraction of the world -- that is most of the tile.
+            // Measured at the tile's CENTRE, so the whole tile goes on one
+            // copy. Measured at the left edge, the body of the tile reaches a
+            // full span past the half-world seam, and at low zoom that is
+            // most of the tile.
             const dx: f32 = @floatCast(cameras.placeTileX(rect.x0, tile_span, view.origin.x) + st.wrap);
             const dy: f32 = @floatCast(rect.y0 - view.origin.y);
+            // What this tile's triangles may paint. An MVT tile is buffered,
+            // so the geometry reaches past these bounds and two neighbours
+            // both hold the strip along the edge they share. See
+            // types.CLIP_NONE.
+            const tile_clip = [4]f32{
+                dx,
+                dy,
+                dx + @as(f32, @floatCast(tile_span)),
+                dy + @as(f32, @floatCast(rect.y1 - rect.y0)),
+            };
             const tile_quads_first: u32 = @intCast(quads.items.len);
             var text_scratch: std.ArrayList(types.Quad) = .empty;
             var text_paint_scratch: std.ArrayList(types.PaintVertex) = .empty;
@@ -1006,6 +1017,7 @@ pub fn buildSceneWithRasters(
                                     .count = @intCast(indices.items.len - run_first),
                                     .paint_key = @intCast(layer_i),
                                     .pattern = run_pattern,
+                                    .clip = tile_clip,
                                     .kind = .pattern,
                                     .prim = .triangles,
                                 });
@@ -1144,6 +1156,7 @@ pub fn buildSceneWithRasters(
                 .count = count,
                 .paint_key = @intCast(layer_i),
                 .pattern = run_pattern,
+                .clip = tile_clip,
                 .kind = if (is_pattern) .pattern else if (sl.kind == .fill) .area else .line,
                 .prim = .triangles,
                 // A pattern cell is mostly transparent: it must blend over
@@ -1525,6 +1538,15 @@ pub fn concatScenes(arena: std.mem.Allocator, parts: []const ScenePart) !Built {
                 .triangles => ibase,
                 .quads => qbase,
             };
+            // The clip is stated in the part's own frame, like its vertices.
+            if (!std.mem.eql(f32, &r.clip, &types.CLIP_NONE)) {
+                moved.clip = .{
+                    r.clip[0] + part.dx,
+                    r.clip[1] + part.dy,
+                    r.clip[2] + part.dx,
+                    r.clip[3] + part.dy,
+                };
+            }
             if (r.pattern != types.NO_PATTERN) moved.pattern = r.pattern + pbase;
             ranges.appendAssumeCapacity(moved);
         }
@@ -1998,7 +2020,7 @@ test "first light: style to pixels through the GPU backend" {
         .size_scale = 1,
         .zoom = @floatFromInt(types.zq(cam.zoom)),
         .zoom_t = 0,
-        .wrap_x = @floatCast(cam.center.x - origin.x),
+        .world_per_px = @floatCast(1.0 / cam.worldToPx()),
         .rot_sin = 0,
         .rot_cos = 1,
         .color = .{ 0, 0, 0, 0 },
@@ -2163,7 +2185,7 @@ test "real chart: Annapolis first light" {
         .size_scale = 1,
         .zoom = @floatFromInt(types.zq(cam.zoom)),
         .zoom_t = 0,
-        .wrap_x = 0,
+        .world_per_px = 0,
         .rot_sin = 0,
         .rot_cos = 1,
         .color = .{ 0, 0, 0, 0 },

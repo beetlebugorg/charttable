@@ -21,7 +21,9 @@
 //!   tile57 fed libtess2 for area fills.
 //! - Output positions are tile-local world units: tile_span * coord / extent.
 //!   The 64-unit buffer overhang stays in the geometry — clipping is the
-//!   renderer's job (per-tile clip rects), never layout's.
+//!   renderer's job (every triangle draw holds the bounds of the tile it came
+//!   from, and the fragment stage trims to them: scene.CLIP_NONE), never
+//!   layout's.
 //! - Fill vertices carry no screen offset: ox/oy zero, flags 0. Zoom window
 //!   and paint-order depth pass through Options.
 //! - Degenerate rings (< 3 distinct points, zero area) draw nothing and are

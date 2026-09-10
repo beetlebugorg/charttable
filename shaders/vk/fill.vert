@@ -24,23 +24,39 @@ layout(set = 1, binding = 0) uniform U {
     float size_scale;
     float zoom;       // fractional zoom * 256
     float zoom_t;
-    float wrap_x;
+    float world_per_px;
     float rot_sin;
     float rot_cos;
     vec4  color;
     vec2  anchor_px;
     vec2  cell_px;
+    vec4  clip_rect;
 } u;
 
 layout(location = 0) out vec4 v_color;
+layout(location = 1) out vec2 v_world;
 
-// Longitude is cyclic, so every tile has a world copy every 1.0 world units
-// and one of them has to be drawn. That choice belongs to the HOST, which
-// makes it once per tile (Camera.placeTileX) and again once per scene, in the
-// matrix (Camera.mvpOrigin takes the short way round in x). Deciding it here,
-// per vertex, tore every primitive lying across the half-world seam.
+// Longitude is cyclic, so a tile has a world copy every 1.0 world units and
+// one of them is drawn. The host picks it, once per tile (Camera.placeTileX)
+// and once per scene in the matrix (Camera.mvpOrigin wraps its x delta).
+// Picking it here, per vertex, split every primitive lying across the
+// half-world seam.
 vec4 project(vec2 p) {
     return u.mvp * vec4(p, 0.0, 1.0);
+}
+
+// The world position a vertex's fragments cover: the vertex position plus its
+// screen-space (ox, oy) converted to world units. The offset is applied after
+// projection, so a line's stroke reaches ground its anchor does not, and a
+// clip test against the anchor alone cuts the stroke along its length.
+//
+// Undoing the projection needs no inverse. The linear part of mvp is scale
+// times rotation, so R(-view) applied to the offset and divided by pixels per
+// world unit gives the world delta of the clip-space offset.
+vec2 world_of(vec2 p, vec2 off) {
+    vec2 back = vec2( off.x * u.rot_cos + off.y * u.rot_sin,
+                     -off.x * u.rot_sin + off.y * u.rot_cos);
+    return p + back * u.size_scale * u.world_per_px;
 }
 
 // The per-vertex zoom visibility window, quantized to 1/256 zoom steps and
@@ -78,4 +94,5 @@ void main() {
     // Clamped: mid-gesture zoom_t can leave [0,1]; hold the end color
     // rather than wrapping to the far one.
     v_color = mix(a_color, a_color_hi, clamp(u.zoom_t, 0.0, 1.0));
+    v_world = world_of(a_pos, off);
 }

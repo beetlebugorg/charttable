@@ -60,9 +60,16 @@ pub fn batch(ranges: []const t.Range, opts: t.BatchOpts, out: []t.Draw) usize {
             @as(f32, @floatFromInt(r.halo[3])) / 255.0,
         } else opts.halo;
 
+        // The clip joins the merge key, because two tiles' ranges paint
+        // different ground and cannot share a draw (types.CLIP_NONE). The
+        // draw count is unchanged in practice: parts concatenate tile-major,
+        // so one layer's ranges from two tiles are adjacent in paint order
+        // and far apart in the index buffer, where the contiguity test
+        // already separates them.
         if (last) |d| {
             if (d.prim == r.prim and d.pipeline == pipe and d.atlas == atlas and
                 d.pattern == r.pattern and std.mem.eql(f32, &d.color, &color) and
+                std.mem.eql(f32, &d.clip, &r.clip) and
                 d.first + d.count == r.first)
             {
                 d.count += r.count;
@@ -78,6 +85,7 @@ pub fn batch(ranges: []const t.Range, opts: t.BatchOpts, out: []t.Draw) usize {
                 .atlas = atlas,
                 .pattern = r.pattern,
                 .color = color,
+                .clip = r.clip,
             };
             last = &out[n];
         } else {
@@ -174,6 +182,24 @@ test "a range's own halo color wins over the scene background" {
     tris.halo = .{ 255, 128, 0, 255 };
     try expectEqual(@as(usize, 1), batch(&.{tris}, .{ .atlas_have = all_atlases, .halo = halo }, &out));
     try expectEqual([4]f32{ 0, 0, 0, 0 }, out[0].color);
+}
+
+// Tile geometry paints only its own tile (types.CLIP_NONE), so two tiles'
+// ranges do not merge even when their index spans are contiguous.
+test "ranges from different tiles do not merge" {
+    var a = tri(0, 30, false);
+    a.clip = .{ 0, 0, 1, 1 };
+    var b = tri(30, 12, false);
+    b.clip = .{ 1, 0, 2, 1 };
+    var out: [2]t.Draw = undefined;
+    const n = batch(&.{ a, b }, .{ .atlas_have = all_atlases, .halo = halo }, &out);
+    try expectEqual(@as(usize, 2), n);
+    try expectEqual([4]f32{ 0, 0, 1, 1 }, out[0].clip);
+    try expectEqual([4]f32{ 1, 0, 2, 1 }, out[1].clip);
+    // Two ranges from the same tile still merge.
+    var c = tri(30, 12, false);
+    c.clip = a.clip;
+    try expectEqual(@as(usize, 1), batch(&.{ a, c }, .{ .atlas_have = all_atlases, .halo = halo }, &out));
 }
 
 test "pattern ranges classify to the pattern pipeline and split on cell change" {

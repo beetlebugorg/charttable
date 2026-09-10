@@ -322,8 +322,8 @@ pub const Gpu = struct {
     overlay_buf: Buffer = .{},
     overlay_count: u32 = 0,
     overlay_gen: u64 = 0, // 0 = nothing uploaded yet (a built store is >= 1)
-    /// The overlay pass's own frame uniform — the chart's, with the MVP and
-    /// wrap rebuilt for the overlay's origin. setOverlay writes it, and it is
+    /// The overlay pass's own frame uniform: the chart's, with the MVP
+    /// rebuilt for the overlay's origin. setOverlay writes it, and it is
     /// the only thing that fills overlay_buf, so a buffer to draw always has a
     /// uniform to draw it with.
     overlay_u: Uniforms = std.mem.zeroes(Uniforms),
@@ -1685,8 +1685,8 @@ pub const Gpu = struct {
 
     /// Draw the overlay LAST — after the raster underlay and the whole chart,
     /// in the same render pass. The overlay carries its OWN uniform
-    /// (setOverlay): the shader reads mvp and wrap_x, and both are built for
-    /// the overlay's origin, not the chart's. It goes in the ring like every
+    /// (setOverlay): the shader reads mvp, and it is built for
+    /// the overlay's origin rather than the chart's. It goes in the ring like every
     /// other draw's, on set 1.
     fn recordOverlay(self: *Gpu, cmd: vk.VkCommandBuffer) void {
         if (self.overlay_count == 0 or self.overlay_buf.buf == null) return;
@@ -2025,6 +2025,11 @@ pub const Gpu = struct {
         for (self.batchScene(s)) |d| {
             const tri = d.prim == .triangles;
             var uu = u;
+            // Tile geometry paints only its own tile. The buffered
+            // overhang two neighbours share must not blend twice
+            // (scene.CLIP_NONE). Quads are set to CLIP_NONE and draw
+            // unclipped.
+            uu.clip_rect = d.clip;
             var pipe: vk.VkPipeline = null;
             var tex_set: vk.VkDescriptorSet = null;
             const halo = d.pipeline == .sdf;
@@ -2099,6 +2104,11 @@ pub const Gpu = struct {
                 uu.color = d.color;
                 const foff = self.pushUniform(&uu) orelse continue;
                 vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipe_layout, 3, 1, &self.frag_uni_set, 1, &foff);
+            } else if (tri) {
+                // fill.frag and pattern.frag read clip_rect from set 3. The
+                // bytes are the vertex stage's, so the ring entry is reused.
+                var voff2 = voff;
+                vk.vkCmdBindDescriptorSets(cmd, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipe_layout, 3, 1, &self.frag_uni_set, 1, &voff2);
             }
             if (tri) {
                 vk.vkCmdDrawIndexed(cmd, d.count, 1, d.first, 0, 0);

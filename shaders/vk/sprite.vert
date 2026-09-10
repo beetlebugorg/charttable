@@ -24,12 +24,13 @@ layout(set = 1, binding = 0) uniform U {
     float size_scale;
     float zoom;
     float zoom_t;
-    float wrap_x;
+    float world_per_px;
     float rot_sin;
     float rot_cos;
     vec4  color;
     vec2  anchor_px;
     vec2  cell_px;
+    vec4  clip_rect;
 } u;
 
 layout(location = 0) out vec2  v_uv;

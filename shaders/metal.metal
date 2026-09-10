@@ -25,14 +25,15 @@ struct U {
     float    size_scale; // pixel density x symbol size multiplier
     float    zoom;       // fractional zoom * 256, tested against zmin/zmax
     float    zoom_t;     // fract(zoom): mix factor for zoom-interpolated paint
-    float    wrap_x;     // RESERVED: the host now wraps per tile and per scene
+    float    world_per_px; // world units per reference px (offset -> world)
     float    rot_sin;
     float    rot_cos;
     float4   color;      // SDF halo background; SDF fragment stage only
     float2   anchor_px;  // pattern phase origin, framebuffer px
     float2   cell_px;    // pattern cell period, framebuffer px
+    float4   clip_rect;  // the tile a triangle draw may paint: x0, y0, x1, y1
 };
-static_assert(sizeof(U) == 128, "U must match scene.Uniforms (128 B)");
+static_assert(sizeof(U) == 144, "U must match scene.Uniforms (144 B)");
 
 // ---- vertex streams (== scene/types.zig structs) ----------------------------
 struct Vertex {                 // scene.Vertex, 28 B
@@ -72,13 +73,13 @@ static_assert(sizeof(Quad) == 40, "Quad must match scene.Quad (40 B)");
 
 constant uint FLAG_MAP_ALIGN = 1u;
 
-// Longitude is cyclic, so every tile has a world copy every 1.0 world units
-// and one of them has to be drawn. That choice belongs to the HOST, which
-// makes it once per tile (Camera.placeTileX) and again once per scene, in the
-// matrix (Camera.mvpOrigin takes the short way round in x). Deciding it here,
-// per vertex, tore every primitive lying across the half-world seam: the
-// corners on one side moved a whole world and the corners on the other did
-// not, so a coastline came out as a band stretched across the map.
+// Longitude is cyclic, so a tile has a world copy every 1.0 world units and
+// one of them is drawn. The host picks it, once per tile (Camera.placeTileX)
+// and once per scene in the matrix (Camera.mvpOrigin wraps its x delta).
+// Picking it here, per vertex, split every primitive lying across the
+// half-world seam: the corners on one side moved a whole world and the
+// corners on the other did not, so a coastline drew as a band stretched
+// across the map.
 static inline float4 project(constant U &u, float2 p) {
     return u.mvp * float4(p, 0.0, 1.0);
 }
@@ -107,6 +108,7 @@ static inline float2 screen_offset(constant U &u, float2 off, uchar flags) {
 struct FillOut {
     float4 pos [[position]];
     float4 color;
+    float2 world;
 };
 
 // The zoom-interpolated pair: buffer(3) is the same property one integer
@@ -120,6 +122,29 @@ static inline float4 paint_of(const device Paint *lo, const device Paint *hi,
     float4 a = float4(lo[vid].color) / 255.0;
     float4 b = float4(hi[vid].color) / 255.0;
     return mix(a, b, clamp(u.zoom_t, 0.0, 1.0));
+}
+
+// The world position a vertex's fragments cover: the vertex position plus its
+// screen-space (ox, oy) converted to world units. The offset is applied after
+// projection, so a line's stroke reaches ground its anchor does not, and a
+// clip test against the anchor alone cuts the stroke along its length.
+//
+// Undoing the projection needs no inverse. The linear part of mvp is scale
+// times rotation, so R(-view) applied to the offset and divided by pixels per
+// world unit gives the world delta of the clip-space offset.
+static inline float2 world_of(constant U &u, float2 p, float2 off) {
+    float2 back = float2(off.x * u.rot_cos + off.y * u.rot_sin,
+                        -off.x * u.rot_sin + off.y * u.rot_cos);
+    return p + back * u.size_scale * u.world_per_px;
+}
+
+// A tile's triangles paint their own tile. The geometry keeps the buffered
+// overhang a line's joins are built from, and the draw trims it
+// (scene.CLIP_NONE). A draw with no tile of its own is set to CLIP_NONE and
+// pays one compare.
+static inline bool clipped(constant U &u, float2 world) {
+    return world.x < u.clip_rect.x || world.y < u.clip_rect.y ||
+           world.x > u.clip_rect.z || world.y > u.clip_rect.w;
 }
 
 vertex FillOut fill_vert(uint vid [[vertex_id]],
@@ -141,10 +166,12 @@ vertex FillOut fill_vert(uint vid [[vertex_id]],
     FillOut out;
     out.pos = gate(u, v.zmin, v.zmax) ? clip : float4(0.0, 0.0, 2.0, 1.0); // z=2 -> clipped
     out.color = paint_of(paint, paint_hi, vid, u);
+    out.world = world_of(u, v.pos, off);
     return out;
 }
 
-fragment float4 fill_frag(FillOut in [[stage_in]]) {
+fragment float4 fill_frag(FillOut in [[stage_in]], constant U &u [[buffer(1)]]) {
+    if (clipped(u, in.world)) discard_fragment();
     return in.color;
 }
 
@@ -156,6 +183,7 @@ struct PatternOut {
     float4 pos [[position]];
     float2 anchor;
     float2 cell;
+    float2 world;
 };
 
 vertex PatternOut pattern_vert(uint vid [[vertex_id]],
@@ -170,6 +198,7 @@ vertex PatternOut pattern_vert(uint vid [[vertex_id]],
     out.pos = gate(u, v.zmin, v.zmax) ? clip : float4(0.0, 0.0, 2.0, 1.0);
     out.anchor = u.anchor_px;
     out.cell = u.cell_px;
+    out.world = world_of(u, v.pos, off);
     return out;
 }
 
@@ -177,7 +206,9 @@ vertex PatternOut pattern_vert(uint vid [[vertex_id]],
 // both by the same amount, so the pattern is fixed to the map, not the screen.
 fragment float4 pattern_frag(PatternOut in [[stage_in]],
                              texture2d<float> cell [[texture(0)]],
-                             sampler smp [[sampler(0)]]) {
+                             sampler smp [[sampler(0)]],
+                             constant U &u [[buffer(1)]]) {
+    if (clipped(u, in.world)) discard_fragment();
     float2 sz = max(in.cell, float2(1.0));
     float2 uv = fract((in.pos.xy - in.anchor) / sz);
     float4 c = cell.sample(smp, uv);
@@ -295,8 +326,8 @@ vertex OverlayOut overlay_vert(uint vid [[vertex_id]],
                                const device OverlayVertex *verts [[buffer(0)]],
                                constant U &u [[buffer(2)]]) {
     OverlayVertex v = verts[vid];
-    // No antimeridian wrap here either: the host turns the whole frame at
-    // once, in the matrix (Camera.mvpOrigin). See project() above.
+    // The host places the whole frame at once, in the matrix
+    // (Camera.mvpOrigin). See project() above.
     float4 clip = u.mvp * float4(v.world, 0.0, 1.0);
     // z = 0 is the near plane. Every paint-order depth the scene writes is in
     // (0,1), so a depth-test-only overlay pass is never hidden by the map it
