@@ -205,6 +205,10 @@ pub const Range = extern struct {
     count: u32,
     paint_key: u32,
     pattern: u32 = NO_PATTERN, // into the scene's patterns, pattern ranges only
+    /// The bounds of the tile this range's geometry came from, world units
+    /// in the scene frame. See CLIP_NONE. Triangle ranges only. Every other
+    /// range is set to CLIP_NONE.
+    clip: [4]f32 = CLIP_NONE,
     kind: Kind,
     prim: Prim,
     atlas: Atlas = .none,
@@ -244,11 +248,15 @@ pub const Draw = extern struct {
     _pad: u8 = 0,
     pattern: u32, // look up YOUR cell texture; derive cell_px from its size
     color: [4]f32, // the uniform's color (halo on SDF draws)
+    /// Copied into Uniforms.clip_rect. The batcher resolves it, so a backend
+    /// does not look it up.
+    clip: [4]f32 = CLIP_NONE,
 };
 
 /// The per-draw uniform block the shaders read, byte for byte. The layout is
 /// not the host's to choose: it is the other half of the vertex contract.
-/// std140 and C agree on this order: color at byte 96, the block 128 bytes.
+/// std140 and C agree on this order: color at byte 96, clip_rect at 128, the
+/// block 144 bytes.
 pub const Uniforms = extern struct {
     mvp: [16]f32, // column-major tile-local -> clip (Camera.mvpOrigin)
     px_to_clip: [2]f32, // reference-px -> clip delta (the ox/oy channel)
@@ -262,22 +270,50 @@ pub const Uniforms = extern struct {
     /// slope is the continuous answer and snapping back to a bracket end is
     /// exactly the jump this field exists to remove.
     zoom_t: f32,
-    wrap_x: f32, // camera centre world-x (antimeridian wrap)
+    /// World units per reference pixel, the reciprocal of Camera.worldToPx.
+    /// It converts a vertex's screen-space (ox, oy) into a world delta, so the
+    /// fragment stage tests the position a line's stroke covers against
+    /// clip_rect instead of the position of its anchor.
+    ///
+    /// This slot held a per-vertex antimeridian wrap until it split every
+    /// primitive lying across the half-world seam. The host picks the world
+    /// copy now, in Camera.placeTileX and Camera.mvpOrigin.
+    world_per_px: f32,
     rot_sin: f32,
     rot_cos: f32,
     color: [4]f32, // SDF halo background; SDF fragment stage only
     anchor_px: [2]f32, // pattern phase origin, framebuffer px
     cell_px: [2]f32, // pattern cell period, framebuffer px
+    /// The tile a triangle draw belongs to, in the scene frame: (x0, y0, x1,
+    /// y1). The fragment stage drops fragments outside it. See CLIP_NONE.
+    clip_rect: [4]f32 = CLIP_NONE,
 };
+
+/// The clip_rect that admits every fragment.
+///
+/// A triangle draw's clip is the bounds of the tile its geometry came from,
+/// in world units in the scene frame. An MVT tile holds its features clipped
+/// to its own bounds plus an overhang, so two neighbours both hold the strip
+/// along the edge they share. A line's joins and caps are built from that
+/// overhang, so it stays in the geometry. Painting it twice blends a
+/// translucent fill twice, and the tile grid then shows through the map as a
+/// lattice of darker strips, so the draw trims it. The test is in world space
+/// because a scissor rect cannot express a tile under a rotated view.
+///
+/// CLIP_NONE covers the ranges with no tile of their own: symbols, whose
+/// labels may overhang the tile holding the anchor, raster quads, which are
+/// already one tile with no overhang, and the host overlay.
+pub const CLIP_NONE: [4]f32 = .{ -1e30, -1e30, 1e30, 1e30 };
 
 comptime {
     std.debug.assert(@sizeOf(Vertex) == 28);
     std.debug.assert(@sizeOf(Quad) == 40);
     std.debug.assert(@sizeOf(PaintVertex) == 4);
-    std.debug.assert(@sizeOf(Range) == 24);
-    std.debug.assert(@sizeOf(Uniforms) == 128);
+    std.debug.assert(@sizeOf(Range) == 40);
+    std.debug.assert(@sizeOf(Uniforms) == 144);
     std.debug.assert(@offsetOf(Uniforms, "color") == 96);
     std.debug.assert(@offsetOf(Uniforms, "anchor_px") == 112);
+    std.debug.assert(@offsetOf(Uniforms, "clip_rect") == 128);
 }
 
 /// Layout guard: packs the sizes the shaders and backends assume so an ABI

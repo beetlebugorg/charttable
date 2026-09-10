@@ -12,12 +12,13 @@ cbuffer U : register(b0) {
     float  u_size_scale;
     float  u_zoom;
     float  u_zoom_t;
-    float  u_wrap_x;
+    float  u_world_per_px;
     float  u_rot_sin;
     float  u_rot_cos;
     float4 u_color;
     float2 u_anchor_px;
     float2 u_cell_px;
+    float4 u_clip_rect; // the tile a triangle draw may paint: x0, y0, x1, y1
 };
 
 struct VSIn {
@@ -45,8 +46,7 @@ VSOut main(VSIn i) {
     bool flip = ((i.a_pack >> 8) & 0xFF) != 0;
     float tangent = float((i.a_pack >> 16) & 0xFF) / 256.0 * 6.2831853071795864;
 
-    float2 world = float2(i.a_pos.x + round(u_wrap_x - i.a_pos.x), i.a_pos.y);
-    float4 clip = mul(u_mvp, float4(world, 0.0, 1.0));
+    float4 clip = mul(u_mvp, float4(i.a_pos, 0.0, 1.0));
 
     float2 off = i.a_off;
     // Keep a tangent-rotated run (line-following text) upright: if the run,

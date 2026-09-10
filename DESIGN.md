@@ -115,10 +115,16 @@ independently, so the unit of tessellation is the tile:
 
 - **Layout** runs per (tile × style-layer) on worker threads: decode →
   filter → evaluate data-driven properties → tessellate into *buckets*.
-  A bucket's vertices are **tile-local f32** (origin at tile corner); each
-  tile draws with its own tile→clip matrix (lookout's origin-relative rule:
+  A bucket's vertices are **tile-local f32** (origin at tile corner), so a
+  cached bucket is reusable at any camera (lookout's origin-relative rule:
   absolute world f32 quantizes visibly at depth; `overlay.zig` proved the
-  fix).
+  fix). At CONCATENATION the buckets are rebased onto one scene origin, and
+  the scene draws with one matrix, one draw per (tile × layer). The host
+  therefore picks the world copy at the antimeridian, per tile and per scene,
+  because a per-vertex choice splits a primitive lying across the seam
+  (`Camera.placeTileX`). A tile's own bounds also travel with its geometry,
+  because a merged scene has no per-tile draw state to clip against
+  (`scene.CLIP_NONE`).
 - **Fills and lines** draw straight from resident buckets — pan/zoom/rotate
   never re-tessellates; a zoom change is a matrix change until the tile set
   itself changes (then new tiles lay out async while old ones keep drawing —

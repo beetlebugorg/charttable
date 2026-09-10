@@ -476,9 +476,15 @@ pub const Gpu = struct {
     }
 
     // One merged front-to-back run of the opaque pre-pass.
-    const OpaqueRun = struct { first: u32, count: u32, pattern: u32 };
+    const OpaqueRun = struct { first: u32, count: u32, pattern: u32, clip: [4]f32 };
 
-    fn flushOpaque(self: *const Gpu, f: *mc.ctm_frame, s: *const Scene, run: OpaqueRun, last_u: *?Uniforms, u: *const Uniforms) void {
+    fn flushOpaque(self: *const Gpu, f: *mc.ctm_frame, s: *const Scene, run: OpaqueRun, last_u: *?Uniforms, u_in: *const Uniforms) void {
+        // Phase A clips as phase B does. A tile paints its own tile in both
+        // passes, so the depth this pass writes describes the same ground the
+        // blended pass reads.
+        var uv = u_in.*;
+        uv.clip_rect = run.clip;
+        const u = &uv;
         if (run.pattern == scene.NO_PATTERN) {
             mc.ctm_set_pipeline(f, mc.CTM_PIPE_FILL);
             mc.ctm_bind_vbuf(f, s.vbuf.?);
@@ -581,14 +587,16 @@ pub const Gpu = struct {
                 const r = s.ranges[i];
                 if (r.count == 0 or r.prim != .triangles or (r.flags & scene.Range.FLAG_OPAQUE) == 0) continue;
                 if (run) |*a| {
-                    if (a.pattern == r.pattern and r.first + r.count == a.first) {
+                    if (a.pattern == r.pattern and std.mem.eql(f32, &a.clip, &r.clip) and
+                        r.first + r.count == a.first)
+                    {
                         a.first = r.first;
                         a.count += r.count;
                         continue;
                     }
                     self.flushOpaque(f, s, a.*, &last_u, &u);
                 }
-                run = .{ .first = r.first, .count = r.count, .pattern = r.pattern };
+                run = .{ .first = r.first, .count = r.count, .pattern = r.pattern, .clip = r.clip };
             }
             if (run) |a| self.flushOpaque(f, s, a, &last_u, &u);
         }
@@ -605,6 +613,11 @@ pub const Gpu = struct {
         const draws: []const scene.Draw = if (n > s.draws.len) &.{} else s.draws[0..n];
         for (draws) |d| {
             var uu = u;
+            // Tile geometry paints only its own tile. The buffered
+            // overhang two neighbours share must not blend twice
+            // (scene.CLIP_NONE). Quads are set to CLIP_NONE and draw
+            // unclipped.
+            uu.clip_rect = d.clip;
             switch (d.prim) {
                 .triangles => {
                     if (!tris_ready) continue;
@@ -810,7 +823,7 @@ test "metal offscreen smoke: paint stream draws, zoom gate culls" {
     });
 
     var u = std.mem.zeroes(Uniforms);
-    u.mvp[0] = 2; // scale x2 into clip; verts stay within the wrap-stable half-world
+    u.mvp[0] = 2; // scale x2 into clip
     u.mvp[5] = 2;
     u.mvp[15] = 1;
     u.px_to_clip = .{ 2.0 / 256.0, -2.0 / 256.0 };

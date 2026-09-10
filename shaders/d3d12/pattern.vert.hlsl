@@ -10,12 +10,13 @@ cbuffer U : register(b0) {
     float  u_size_scale;
     float  u_zoom;
     float  u_zoom_t;
-    float  u_wrap_x;
+    float  u_world_per_px;
     float  u_rot_sin;
     float  u_rot_cos;
     float4 u_color;
     float2 u_anchor_px;
     float2 u_cell_px;
+    float4 u_clip_rect; // the tile a triangle draw may paint: x0, y0, x1, y1
 };
 
 struct VSIn {
@@ -30,12 +31,19 @@ struct VSOut {
     float4 pos    : SV_Position;
     float2 anchor : TEXCOORD0;
     float2 cell   : TEXCOORD1;
+    float2 world  : TEXCOORD2;
 };
+
+// See fill.vert.hlsl: the world position a vertex's fragments actually land on.
+float2 world_of(float2 p, float2 off) {
+    float2 back = float2( off.x * u_rot_cos + off.y * u_rot_sin,
+                         -off.x * u_rot_sin + off.y * u_rot_cos);
+    return p + back * u_size_scale * u_world_per_px;
+}
 
 VSOut main(VSIn i) {
     VSOut o;
-    float2 world = float2(i.a_pos.x + round(u_wrap_x - i.a_pos.x), i.a_pos.y);
-    float4 clip = mul(u_mvp, float4(world, 0.0, 1.0));
+    float4 clip = mul(u_mvp, float4(i.a_pos, 0.0, 1.0));
     float2 off = i.a_off;
     if ((i.a_flags & 1) != 0) {
         off = float2(off.x * u_rot_cos - off.y * u_rot_sin,
@@ -50,5 +58,6 @@ VSOut main(VSIn i) {
     o.pos = vis ? clip : float4(0.0, 0.0, 2.0, 1.0);
     o.anchor = u_anchor_px;
     o.cell = u_cell_px;
+    o.world = world_of(i.a_pos, off);
     return o;
 }

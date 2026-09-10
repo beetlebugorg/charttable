@@ -54,7 +54,7 @@ Three root parameters and one static sampler, shared by all five pipelines:
 
 Both CBVs are root descriptors pointed at a per-draw slice of one upload-heap
 ring, so a draw costs one address write and no descriptor allocation. The block
-is `scene.Uniforms`, 128 bytes; HLSL's constant-buffer packing lands every field
+is `scene.Uniforms`, 144 bytes; HLSL's constant-buffer packing lands every field
 at the offset the struct declares.
 
 ## Conventions this backend does not have to correct for

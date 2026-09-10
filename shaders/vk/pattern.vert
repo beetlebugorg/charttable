@@ -17,20 +17,28 @@ layout(set = 1, binding = 0) uniform U {
     float size_scale;
     float zoom;
     float zoom_t;
-    float wrap_x;
+    float world_per_px;
     float rot_sin;
     float rot_cos;
     vec4  color;
     vec2  anchor_px;
     vec2  cell_px;
+    vec4  clip_rect;
 } u;
 
 layout(location = 0) out vec2 v_anchor;
 layout(location = 1) out vec2 v_cell;
+layout(location = 2) out vec2 v_world;
+
+// See fill.vert: the world position a vertex's fragments actually land on.
+vec2 world_of(vec2 p, vec2 off) {
+    vec2 back = vec2( off.x * u.rot_cos + off.y * u.rot_sin,
+                     -off.x * u.rot_sin + off.y * u.rot_cos);
+    return p + back * u.size_scale * u.world_per_px;
+}
 
 void main() {
-    vec2 world = vec2(a_pos.x + round(u.wrap_x - a_pos.x), a_pos.y);
-    vec4 clip = u.mvp * vec4(world, 0.0, 1.0);
+    vec4 clip = u.mvp * vec4(a_pos, 0.0, 1.0);
     vec2 off = a_off;
     if ((a_flags & 1u) != 0u) {
         off = vec2(off.x * u.rot_cos - off.y * u.rot_sin,
@@ -45,4 +53,5 @@ void main() {
     gl_Position = vis ? clip : vec4(0.0, 0.0, 2.0, 1.0);
     v_anchor = u.anchor_px;
     v_cell = u.cell_px;
+    v_world = world_of(a_pos, off);
 }

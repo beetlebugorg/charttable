@@ -18,12 +18,13 @@ cbuffer U : register(b1) {
     float  u_size_scale;
     float  u_zoom;
     float  u_zoom_t;
-    float  u_wrap_x;
+    float  u_world_per_px;
     float  u_rot_sin;
     float  u_rot_cos;
     float4 u_color;      // the SDF halo color for this draw
     float2 u_anchor_px;
     float2 u_cell_px;
+    float4 u_clip_rect; // the tile a triangle draw may paint: x0, y0, x1, y1
 };
 
 struct PSIn {

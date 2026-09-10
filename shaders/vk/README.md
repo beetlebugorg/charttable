@@ -51,7 +51,9 @@ are not negotiable — they are the struct layouts in scene/types.zig.
 lookout's SDL_GPU convention, kept so a port lands on familiar ground:
 set 1 binding 0 = the vertex-stage uniform block, set 2 binding 0 = the
 fragment sampler, set 3 binding 0 = the fragment-stage uniform block. The
-block is `scene.Uniforms`, 128 bytes, std140-compatible in this field order.
+block is `scene.Uniforms`, 144 bytes, std140-compatible in this field order.
+The fill and pattern FRAGMENT stages read it from set 3 as well as sdf: every
+triangle draw is clipped to `clip_rect`.
 
 ## Two contract changes from lookout, called out
 

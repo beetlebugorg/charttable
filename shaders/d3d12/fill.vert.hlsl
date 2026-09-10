@@ -11,12 +11,13 @@ cbuffer U : register(b0) {
     float  u_size_scale;
     float  u_zoom;       // fractional zoom * 256
     float  u_zoom_t;
-    float  u_wrap_x;
+    float  u_world_per_px;
     float  u_rot_sin;
     float  u_rot_cos;
     float4 u_color;
     float2 u_anchor_px;
     float2 u_cell_px;
+    float4 u_clip_rect; // the tile a triangle draw may paint: x0, y0, x1, y1
 };
 
 struct VSIn {
@@ -35,15 +36,16 @@ struct VSIn {
 struct VSOut {
     float4 pos   : SV_Position;
     float4 color : TEXCOORD0;
+    float2 world : TEXCOORD1;
 };
 
-// Longitude is cyclic: draw each vertex at the world instance nearest the
-// camera, so a view straddling the antimeridian is seamless. The world period
-// is exactly 1.0 in ANY translated frame, so this works on tile-local
-// coordinates as long as u_wrap_x is stated in the same frame.
+// Longitude is cyclic, so a tile has a world copy every 1.0 world units and
+// one of them is drawn. The host picks it, once per tile (Camera.placeTileX)
+// and once per scene in the matrix (Camera.mvpOrigin wraps its x delta).
+// Picking it here, per vertex, split every primitive lying across the
+// half-world seam.
 float4 project(float2 p) {
-    float2 world = float2(p.x + round(u_wrap_x - p.x), p.y);
-    return mul(u_mvp, float4(world, 0.0, 1.0));
+    return mul(u_mvp, float4(p, 0.0, 1.0));
 }
 
 // The per-vertex zoom visibility window, quantized to 1/256 zoom steps and
@@ -57,6 +59,20 @@ bool gate(uint zwin) {
 // (ox, oy) is added AFTER projection, in reference px. map_align means it is
 // stated in the MAP frame: a rotated view must turn it, or the pen shears to
 // |cos(rotation)| of its width.
+// The world position a vertex's fragments cover: the vertex position plus its
+// screen-space (ox, oy) converted to world units. The offset is applied after
+// projection, so a line's stroke reaches ground its anchor does not, and a
+// clip test against the anchor alone cuts the stroke along its length.
+//
+// Undoing the projection needs no inverse. The linear part of mvp is scale
+// times rotation, so R(-view) applied to the offset and divided by pixels per
+// world unit gives the world delta of the clip-space offset.
+float2 world_of(float2 p, float2 off) {
+    float2 back = float2( off.x * u_rot_cos + off.y * u_rot_sin,
+                         -off.x * u_rot_sin + off.y * u_rot_cos);
+    return p + back * u_size_scale * u_world_per_px;
+}
+
 float2 screen_offset(float2 off, uint flags) {
     if ((flags & 1) != 0) {
         off = float2(off.x * u_rot_cos - off.y * u_rot_sin,
@@ -82,5 +98,6 @@ VSOut main(VSIn i) {
     // Clamped: mid-gesture zoom_t can leave [0,1]; hold the end color
     // rather than wrapping to the far one.
     o.color = lerp(i.a_color, i.a_color_hi, saturate(u_zoom_t));
+    o.world = world_of(i.a_pos, off);
     return o;
 }
