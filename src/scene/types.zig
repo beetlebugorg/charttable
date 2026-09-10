@@ -262,7 +262,13 @@ pub const Uniforms = extern struct {
     /// slope is the continuous answer and snapping back to a bracket end is
     /// exactly the jump this field exists to remove.
     zoom_t: f32,
-    wrap_x: f32, // camera centre world-x (antimeridian wrap)
+    /// RESERVED. It carried the antimeridian wrap the vertex stages used to
+    /// apply per vertex — which tore every primitive lying across the
+    /// half-world seam, because the corners on one side moved a whole world
+    /// and the corners on the other did not. The choice of world copy is the
+    /// host's now: once per tile in Camera.placeTileX, once per scene in
+    /// Camera.mvpOrigin. Kept so the block stays 128 bytes.
+    wrap_x: f32,
     rot_sin: f32,
     rot_cos: f32,
     color: [4]f32, // SDF halo background; SDF fragment stage only

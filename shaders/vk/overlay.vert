@@ -32,10 +32,10 @@ layout(set = 1, binding = 0) uniform U {
 layout(location = 0) out vec4 v_color;
 
 void main() {
-    // The chart shader's antimeridian wrap: draw at the world instance nearest
-    // the camera. A whole world width is 1.0 in the relative frame too.
-    vec2 world = vec2(a_world.x + round(u.wrap_x - a_world.x), a_world.y);
-    vec4 clip = u.mvp * vec4(world, 0.0, 1.0);
+    // No antimeridian wrap here: the host turns the whole frame at once, in
+    // the matrix (Camera.mvpOrigin). Wrapping per vertex tore any primitive
+    // lying across the half-world seam.
+    vec4 clip = u.mvp * vec4(a_world, 0.0, 1.0);
     // z = 0 is the near plane. The chart's paint-order depths are all in (0,1)
     // and this pass writes no depth, so plugin content is never hidden by the
     // chart and never hides it from a later pass.

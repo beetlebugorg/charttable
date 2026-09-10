@@ -23,6 +23,38 @@ pub fn wrapDx(a: f64, b: f64) f64 {
     return d - std.math.round(d);
 }
 
+/// Where a tile's left edge sits in a frame whose origin is `origin_x`,
+/// choosing the world copy nearest that origin.
+///
+/// Longitude is cyclic, so every tile has a copy each 1.0 world units and the
+/// renderer has to pick one, for the tile as a whole. Nearest is measured at
+/// the tile's CENTRE: judged by its left edge, a tile a whole span wide counts
+/// as near when only its far corner is, and the body of it lands a world away
+/// from what the view is looking at.
+pub fn placeTileX(x0: f64, span: f64, origin_x: f64) f64 {
+    return wrapDx(x0 + span * 0.5, origin_x) - span * 0.5;
+}
+
+/// The other world copy of a tile that a view can also see, as the offset to
+/// add to its placement (`-1` or `+1`), or null when one copy is enough.
+///
+/// `dx` is the placement placeTileX chose and `span` the tile's width, both in
+/// world units in a frame centred on the view; `half_w` is the view's own half
+/// width there. Longitude is cyclic, so a tile recurs every 1.0 world units:
+/// once the view is wider than the gap between two copies -- which happens
+/// from about z1 down, where a tile is a large fraction of the world -- the
+/// same tile is visible on both sides and has to be DRAWN on both sides. One
+/// placement per tile leaves a wedge of empty ocean instead.
+///
+/// At most one copy can qualify: a tile is at most one world wide, so its
+/// copies are at least that far apart.
+pub fn wrappedCopy(dx: f64, span: f64, half_w: f64) ?f64 {
+    for ([2]f64{ -1, 1 }) |k| {
+        if (dx + k < half_w and dx + k + span > -half_w) return k;
+    }
+    return null;
+}
+
 /// lon/lat (degrees) -> normalized web-mercator [0,1], y down.
 pub fn lonLatToWorld(lon: f64, lat: f64) Vec2 {
     const x = wrapX((lon + 180.0) / 360.0);
@@ -90,7 +122,13 @@ pub const Camera = struct {
         const b: f64 = 2.0 * s / @as(f64, self.vh);
         const c = std.math.cos(self.rotation);
         const sn = std.math.sin(self.rotation);
-        const dx = origin.x - self.center.x; // added before rotate/scale
+        // SHORT WAY in x: the camera and a scene origin are both world x in
+        // [0,1), so a camera that has crossed the antimeridian since the
+        // scene was built is a whole world away by subtraction and next door
+        // by longitude. Wrapping here turns the whole scene at once, which is
+        // the only place the turn can happen without splitting geometry: a
+        // per-vertex wrap tears any primitive lying across the seam.
+        const dx = wrapDx(origin.x, self.center.x); // added before rotate/scale
         const dy = origin.y - self.center.y;
         var m = [_]f32{0} ** 16;
         m[0] = @floatCast(a * c);
@@ -360,4 +398,61 @@ test "halfExtents holds the corners of a rotated viewport" {
             try std_testing.expect(@abs(w.y - cam.center.y) <= he.y + 1e-9);
         }
     }
+}
+
+// The seamap style over a wide view came out as horizontal bands stretched
+// across the map: the vertex stages chose a world copy PER VERTEX, so a
+// triangle lying across the half-world seam had corners a whole world apart.
+// The choice is the host's now, and these are the two halves of it.
+test "placeTileX puts a whole tile on its nearest copy" {
+    const std_testing = std.testing;
+    // z2: four columns, a quarter of the world each.
+    const span = 0.25;
+    inline for (.{ 0.0, 0.1234, 0.2361, 0.5, 0.75, 0.9999 }) |origin_x| {
+        var col: usize = 0;
+        while (col < 4) : (col += 1) {
+            const x0 = @as(f64, @floatFromInt(col)) * span;
+            const dx = placeTileX(x0, span, origin_x);
+            // Still the same geography: a whole number of worlds from where
+            // the tile actually is.
+            const worlds = dx - (x0 - origin_x);
+            try std_testing.expectApproxEqAbs(@round(worlds), worlds, 1e-12);
+            // And the nearest copy of it, measured where the tile IS rather
+            // than at its left edge -- which is what keeps the body of a tile
+            // on the near side instead of a corner of it.
+            try std_testing.expect(@abs(dx + span * 0.5) <= 0.5);
+        }
+    }
+}
+
+test "wrappedCopy asks for the second copy only when the view can see it" {
+    const std_testing = std.testing;
+    // z1: two columns, half the world each, and a view of the whole world.
+    // The column placed off to the west is visible in the east as well, and
+    // has to be drawn there too or that side is empty ocean.
+    try std_testing.expectEqual(@as(?f64, 1), wrappedCopy(-0.7361, 0.5, 0.5));
+    // The same tile under a view half that wide is off screen on both sides.
+    try std_testing.expect(wrappedCopy(-0.7361, 0.5, 0.25) == null);
+    // A tile under the camera never needs a second copy: its other copies are
+    // a world away, and no view is that wide.
+    try std_testing.expect(wrappedCopy(-0.1, 0.25, 0.5) == null);
+}
+
+// mvpOrigin's x delta takes the short way round. Without that a camera that
+// crossed the antimeridian since the scene was built is a whole world from
+// its origin by subtraction, and the scene is translated off screen.
+test "mvpOrigin turns the whole scene at the antimeridian" {
+    const std_testing = std.testing;
+    const cam = Camera{
+        .origin = .{ .x = 0.99, .y = 0.5 },
+        .center = .{ .x = 0.01, .y = 0.5 },
+        .zoom = 4,
+        .vw = 1024,
+        .vh = 768,
+    };
+    const near = cam.mvpOrigin(cam.origin);
+    // 0.99 is 0.02 WEST of 0.01, not 0.98 east: the translation is the small
+    // one, and of the sign that puts the origin left of centre.
+    const a = 2.0 * cam.worldToPx() / @as(f64, cam.vw);
+    try std_testing.expectApproxEqAbs(@as(f32, @floatCast(a * -0.02)), near[12], 1e-3);
 }

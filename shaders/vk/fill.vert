@@ -34,13 +34,13 @@ layout(set = 1, binding = 0) uniform U {
 
 layout(location = 0) out vec4 v_color;
 
-// Longitude is cyclic: draw each vertex at the world instance nearest the
-// camera, so a view straddling the antimeridian is seamless. The world period
-// is exactly 1.0 in ANY translated frame, so this works on tile-local
-// coordinates as long as u.wrap_x is stated in the same frame.
+// Longitude is cyclic, so every tile has a world copy every 1.0 world units
+// and one of them has to be drawn. That choice belongs to the HOST, which
+// makes it once per tile (Camera.placeTileX) and again once per scene, in the
+// matrix (Camera.mvpOrigin takes the short way round in x). Deciding it here,
+// per vertex, tore every primitive lying across the half-world seam.
 vec4 project(vec2 p) {
-    vec2 world = vec2(p.x + round(u.wrap_x - p.x), p.y);
-    return u.mvp * vec4(world, 0.0, 1.0);
+    return u.mvp * vec4(p, 0.0, 1.0);
 }
 
 // The per-vertex zoom visibility window, quantized to 1/256 zoom steps and

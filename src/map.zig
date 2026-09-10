@@ -42,6 +42,11 @@ pub const SourcedTile = struct {
     /// Empty means unlabeled, which matches any layer: a caller with one
     /// source has nothing to disambiguate.
     source: []const u8 = "",
+    /// Which world copy to draw this tile at: 0 for the one nearest the view
+    /// origin, -1 or +1 for the copy a world away. Longitude is cyclic, and a
+    /// view wide enough sees the same tile on both sides (Camera.wrappedCopy),
+    /// so the same tile is listed twice with different values here.
+    wrap: f64 = 0,
 };
 
 /// The build's output: everything Gpu.SceneData borrows, plus the effective
@@ -289,6 +294,8 @@ pub const RasterTile = struct {
     /// the starting alpha (in: 0, out: opaque) and records the quad span in
     /// Built.fades; the Map animates it through the quad paint stream.
     fade: Fade = .none,
+    /// Which world copy to draw at — see SourcedTile.wrap.
+    wrap: f64 = 0,
 
     pub const Fade = enum(u2) { none, in, out };
 };
@@ -896,7 +903,12 @@ pub fn buildSceneWithRasters(
             // that column's own world position puts it on the wrong side of
             // the map. Harmless while the viewport is a sliver of the world;
             // at low zoom it scrambles the geography.
-            const dx: f32 = @floatCast(cameras.wrapDx(rect.x0, view.origin.x));
+            //
+            // By the tile's CENTRE, so the whole tile lands on one copy. The
+            // left edge alone leaves the body reaching a full tile span past
+            // the half-world seam, and at low zoom -- where a tile is a large
+            // fraction of the world -- that is most of the tile.
+            const dx: f32 = @floatCast(cameras.placeTileX(rect.x0, tile_span, view.origin.x) + st.wrap);
             const dy: f32 = @floatCast(rect.y0 - view.origin.y);
             const tile_quads_first: u32 = @intCast(quads.items.len);
             var text_scratch: std.ArrayList(types.Quad) = .empty;
@@ -1230,7 +1242,7 @@ fn layoutDemLayer(
         }
 
         const rect = rt.id.worldRect();
-        const x0: f32 = @floatCast(cameras.wrapDx(rect.x0, view.origin.x));
+        const x0: f32 = @floatCast(cameras.placeTileX(rect.x0, rect.x1 - rect.x0, view.origin.x) + rt.wrap);
         const y0: f32 = @floatCast(rect.y0 - view.origin.y);
         const x1: f32 = x0 + @as(f32, @floatCast(rect.x1 - rect.x0));
         const y1: f32 = @floatCast(rect.y1 - view.origin.y);
@@ -1364,7 +1376,7 @@ fn layoutRasterLayer(
         if (rt.rgba.len < @as(usize, rt.w) * rt.h * 4) continue;
 
         const rect = rt.id.worldRect();
-        const x0: f32 = @floatCast(cameras.wrapDx(rect.x0, view.origin.x));
+        const x0: f32 = @floatCast(cameras.placeTileX(rect.x0, rect.x1 - rect.x0, view.origin.x) + rt.wrap);
         const y0: f32 = @floatCast(rect.y0 - view.origin.y);
         const x1: f32 = x0 + @as(f32, @floatCast(rect.x1 - rect.x0));
         const y1: f32 = @floatCast(rect.y1 - view.origin.y);
@@ -2641,7 +2653,7 @@ test "concatScenes: per-tile geometry plus a global symbol pass equals one build
         }, .{});
         try parts.append(a, .{
             .built = part,
-            .dx = @floatCast(cameras.wrapDx(rect.x0, view.origin.x)),
+            .dx = @floatCast(cameras.placeTileX(rect.x0, rect.x1 - rect.x0, view.origin.x)),
             .dy = @floatCast(rect.y0 - view.origin.y),
         });
     }

@@ -29,8 +29,7 @@ layout(location = 0) out vec2 v_anchor;
 layout(location = 1) out vec2 v_cell;
 
 void main() {
-    vec2 world = vec2(a_pos.x + round(u.wrap_x - a_pos.x), a_pos.y);
-    vec4 clip = u.mvp * vec4(world, 0.0, 1.0);
+    vec4 clip = u.mvp * vec4(a_pos, 0.0, 1.0);
     vec2 off = a_off;
     if ((a_flags & 1u) != 0u) {
         off = vec2(off.x * u.rot_cos - off.y * u.rot_sin,

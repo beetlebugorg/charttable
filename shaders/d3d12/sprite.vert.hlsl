@@ -45,8 +45,7 @@ VSOut main(VSIn i) {
     bool flip = ((i.a_pack >> 8) & 0xFF) != 0;
     float tangent = float((i.a_pack >> 16) & 0xFF) / 256.0 * 6.2831853071795864;
 
-    float2 world = float2(i.a_pos.x + round(u_wrap_x - i.a_pos.x), i.a_pos.y);
-    float4 clip = mul(u_mvp, float4(world, 0.0, 1.0));
+    float4 clip = mul(u_mvp, float4(i.a_pos, 0.0, 1.0));
 
     float2 off = i.a_off;
     // Keep a tangent-rotated run (line-following text) upright: if the run,

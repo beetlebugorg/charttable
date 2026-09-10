@@ -34,8 +34,7 @@ struct VSOut {
 
 VSOut main(VSIn i) {
     VSOut o;
-    float2 world = float2(i.a_pos.x + round(u_wrap_x - i.a_pos.x), i.a_pos.y);
-    float4 clip = mul(u_mvp, float4(world, 0.0, 1.0));
+    float4 clip = mul(u_mvp, float4(i.a_pos, 0.0, 1.0));
     float2 off = i.a_off;
     if ((i.a_flags & 1) != 0) {
         off = float2(off.x * u_rot_cos - off.y * u_rot_sin,

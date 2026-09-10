@@ -28,10 +28,10 @@ struct VSOut {
 
 VSOut main(VSIn i) {
     VSOut o;
-    // The chart shader's antimeridian wrap: draw at the world instance nearest
-    // the camera. A whole world width is 1.0 in the relative frame too.
-    float2 world = float2(i.a_world.x + round(u_wrap_x - i.a_world.x), i.a_world.y);
-    float4 clip = mul(u_mvp, float4(world, 0.0, 1.0));
+    // No antimeridian wrap here: the host turns the whole frame at once, in
+    // the matrix (Camera.mvpOrigin). Wrapping per vertex tore any primitive
+    // lying across the half-world seam.
+    float4 clip = mul(u_mvp, float4(i.a_world, 0.0, 1.0));
     // z = 0 is the near plane. The chart's paint-order depths are all in (0,1)
     // and this pass writes no depth, so host content is never hidden by the
     // chart and never hides it from a later pass.

@@ -1696,6 +1696,10 @@ pub const Map = struct {
         // would outlive the eviction that frees it.
         var parts: std.ArrayListUnmanaged(map.ScenePart) = .empty;
         defer parts.deinit(self.gpa);
+        // How far the scene has to reach either side of the origin, so a tile
+        // the view sees on BOTH sides of the world can be drawn on both.
+        const half_w = self.extentsAt(zoom).x;
+        var tile_parts: usize = 0;
         var vector_tiles: std.ArrayListUnmanaged(map.SourcedTile) = .empty;
         var rasters: std.ArrayListUnmanaged(map.RasterTile) = .empty;
         // How many tiles this pass may TESSELLATE. Cached buckets are free
@@ -1728,11 +1732,26 @@ pub const Map = struct {
             switch (self.cache.sourceKind(key)) {
                 .vector => {
                     const tile = self.cache.get(key) orelse continue;
+                    const rect = key.tileId().worldRect();
+                    const span = rect.x1 - rect.x0;
+                    // The nearest world copy: see the note in map.zig. A view
+                    // wide enough sees the same tile on both sides of the
+                    // world, and then it is listed -- and placed -- twice.
+                    const dx = cameras.placeTileX(rect.x0, span, origin.x);
+                    const second = cameras.wrappedCopy(dx, span, half_w);
                     try vector_tiles.append(a, .{
                         .id = key.tileId(),
                         .tile = tile,
                         .source = self.sourceName(key.source),
                     });
+                    if (second) |copy_dx| {
+                        try vector_tiles.append(a, .{
+                            .id = key.tileId(),
+                            .tile = tile,
+                            .source = self.sourceName(key.source),
+                            .wrap = copy_dx,
+                        });
+                    }
                     if (!self.bucketReady(key, zoom)) {
                         if (budget == 0) {
                             deferred += 1;
@@ -1741,17 +1760,26 @@ pub const Map = struct {
                         budget -= 1;
                     }
                     const bucket = (try self.bucketFor(style, key, zoom)) orelse continue;
-                    const rect = key.tileId().worldRect();
+                    const dy: f32 = @floatCast(rect.y0 - origin.y);
                     try parts.append(self.gpa, .{
                         .built = bucket.built,
-                        // The nearest world copy: see the note in map.zig.
-                        .dx = @floatCast(cameras.wrapDx(rect.x0, origin.x)),
-                        .dy = @floatCast(rect.y0 - origin.y),
+                        .dx = @floatCast(dx),
+                        .dy = dy,
                     });
+                    tile_parts += 1;
+                    // The same bucket, placed a world over: the second copy
+                    // costs a rebase at concatenation, not a tessellation.
+                    if (second) |copy_dx| {
+                        try parts.append(self.gpa, .{
+                            .built = bucket.built,
+                            .dx = @floatCast(dx + copy_dx),
+                            .dy = dy,
+                        });
+                    }
                 },
                 .raster => {
                     const img = self.cache.getRaster(key) orelse continue;
-                    try rasters.append(a, .{
+                    const rt = map.RasterTile{
                         .id = key.tileId(),
                         .source = self.sourceName(key.source),
                         .w = img.w,
@@ -1760,7 +1788,16 @@ pub const Map = struct {
                         // A source whose level swapped fades its new tiles
                         // in from invisible over the outgoing ones.
                         .fade = if (self.build_fade_sources & (@as(u8, 1) << key.source) != 0) .in else .none,
-                    });
+                    };
+                    try rasters.append(a, rt);
+                    const rect = key.tileId().worldRect();
+                    const span = rect.x1 - rect.x0;
+                    const dx = cameras.placeTileX(rect.x0, span, origin.x);
+                    if (cameras.wrappedCopy(dx, span, half_w)) |copy_dx| {
+                        var copy = rt;
+                        copy.wrap = copy_dx;
+                        try rasters.append(a, copy);
+                    }
                 },
             }
         }
@@ -1797,7 +1834,9 @@ pub const Map = struct {
             // Tiles whose geometry is actually IN the scene: `have` less
             // whatever the budget deferred. The gap is what a test can watch
             // to catch the scene silently losing ground.
-            .scene_tiles = parts.items.len - 1, // less the global pass
+            // Distinct tiles, not parts: a tile the view sees on both sides
+            // of the world is placed twice and is still one tile.
+            .scene_tiles = tile_parts,
             .partial = deferred > 0,
             .origin = origin,
             .zoom = zoom,

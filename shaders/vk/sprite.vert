@@ -41,8 +41,7 @@ void main() {
     bool flip  = ((a_pack >> 8) & 0xFFu) != 0u;
     float tangent = float((a_pack >> 16) & 0xFFu) / 256.0 * 6.2831853071795864;
 
-    vec2 world = vec2(a_pos.x + round(u.wrap_x - a_pos.x), a_pos.y);
-    vec4 clip = u.mvp * vec4(world, 0.0, 1.0);
+    vec4 clip = u.mvp * vec4(a_pos, 0.0, 1.0);
 
     vec2 off = a_off;
     // Keep a tangent-rotated run (line-following text) upright: if the run,

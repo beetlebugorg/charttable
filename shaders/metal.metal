@@ -25,7 +25,7 @@ struct U {
     float    size_scale; // pixel density x symbol size multiplier
     float    zoom;       // fractional zoom * 256, tested against zmin/zmax
     float    zoom_t;     // fract(zoom): mix factor for zoom-interpolated paint
-    float    wrap_x;     // camera centre x IN THE VERTEX FRAME (antimeridian)
+    float    wrap_x;     // RESERVED: the host now wraps per tile and per scene
     float    rot_sin;
     float    rot_cos;
     float4   color;      // SDF halo background; SDF fragment stage only
@@ -72,14 +72,15 @@ static_assert(sizeof(Quad) == 40, "Quad must match scene.Quad (40 B)");
 
 constant uint FLAG_MAP_ALIGN = 1u;
 
-// Longitude is cyclic: draw each vertex at the world instance nearest the
-// camera (x, x-1 or x+1), so a view straddling the antimeridian is seamless.
-// The world period is exactly 1.0 world unit in ANY translated frame, so this
-// works on tile-local coordinates as long as u.wrap_x is stated in the same
-// frame (host: camera.center.x - tile_origin.x).
+// Longitude is cyclic, so every tile has a world copy every 1.0 world units
+// and one of them has to be drawn. That choice belongs to the HOST, which
+// makes it once per tile (Camera.placeTileX) and again once per scene, in the
+// matrix (Camera.mvpOrigin takes the short way round in x). Deciding it here,
+// per vertex, tore every primitive lying across the half-world seam: the
+// corners on one side moved a whole world and the corners on the other did
+// not, so a coastline came out as a band stretched across the map.
 static inline float4 project(constant U &u, float2 p) {
-    float2 world = float2(p.x + rint(u.wrap_x - p.x), p.y);
-    return u.mvp * float4(world, 0.0, 1.0);
+    return u.mvp * float4(p, 0.0, 1.0);
 }
 
 // The per-vertex zoom visibility window: zmin/zmax quantized to 1/256 zoom
@@ -276,7 +277,7 @@ fragment float4 sdf_frag(QuadOut in [[stage_in]],
 //
 // The stream is world-space positions relative to the frame's own origin, with
 // a colour per vertex. The host supplies the matching uniform (an mvp built
-// for that origin), so this shader reads only mvp and wrap_x.
+// for that origin), so this shader reads only mvp.
 struct OverlayVertex {          // scene.OverlayVertex, 24 B
     // packed_float2/4 hold the stride at 24; natural alignment would pad to 32
     // and shear the stream.
@@ -294,10 +295,9 @@ vertex OverlayOut overlay_vert(uint vid [[vertex_id]],
                                const device OverlayVertex *verts [[buffer(0)]],
                                constant U &u [[buffer(2)]]) {
     OverlayVertex v = verts[vid];
-    // The same antimeridian wrap the scene shaders apply: draw at the world
-    // instance nearest the camera, so an overlay across the seam is seamless.
-    float2 world = float2(v.world.x + rint(u.wrap_x - v.world.x), v.world.y);
-    float4 clip = u.mvp * float4(world, 0.0, 1.0);
+    // No antimeridian wrap here either: the host turns the whole frame at
+    // once, in the matrix (Camera.mvpOrigin). See project() above.
+    float4 clip = u.mvp * float4(v.world, 0.0, 1.0);
     // z = 0 is the near plane. Every paint-order depth the scene writes is in
     // (0,1), so a depth-test-only overlay pass is never hidden by the map it
     // annotates — and it writes no depth, so it cannot hide the map either.
