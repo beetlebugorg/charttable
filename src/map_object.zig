@@ -304,7 +304,7 @@ pub const Map = struct {
     /// decided; the worker only reads it.
     build_fade_out: std.ArrayListUnmanaged(u64) = .empty,
     /// Bit per cache source index whose incoming rasters fade IN.
-    build_fade_sources: u8 = 0,
+    build_fade_sources: std.StaticBitSet(caches.max_sources) = .initEmpty(),
     /// Updates left in the live scene's raster cross-fade; 0 = none.
     fade_left: u32 = 0,
     /// Updates spent waiting on tile supply for the next rebuild
@@ -417,8 +417,14 @@ pub const Map = struct {
 
     /// Point a style source name at a place tiles come from. Returns the
     /// cache's source index. Re-binding a name replaces it.
-    pub fn bindSource(self: *Map, name: []const u8, src: caches.Source) !usize {
+    pub fn bindSource(self: *Map, name: []const u8, source: caches.Source) !usize {
         self.waitForBuild(); // the worker reads cache.sources
+
+        // A tile deeper than the key can address truncates into another
+        // tile's key, so the band stops here. Every style path clamps to 22
+        // already; an archive's own header is the one that can ask for more.
+        var src = source;
+        src.maxzoom = @min(src.maxzoom, caches.max_zoom);
         for (self.bound.items) |*b| {
             if (std.mem.eql(u8, b.name, name)) {
                 self.cache.sources.items[b.index] = src;
@@ -1304,7 +1310,7 @@ pub const Map = struct {
     /// The style source name a cache source index was bound to. A raster
     /// layer draws only its own source's tiles, so the name has to travel
     /// with the image.
-    fn sourceName(self: *const Map, index: u3) []const u8 {
+    fn sourceName(self: *const Map, index: @FieldType(caches.Key, "source")) []const u8 {
         for (self.bound.items) |b| {
             if (b.index == index) return b.name;
         }
@@ -1510,10 +1516,10 @@ pub const Map = struct {
     /// the worker only reads what this writes.
     fn chooseFades(self: *Map, have: []const u64) !void {
         self.build_fade_out.clearRetainingCapacity();
-        self.build_fade_sources = 0;
+        self.build_fade_sources = .initEmpty();
         if (self.built == null) return; // a first scene has nothing to fade from
-        var prev_level: [8]?u8 = @splat(null);
-        var next_level: [8]?u8 = @splat(null);
+        var prev_level: [caches.max_sources]?u8 = @splat(null);
+        var next_level: [caches.max_sources]?u8 = @splat(null);
         for (have) |k| {
             const key: caches.Key = @bitCast(k);
             if (self.cache.sourceKind(key) == .raster) next_level[key.source] = key.tileId().z;
@@ -1522,11 +1528,11 @@ pub const Map = struct {
             const key: caches.Key = @bitCast(k);
             if (self.cache.sourceKind(key) == .raster) prev_level[key.source] = key.tileId().z;
         }
-        for (0..8) |si| {
+        for (0..caches.max_sources) |si| {
             const pz = prev_level[si] orelse continue;
             const nz = next_level[si] orelse continue;
             if (pz == nz) continue;
-            self.build_fade_sources |= @as(u8, 1) << @intCast(si);
+            self.build_fade_sources.set(si);
             for (self.resident.items) |k| {
                 const key: caches.Key = @bitCast(k);
                 if (key.source != si or self.cache.sourceKind(key) != .raster) continue;
@@ -1790,7 +1796,7 @@ pub const Map = struct {
                         .rgba = img.rgba,
                         // A source whose level swapped fades its new tiles
                         // in from invisible over the outgoing ones.
-                        .fade = if (self.build_fade_sources & (@as(u8, 1) << key.source) != 0) .in else .none,
+                        .fade = if (self.build_fade_sources.isSet(key.source)) .in else .none,
                     };
                     try rasters.append(a, rt);
                     const rect = key.tileId().worldRect();

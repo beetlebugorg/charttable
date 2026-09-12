@@ -401,13 +401,25 @@ pub const PmtilesLibrary = struct {
 /// How many sources one Cache can hold, fixed by the width of `Key.source`.
 pub const max_sources: usize = 1 << @bitSizeOf(@FieldType(Key, "source"));
 
+/// The deepest zoom one key can address, fixed by the width of `Key.x`.
+/// bindSource clamps every source to it, because a tile past it truncates
+/// into another tile's key.
+pub const max_zoom: u8 = @bitSizeOf(@FieldType(Key, "x"));
+
 /// One cached tile, addressed by source index and tile id. 64 bits so the
 /// slot table keys on a scalar.
+///
+/// The field widths are a budget. x and y hold a tile coordinate at
+/// max_zoom, z holds the zoom, and the rest names the source. x and y held
+/// 28 bits each, which addresses zoom 28, while every bind here clamps a
+/// source to 22 and PMTiles stops at 27. That left 3 bits for the source,
+/// and two chart styles in a row bind more than eight sources between them:
+/// the ninth bind was refused.
 pub const Key = packed struct(u64) {
-    x: u28,
-    y: u28,
-    z: u5,
-    source: u3,
+    x: u25,
+    y: u25,
+    z: u6,
+    source: u8,
 
     pub fn of(source: usize, id: coord.TileId) Key {
         return .{
